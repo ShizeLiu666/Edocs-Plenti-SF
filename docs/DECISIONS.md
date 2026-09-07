@@ -306,7 +306,7 @@ Plenti 转介邮件可能含融资申请资料与身份证明,`PLENTI_ADAPTATION
 
 ### TODO-1 硬编码生产域名 → `INTERNAL_DOMAIN` 【✅ Phase 2 已完成】
 
-**这是 D-001 的代价。已由 Phase 2 提交 `PHASE2_COMMIT` 处理。**
+**这是 D-001 的代价。已由 Phase 2 提交 `4654c1b` 处理。**
 
 `src/Code.gs` 第 51 行(`ivClassify_` 内部邮件排除)硬编码了生产域名:
 
