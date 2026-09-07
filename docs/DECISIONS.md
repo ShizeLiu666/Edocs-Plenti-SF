@@ -4,6 +4,17 @@
 不能只存在于聊天记录中。
 
 规格:[eDocs-Plenti-Intake-开发规格.md](eDocs-Plenti-Intake-开发规格.md)
+沙箱配置手册:[SANDBOX_SETUP.md](SANDBOX_SETUP.md)(Jack 手工执行)
+
+## 外部依赖状态(2026-09-07)
+
+| 依赖 | 状态 |
+|---|---|
+| eDocs 组 **moderation** | ✅ Lily 已确认:不会把邮件扣进审核队列 |
+| eDocs 组 **外部发件人能否直接投递** | ⏳ 已再去问 —— 见 **Q12**,直接影响 §5.1 |
+| `sf-intake` 账号 | ⏳ 未建。阻塞 Apps Script 项目与触发器 |
+| Salesforce 沙箱 | 🔧 Jack 以 `jack.liu` 登录配置中,照 SANDBOX_SETUP.md 走 |
+| Plenti 真实样本 | ⏳ 2026-09-09 会议 |
 
 ---
 
@@ -469,3 +480,5 @@ watermark 的校验保持原样。
 | Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
 | Q10 | **不可信邮件全部转 review 的审核噪音。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂 Review 标签。按规格实现,不放宽;Jack 去问 eDocs 日均邮件量,**决策依据是真实流量数据,不是"感觉太吵"** | 上线前评估 | §5.1 / D-010 |
 | ~~Q11~~ | ~~`INTAKE_V2_START` 的两个 fail-open 缺口~~ **已关闭** —— Phase 2 当期修复,见 TODO-3 | 无 | —— |
+| Q12 | **外部发件人能否直接投递到 eDocs 组?** moderation 那一层 Lily 已确认通了,但投递权限本身还没确认。若外部发件人被拦、或投递路径与预期不同,**Google Groups 写入的 `X-Original-Sender` / `X-Original-Authentication-Results` 可能根本不存在** —— 那样 `isPlentiSource_` 的全部前提要重想 | **Phase 3**(先于样本解析) | §5.1 |
+| Q13 | **沙箱的 Run As 用户若用 `jack.liu`,权限最小集就没被验证过。** 管理员身份下测试必然通过,到生产换成受限集成用户时才会集中暴露。若沙箱这样做了,生产上线前必须补测 | 上线前 | SANDBOX_SETUP §2.5 |

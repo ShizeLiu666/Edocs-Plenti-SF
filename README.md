@@ -8,6 +8,7 @@ Plenti 的转介线索,在 Salesforce 建 Lead,并记录 SLA 所需的时间戳�
 
 完整规格见 [docs/eDocs-Plenti-Intake-开发规格.md](docs/eDocs-Plenti-Intake-开发规格.md)。
 决策记录与待办见 [docs/DECISIONS.md](docs/DECISIONS.md)。
+Salesforce 沙箱配置手册见 [docs/SANDBOX_SETUP.md](docs/SANDBOX_SETUP.md)(Jack 手工执行,同时是照搬到生产的清单)。
 
 ---
 
