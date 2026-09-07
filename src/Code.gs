@@ -96,8 +96,20 @@ function runIntakeV2(){
  if(p.getProperty('EDOCS_ADAPTATION_VALIDATED')!=='true')throw new Error('Plenti adaptation has not been validated. Read handoff instructions.');
  var lock=LockService.getScriptLock();if(!lock.tryLock(1000)){console.log('Another intake execution is running.');return;}
  try{
- var began=Date.now(),cut=new Date(p.getProperty('INTAKE_V2_START')),cursor=new Date(p.getProperty('INTAKE_V2_WATERMARK')||cut.toISOString());
- if(isNaN(cut.getTime())||isNaN(cursor.getTime()))throw new Error('Missing valid intake start/watermark');
+ // [Phase 2] 修复模板既有的 fail-open 缺口(DECISIONS TODO-3),不是行为变更:
+ // 原写法是 cut=new Date(p.getProperty('INTAKE_V2_START')) 后再 isNaN 检查。
+ //   缺口一:属性未设置时 getProperty 返回 null,new Date(null) 得到
+ //           1970-01-01 而不是 NaN,isNaN 检查静默通过 → 回扫全部历史邮件。
+ //   缺口二:属性是非法字符串时,同一行的 cut.toISOString() 先抛 RangeError,
+ //           下面那句写好的错误提示永远不可达。
+ // 现在按其他必填属性的一致做法处理:缺失即抛错,不可解析即抛错,
+ // 且两项校验都在任何 Date 方法调用之前完成。watermark 的校验保持原样。
+ var began=Date.now(),start=p.getProperty('INTAKE_V2_START');
+ if(!start)throw new Error('Configure INTAKE_V2_START');
+ var cut=new Date(start);
+ if(isNaN(cut.getTime()))throw new Error('Configure INTAKE_V2_START with a parsable ISO timestamp');
+ var cursor=new Date(p.getProperty('INTAKE_V2_WATERMARK')||cut.toISOString());
+ if(isNaN(cursor.getTime()))throw new Error('Missing valid intake start/watermark');
  ivRefreshOutstanding_(began+30000);
  var lower=Math.max(cut.getTime(),cursor.getTime()-172800000),before=Math.floor(began/1000)+1,query='list:'+ivGroupAddress_()+' after:'+Math.floor(lower/1000)+' before:'+before+' -in:spam -in:trash',offset=0,count=0,done=false;
  while(Date.now()-began<220000){

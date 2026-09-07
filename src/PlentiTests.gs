@@ -409,7 +409,15 @@ function testPlentiLeadPayload(){
  plAssert_(payload.Description.indexOf('FIXTURE-0001')>=0,'Description records the referral id');
  plAssert_(payload.Description.indexOf('12 Fictional Street')<0,'the raw email body is not copied into Description (D-012)');
  plAssert_(payload.Description.length<=32000,'Description stays within the Salesforce limit');
- console.log('PASS: 14 Lead field-mapping cases');
+
+ // D-012 最小集合:Description 的每一行都必须命中白名单。Phase 3 填字段
+ // 正则时若把 application ID / broker ID / 客户编号顺手塞进摘要,这里会变红。
+ var allowed=[/^\[Intake: /,/^PLENTI REFERRAL - PENDING ADMIN REVIEW$/,/^Source: /,/^Plenti referral ID: /,/^Subject: /,/^Raw email body is intentionally not copied/];
+ payload.Description.split('\n').forEach(function(line){
+  if(!line.trim())return;
+  plAssert_(allowed.some(function(re){return re.test(line);}),'Description carries a line outside the D-012 minimum set: '+line);
+ });
+ console.log('PASS: 15 Lead field-mapping cases including the Description minimum set');
 }
 
 // ============================================================

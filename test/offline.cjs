@@ -154,16 +154,31 @@ console.log('PASS: safe export guards; no Gmail/Salesforce connection or records
 // 7. 收信范围收窄(规格 §5.7)
 // ──────────────────────────────────────────────────────────────
 props.set('EDOCS_ADAPTATION_VALIDATED', 'true');
+
+// INTAKE_V2_START 的三条校验(DECISIONS TODO-3)。这三条锁住的是一个修好的
+// 行为:模板原写法在属性缺失时会静默回扫到 1970-01-01,在属性非法时会先抛
+// RangeError 使那句写好的提示永远不可达。以后重构 runIntakeV2 不能把它改回去。
+assert.throws(() => context.runIntakeV2(), /Configure INTAKE_V2_START/,
+  'a missing start time must stop before any mailbox access, not silently scan from 1970');
+props.set('INTAKE_V2_START', 'not-a-timestamp');
+let thrown = null;
+try { context.runIntakeV2(); } catch (e) { thrown = e; }
+assert.ok(thrown, 'an unparsable start time must throw');
+assert.match(String(thrown.message), /Configure INTAKE_V2_START with a parsable ISO timestamp/,
+  'an unparsable start time must raise a recognisable error');
+// instanceof 跨 vm realm 不可靠,按 name 和 message 判定。
+assert.notEqual(thrown.name, 'RangeError',
+  'the start-time check must run before any Date method call, so no RangeError can pre-empt it');
+assert.doesNotMatch(String(thrown.message), /Invalid time value/,
+  'the template RangeError must no longer surface');
+
 props.set('INTAKE_V2_START', '2026-09-07T00:00:00+09:30');
 props.set('INTAKE_V2_WATERMARK', 'not-a-timestamp');
 assert.throws(() => context.runIntakeV2(), /Missing valid intake start\/watermark/,
-  'an unparsable watermark must stop before any mailbox access');
+  'a valid start with an unparsable watermark still hits the original check');
 props.delete('INTAKE_V2_WATERMARK');
-// ⚠️ 这道 isNaN 检查只在 watermark 非法时可达。INTAKE_V2_START 本身的两种
-// 坏情况都绕过了它:未设置时 new Date(null) 得到 1970-01-01(不是 NaN),
-// 非法字符串则先在 cut.toISOString() 抛 RangeError。两者都是模板既有行为,
-// 记为 DECISIONS Q11,本期不改。此处刻意不为它们写断言 —— 测试不该把一个
-// 待修的行为锁死成规范。
+console.log('PASS: 3 intake start-time validation cases (template fail-open gaps closed)');
+
 assert.throws(() => context.runIntakeV2(), /EDOCS_GROUP_ADDRESS/,
   'the group address must be configured before any mailbox is scanned');
 

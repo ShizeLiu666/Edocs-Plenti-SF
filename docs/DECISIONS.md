@@ -252,6 +252,9 @@ DMARC 通过意味着 SPF 或 DKIM 至少一项通过**且域名对齐**;单独�
 代价是审核噪音更大,那正是 Q10 要用真实流量数据回答的问题。
 **这是一处 fail-safe 方向的偏离,改回去只需要动 `plProcess_` 里的一个分支。**
 
+**Jack 已追认(2026-09-07)**:"改得对……你在实现时发现计划书里那个括号不成立
+并主动纠正,这个判断优于我的批复。"噪音代价记在 Q10,等流量数据。
+
 ---
 
 ## D-011 Plenti 不复用 `Lead_Category__c` 作为审核信号
@@ -298,7 +301,19 @@ Plenti 转介邮件可能含融资申请资料与身份证明,`PLENTI_ADAPTATION
 若审核人反映上下文不够,那是 **Q5** 数据留存范围的一部分,由 Jack 拍板后再放开
 —— 改一行即可。
 
-**这一条计划书里没有,是实现时冒出来的决策点,请 Jack 追认。**
+**Jack 已追认(2026-09-07),并追加一条要求:**
+
+> Description 的结构化摘要里**除 `referralId` 外不写任何 Plenti 内部标识符**
+> —— application ID、broker ID、客户编号、账户号一律不进。等看到样本、确认
+> 哪些字段算"销售必要信息"之后再逐项放开,现在按最小集合写。
+
+当前允许的 Description 行只有六种:邮件标记 `[Intake: …]`、
+`PLENTI REFERRAL - PENDING ADMIN REVIEW`、`Source:`、`Plenti referral ID:`、
+`Subject:`、以及那句"正文有意不复制"的说明。
+
+**这条不是靠注释维持的。** `testPlentiLeadPayload` 有一道白名单断言:
+Description 的每一行都必须命中上述前缀之一。Phase 3 填字段正则时若把解析到
+的编号顺手塞进摘要,测试会立刻变红。
 
 ---
 
@@ -345,7 +360,7 @@ Script Property `INTERNAL_DOMAIN`,**缺失即抛错停止**,符合规格 §3 禁
 多出 `EXPORT_NOTES.md`、`appsscript.example.json`、`script-properties.example.json`。
 `appsscript.json` 的 oauthScopes 即来自 `appsscript.example.json`。
 
-### TODO-3 `INTAKE_V2_START` 的两个 fail-open 缺口 【上线前必须处理,Q11】
+### TODO-3 `INTAKE_V2_START` 的两个 fail-open 缺口 【✅ Phase 2 已修复】
 
 Phase 2 写离线测试时发现,`runIntakeV2` 里这两行的组合有两个缺口:
 
@@ -363,13 +378,42 @@ if(isNaN(cut.getTime())||isNaN(cursor.getTime()))throw new Error('Missing valid 
 
 那道 `isNaN` 检查实际上**只在 watermark 非法时可达**。
 
-**都是 handoff 模板的既有行为,不是 Phase 2 引入的。** 没有顺手改,因为它超出
-了 Jack 批准的函数三分类范围,而且属于"改模板既有逻辑"—— 按约定要先问。
-两道安全开关关闭时不会触发,所以不是当前风险。
+**都是 handoff 模板的既有行为,不是 Phase 2 引入的。**
 
-修法很短:`INTAKE_V2_START` 缺失或不可解析时直接抛错,与其他必填属性一致。
-`test/offline.cjs` 刻意**没有**为这两个行为写断言 —— 测试不该把一个待修的行为
-锁死成规范。
+我最初的判断是"两道安全开关关闭时不会触发,所以不是当前风险,留到上线前"。
+**Jack 否决了这个推理,要求当期就改**,理由成立且更强:
+
+> 这个推理的前提是开关会一直关着,但 **Phase 4 就会打开它们做沙箱端到端测试,
+> 而那时 `INTAKE_V2_START` 很可能还没配**。后果是脚本回扫 `sf-intake` 邮箱的
+> 全部历史邮件 —— 沙箱里是浪费时间,如果哪次配置指向生产,就是一次无法撤销的
+> 批量写入。而且这两个缺陷藏得很深:第一个完全静默,第二个让一句写好的防御
+> 代码永远不可达,不会随时间更容易发现。
+
+同时明确了这不超出批准范围:§5.7 的批复已经写了"属性缺失抛错",
+`INTAKE_V2_START` 与 `EDOCS_GROUP_ADDRESS` 是同一类必填属性,只是模板对前者的
+校验写坏了。
+
+**修复内容**(`src/Code.gs` `runIntakeV2`,带 `[Phase 2]` 注释):
+
+```javascript
+var began=Date.now(),start=p.getProperty('INTAKE_V2_START');
+if(!start)throw new Error('Configure INTAKE_V2_START');
+var cut=new Date(start);
+if(isNaN(cut.getTime()))throw new Error('Configure INTAKE_V2_START with a parsable ISO timestamp');
+var cursor=new Date(p.getProperty('INTAKE_V2_WATERMARK')||cut.toISOString());
+if(isNaN(cursor.getTime()))throw new Error('Missing valid intake start/watermark');
+```
+
+两项校验都在任何 `Date` 方法调用之前完成,`RangeError` 不再可能抢先抛出。
+watermark 的校验保持原样。
+
+**断言**:既然修了就必须锁住,否则以后重构 `runIntakeV2` 会把它改回去。
+`test/offline.cjs` 加了三条 —— 缺失即抛错且信息可辨认、非法字符串抛的不是
+`RangeError`、合法 start 配非法 watermark 仍走原有检查。已反向验证:把
+`runIntakeV2` 改回模板原写法,套件确实变红。
+
+(我先前写的"测试不该把待修的行为锁死成规范"在当时成立,行为修好之后就不再
+适用 —— 现在锁住的是正确行为。)
 
 ---
 
@@ -424,4 +468,4 @@ if(isNaN(cut.getTime())||isNaN(cursor.getTime()))throw new Error('Missing valid 
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |
 | Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
 | Q10 | **不可信邮件全部转 review 的审核噪音。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂 Review 标签。按规格实现,不放宽;Jack 去问 eDocs 日均邮件量,**决策依据是真实流量数据,不是"感觉太吵"** | 上线前评估 | §5.1 / D-010 |
-| Q11 | **`INTAKE_V2_START` 的两个 fail-open 缺口**(模板既有行为,Phase 2 发现但未改,详见下方 TODO-3) | 上线前 | —— |
+| ~~Q11~~ | ~~`INTAKE_V2_START` 的两个 fail-open 缺口~~ **已关闭** —— Phase 2 当期修复,见 TODO-3 | 无 | —— |

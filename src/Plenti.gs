@@ -337,6 +337,13 @@ function plResolve_(message,parsed){
  * Plenti 转介邮件可能含融资申请资料与身份证明,PLENTI_ADAPTATION.md 第 11
  * 条要求"仅留存销售必要信息"。若审核人反映上下文不够,那是 Q5 数据留存
  * 范围的一部分,由 Jack 拍板后再放开。
+ *
+ * ⚠️ [Phase 3 注意] Description 里**除 referralId 外不写任何 Plenti 内部
+ * 标识符** —— application ID、broker ID、客户编号、账户号一律不进。等看到
+ * 真实样本、确认哪些字段算"销售必要信息"之后再逐项放开,现在按最小集合写。
+ * 填字段正则时不要顺手把解析到的编号都塞进摘要。
+ * 这条由 testPlentiLeadPayload 的白名单断言强制:Description 的每一行都
+ * 必须命中允许的前缀,加新行会让测试变红。
  */
 function plLeadPayload_(message,parsed){
  var c=parsed.customer,marker='[Intake: '+message.getId()+']';
