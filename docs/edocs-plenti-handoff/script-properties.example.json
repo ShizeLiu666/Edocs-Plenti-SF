@@ -1,0 +1,10 @@
+{
+  "SF_LOGIN_URL": "",
+  "SF_CLIENT_ID": "",
+  "SF_CLIENT_SECRET": "",
+  "INTAKE_MAILBOX": "",
+  "INTAKE_ADMIN_ID": "",
+  "INTAKE_V2_ENABLED": "false",
+  "EDOCS_ADAPTATION_VALIDATED": "false",
+  "INTAKE_V2_START": ""
+}

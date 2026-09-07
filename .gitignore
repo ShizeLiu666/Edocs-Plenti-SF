@@ -1,0 +1,23 @@
+# clasp 本地配置与 OAuth token
+# .clasp.json 含 scriptId;.clasprc.json 含 clasp 的 OAuth token,更敏感
+.clasp.json
+.clasprc.json
+
+# 任何含密钥的本地文件
+# script-properties.json 单独点名:handoff 里有 script-properties.example.json
+# 模板,最容易发生的事故是有人复制一份填上真 Client Secret 后存成这个名字
+*.local.json
+*.secret*
+script-properties.json
+.env
+.env.*
+
+# 原始邮件
+# 禁止事项 #5:Plenti 转介邮件可能含融资申请资料与身份证明,
+# 一旦进入 git 历史极难彻底清除。测试 fixture 一律用虚构的
+# .txt / .json,不使用 .eml 格式 —— 见 test/fixtures/README.md
+*.eml
+
+# 其他
+node_modules/
+.DS_Store
