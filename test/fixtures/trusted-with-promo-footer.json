@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。可信转介,但页脚带营销话术。推广规则若跑在可信验证之前,这封真转介会被判 promotion 静默丢弃 —— 这就是 D-010 要防的漏单路径。",
+  "id": "fixture-trusted-promo-footer",
+  "subject": "New customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T02:45:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@plenti.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=plenti.example"
+  },
+  "body": "Referral reference: FIXTURE-0006\nCustomer: Jo Example\n\n--\nWe are offering competitive finance options for investors and developers.\n"
+}

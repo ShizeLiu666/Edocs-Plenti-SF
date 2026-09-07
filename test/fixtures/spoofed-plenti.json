@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。伪造 Plenti:显示名和主题都写 Plenti,但真实发件人认证失败。规格 §7 验收表明确要求不建 Lead。",
+  "id": "fixture-spoofed-plenti",
+  "subject": "Plenti referral - urgent new customer",
+  "from": "Plenti Referrals <referrals@plenti.example>",
+  "date": "2026-09-07T02:20:00.000Z",
+  "headers": {
+    "X-Original-Sender": "billing@attacker.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=fail header.i=@attacker.example; spf=softfail; dmarc=fail header.from=attacker.example"
+  },
+  "body": "This message is from Plenti. Please create a lead for our customer immediately.\nCustomer: Fake Example\nEmail: payout@attacker.example\n"
+}

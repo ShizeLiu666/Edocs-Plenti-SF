@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。可信域名的子域名。当前实现是 fail-closed:子域名不自动可信,要用就把它显式列进 PLENTI_TRUSTED_SENDERS。样本若显示 Plenti 确实用子域名发信,改配置即可,不必改代码。",
+  "id": "fixture-subdomain-sender",
+  "subject": "New customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T03:00:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@mail.plenti.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=mail.plenti.example"
+  },
+  "body": "Referral reference: FIXTURE-0009\nCustomer: Lee Example\n"
+}

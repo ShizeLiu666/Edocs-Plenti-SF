@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。可信发件人用 no-reply 地址。模板会把 no-reply 一律当自动邮件 ignore,那样会漏单(PLENTI_ADAPTATION.md 第 2 条)。",
+  "id": "fixture-trusted-noreply",
+  "subject": "New customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T02:40:00.000Z",
+  "headers": {
+    "X-Original-Sender": "no-reply@plenti.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=plenti.example"
+  },
+  "body": "Referral reference: FIXTURE-0005\nCustomer: Ash Example\nDo not reply to this address.\n"
+}

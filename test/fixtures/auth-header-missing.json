@@ -1,0 +1,11 @@
+{
+  "_note": "虚构样本。发件人可信,但 Google Groups 没有保留 X-Original-Authentication-Results —— 规格 §5.1 明确说不能假设这个头一定在。",
+  "id": "fixture-auth-header-missing",
+  "subject": "New customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T02:30:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@plenti.example"
+  },
+  "body": "Referral reference: FIXTURE-0003\nCustomer: Sam Example\n"
+}

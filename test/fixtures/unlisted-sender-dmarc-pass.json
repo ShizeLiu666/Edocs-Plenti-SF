@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。DMARC 通过但发件人不在可信清单里 —— 认证通过不等于是 Plenti。",
+  "id": "fixture-unlisted-sender",
+  "subject": "Customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T02:25:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@otherbroker.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=otherbroker.example"
+  },
+  "body": "Referral reference: FIXTURE-0002\nCustomer: Robin Example\n"
+}

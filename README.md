@@ -11,15 +11,37 @@ Plenti 的转介线索,在 Salesforce 建 Lead,并记录 SLA 所需的时间戳�
 
 ---
 
-## 当前状态:Phase 1(本地地基)—— 不可上线
+## 当前状态:Phase 2 完成 —— 不可上线
 
-已完成:仓库、目录结构、`.gitignore`、`appsscript.json`、离线测试入口。
+**定位**(DECISIONS D-007):`src/Plenti.gs` 是主干,本项目只处理 Plenti
+转介线索;`src/Code.gs` 是基础设施工具库;`src/Legacy.gs` 隔离 info 模型
+专有逻辑,主干一次也不引用它(由离线测试的静态守卫强制检查)。
 
-**尚未完成**:Plenti 解析(Phase 3)、发件人可信验证(Phase 3)、
-业务级去重(Phase 3)、任何 Salesforce 连接验证(Phase 4)。
+已完成:
 
-`src/Code.gs` 与 `src/Tests.gs` 目前是 info 邮箱模板的**原样导入**,
-针对 Plenti 的适配一项都还没做。详见 `docs/DECISIONS.md` 的待办清单。
+- 仓库、目录结构、`.gitignore`、`appsscript.json`(Phase 1)
+- 模板函数三分类,info 专有逻辑隔离进 `Legacy.gs`(D-008)
+- 发件人可信验证 `isPlentiSource_`(规格 §5.1)
+- 三样可继承的东西:排除规则、`review` 兜底、创建前防重锁(规格 §2)
+- 解析骨架 `parsePlentiReferral_`,**字段正则留空**
+- 收信范围收窄到 eDocs 群组(规格 §5.7)
+- `.eml` 留存开关,默认关闭(规格 §5.6)
+
+**尚未完成**:
+
+- **Plenti 字段提取正则**(Phase 3,等 2026-09-09 真实样本)。骨架期
+  `parsePlentiReferral_` 恒返回 `unknown` / 低置信度,所有邮件转 review,
+  **永远不会创建 Lead** —— 这是设计如此,不是缺陷
+- **业务级去重的 referral ID 存储**(Q6)。`plFindReferral_` 是 fail-closed
+  桩,直接抛错;宁可整条路径卡死,也不在没有业务级去重的情况下建 Lead
+- **补充资料更新已有 Lead 的路径**(Q6)。`kind==='supplement'` 目前只转 review
+- **review 状态的自动解除**(Q9,阻塞于 Q1)。`plRefreshReview_` 是空操作桩,
+  `SF-Lead-Review` 标签需人工处理
+- 任何 Salesforce 连接与字段映射验证(Phase 4)
+
+⚠️ `isPlentiSource_` 的实现**必须用 2026-09-09 拿到的真实样本验证**。不能假设
+Google Groups 一定保留了 `X-Original-Sender` 和 `X-Original-Authentication-Results`
+这两个头。拿到样本第一件事是打印全部邮件头确认。
 
 ---
 
@@ -71,8 +93,17 @@ node test/offline.cjs
 `UrlFetchApp.fetch` 被替换为直接抛错的桩 —— **测试不会连接 Gmail 或
 Salesforce,不会读写任何真实记录**。
 
-当前基线(规格 §6 Phase 1 第 4 项):11 分类 + 2 字段提取 + 3 边界 +
-8 标签 + 6 短询问 + 6 购买意图 + 3 回复地址 + 多行地址 + 6 去重 + 安全门槛。
+测试内容分三层:
+
+1. **静态守卫** —— 断言 `Code.gs` / `Plenti.gs` 去掉注释后不出现 `Legacy.gs`
+   定义的任何函数名,并断言 `Legacy.gs` 的每一行都按原顺序出现在 handoff
+   原件里。Apps Script 是单一全局作用域,文件头声明靠人自觉,这道检查是强制的。
+   守卫自身带正反向自测。
+2. **模板基线** —— 规格 §6 Phase 1 第 4 项列出的那些用例,一条不少:
+   11 分类 + 2 字段提取 + 3 边界 + 8 标签 + 6 短询问 + 6 购买意图 +
+   3 回复地址 + 多行地址 + 6 去重 + 安全门槛。
+3. **Plenti 路径** —— 可信验证、域名边界绕过、排除规则、空发件人、解析骨架、
+   fail-closed 去重、防重锁、字段映射、`.eml` 开关、端到端分流。
 
 > 输出中 `8 Lead-only label cases` 出现两次,是 `testPurchaseIntentUpgrade`
 > 与 `testMultilineReplyRepair` 各自嵌套调用了一次 `testLeadOnlyLabels()`,
@@ -86,12 +117,14 @@ Salesforce,不会读写任何真实记录**。
 ├── appsscript.json       Apps Script manifest(时区 Australia/Adelaide)
 ├── .clasp.json           本地生成,已 gitignore,Phase 4 才创建
 ├── src/
-│   ├── Code.gs           主流程(Phase 1 为模板原样导入)
-│   ├── Plenti.gs         Plenti 专用解析(Phase 3 实现,当前仅占位)
-│   └── Tests.gs          回归测试(Phase 1 为模板原样导入)
+│   ├── Plenti.gs         **主干** —— plProcess_ 及全部 Plenti 逻辑
+│   ├── Code.gs           基础设施工具库(SF REST / 属性 / 状态 / 标签 / 定时入口)
+│   ├── Legacy.gs         info 模型专有逻辑,原文隔离,主干不引用
+│   ├── Tests.gs          模板回归测试(原文未改,兼作 Legacy 未被改动的守卫)
+│   └── PlentiTests.gs    Plenti 路径回归测试
 ├── test/
-│   ├── offline.cjs       沙箱测试入口
-│   └── fixtures/         虚构样本邮件(规则见该目录 README)
+│   ├── offline.cjs       沙箱测试入口 + 静态守卫
+│   └── fixtures/         虚构样本邮件 .json(规则见该目录 README)
 └── docs/
     ├── eDocs-Plenti-Intake-开发规格.md   项目规格
     ├── DECISIONS.md                      决策记录与待办
@@ -106,7 +139,9 @@ Salesforce,不会读写任何真实记录**。
 ## Script Properties
 
 所有环境相关值一律走 Script Properties,**代码中不硬编码**,缺失即抛错停止。
-完整清单(含 Phase 2/3 才引入的属性)见 [docs/DECISIONS.md](docs/DECISIONS.md)。
+Phase 2 新增四项:`INTERNAL_DOMAIN`、`EDOCS_GROUP_ADDRESS`、
+`PLENTI_TRUSTED_SENDERS`、`ATTACH_RAW_EMAIL`(默认关闭)。
+完整清单与格式说明见 [docs/DECISIONS.md](docs/DECISIONS.md)。
 
 凭据**不写进仓库**,只通过获准的安全方式配置,不发在聊天或邮件中。
 
@@ -149,6 +184,10 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
   Flow 可能被创建动作触发,需单独验证。
 - 并非每条 review 都对应一条 Salesforce 记录 —— `SF-Lead-Review` 标签既
   可能是已创建的待审核 Lead,也可能是尚未唯一匹配的邮件。
+- **不可信邮件一律转 review。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂
+  `SF-Lead-Review` 标签。这是规格 §5.1 的要求(验证不通过 → review),
+  代价是审核噪音。是否放宽等 Q10 拿到真实流量数据再定。
+- **review 状态目前没有自动解除机制**(Q9)。标签需要人工处理。
 - **Business Hours 当前配置错误**(Los Angeles 时区 + 24/7),必须改为
   Adelaide 时区、正确营业时间并加入南澳公共假期。这是本项目之外的
   Salesforce 配置任务,但**在它修好之前任何"工作日"计算都是错的**。

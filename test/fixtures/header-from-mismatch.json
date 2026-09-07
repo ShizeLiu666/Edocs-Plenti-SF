@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。发件人在可信清单、dmarc=pass,但 header.from 指向另一个域 —— 认证结果描述的不是这封信的发件人。",
+  "id": "fixture-header-from-mismatch",
+  "subject": "New customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T03:05:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@plenti.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=newsletter.example"
+  },
+  "body": "Referral reference: FIXTURE-0010\nCustomer: Pat Example\n"
+}

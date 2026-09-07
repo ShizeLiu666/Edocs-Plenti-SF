@@ -1,0 +1,12 @@
+{
+  "_note": "虚构样本。可信 Plenti 新转介:两个头齐全,dmarc=pass,发件人在 PLENTI_TRUSTED_SENDERS 里。",
+  "id": "fixture-trusted-referral",
+  "subject": "New customer referral",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-07T02:15:00.000Z",
+  "headers": {
+    "X-Original-Sender": "Referrals <referrals@plenti.example>",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass header.i=@plenti.example; spf=pass smtp.mailfrom=plenti.example; dmarc=pass header.from=plenti.example"
+  },
+  "body": "Referral reference: FIXTURE-0001\nCustomer: Dale Example\nEmail: dale.example@example.net\nPhone: 0400 000 001\nSite address: 12 Fictional Street, Sampletown SA 5000\n"
+}
