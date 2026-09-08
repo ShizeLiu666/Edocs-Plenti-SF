@@ -599,10 +599,89 @@ function testPlentiRecipientAllowlist(){
 }
 
 // ============================================================
+// 16. R3 临时强制创建开关 —— ⚠️ Phase 4 后连同被测代码一起删除
+// ============================================================
+
+function testPlentiForceCreate(){
+ plTestBaseline_();
+ var message=plTestMessage_('trusted-referral');
+
+ // 默认关闭:未配置 = false
+ plAssertEq_(plForceCreate_(),false,'PLENTI_FORCE_CREATE defaults to off when unset');
+ plTestSetProps_({PLENTI_FORCE_CREATE:'false'});
+ plAssertEq_(plForceCreate_(),false,'explicit "false" stays off');
+ plTestSetProps_({PLENTI_FORCE_CREATE:'TRUE'});
+ plAssertEq_(plForceCreate_(),false,'only the exact lowercase string "true" turns it on');
+ plTestSetProps_({PLENTI_FORCE_CREATE:null});
+
+ // 关闭时:置信度判定照旧生效,不建 Lead
+ plTestWithFakeApi_(function(calls){
+  var s=plProcess_(message,false);
+  plAssertEq_(s.state,'review','with the switch off the confidence gate still rejects');
+  plAssert_(!s.forced,'no forced marker when the switch is off');
+  plAssertEq_(plTestPosts_(calls).length,0,'switch off means no Lead is written');
+ });
+
+ // 打开时:绕过置信度门,真正走到 plCreateLead_
+ plTestClearState_();
+ plTestSetProps_({PLENTI_FORCE_CREATE:'true'});
+ var posted=plTestWithFakeApi_(function(calls){
+  var s=plProcess_(message,false);
+  plAssertEq_(s.created,true,'forced mode reaches Lead creation');
+  plAssertEq_(s.forced,true,'the state records that this run was forced');
+  plAssert_(/^\[FORCED\] /.test(s.reason),'the reason is prefixed so a reviewer can tell');
+  var p=plTestPosts_(calls);
+  plAssertEq_(p.length,1,'exactly one Lead POST');
+  return p[0].data;
+ });
+
+ // 合成值的两条安全约束
+ plAssert_(/@example\.invalid$/.test(posted.Email),'the synthetic customer email must use the unroutable .invalid TLD so no Salesforce Flow can mail a real address');
+ plAssert_(posted.Email!=='referrals@plenti.example','the synthetic email must never fall back to the sender address');
+ plAssert_(/Forced Test/.test(posted.LastName),'the synthetic name is obviously test data');
+ plAssertEq_(posted.LeadSource,'Plenti','the real field mapping is still exercised — that is the point of the switch');
+ plAssertEq_(posted.Plenti_Received_At__c,message.getDate().toISOString(),'the received timestamp is still the real message date');
+
+ // 解析器保持诚实:强制模式不改 parsePlentiReferral_ 的返回
+ var honest=parsePlentiReferral_(message);
+ plAssertEq_(honest.kind,'unknown','the parser must not lie about what it parsed, even in forced mode');
+ plAssertEq_(honest.confidence,'low','confidence stays low');
+
+ // 合成结果保留真实解析到的值,只补空缺
+ var partial={kind:'unknown',referralId:'REAL-123',customer:{firstName:'',lastName:'Realname',email:'',phone:'0400000000',street:'',city:'',state:'',postcode:''},confidence:'low',missing:[],ambiguous:[],reason:''};
+ var filled=plForcedParse_(message,partial);
+ plAssertEq_(filled.referralId,'REAL-123','a real referral id is preserved');
+ plAssertEq_(filled.customer.lastName,'Realname','a real name is preserved');
+ plAssertEq_(filled.customer.phone,'0400000000','a real phone is preserved');
+ plAssert_(/@example\.invalid$/.test(filled.customer.email),'only the missing field is synthesised');
+
+ // 前后两层去重仍然有效。
+ // 顺序要紧:防重锁的用例必须紧接在上面那次真实创建之后跑 —— 那次创建留下的
+ // IV2_CREATE_ 正是它的前置条件,先 plTestClearState_() 会把前置条件清掉。
+ plTestWithFakeApi_(function(calls){
+  plAssertThrows_(function(){plCreateLead_(message,plForcedParse_(message,parsePlentiReferral_(message)));},
+   /Earlier create outcome is uncertain/,'the IV2_CREATE_ lock still applies in forced mode');
+  plAssertEq_(plTestPosts_(calls).length,0,'the blocked retry writes nothing');
+ });
+ plTestClearState_();
+ plTestWithFakeApi_(function(calls){
+  ivQuery_=function(q){calls.push({kind:'query',query:q});return [{Id:'00Qexisting00001AAA',Description:'[Intake: '+message.getId()+']',IsConverted:false,Status:'New'}];};
+  var r=plResolve_(message,plForcedParse_(message,parsePlentiReferral_(message)),true);
+  plAssert_(r.lead&&!r.create,'forced mode still honours the message-marker layer');
+  plAssertEq_(plTestPosts_(calls).length,0,'a second run of the same message must not create a second Lead');
+ });
+
+ plTestSetProps_({PLENTI_FORCE_CREATE:null});
+ plTestBaseline_();
+ console.log('PASS: 18 force-create switch cases (TEMPORARY — remove with D-017 after Phase 4)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiForceCreate();
  testPlentiRecipientAllowlist();
  testPlentiSourceTrust();
  testPlentiTrustedSenderBoundary();

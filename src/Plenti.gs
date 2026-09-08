@@ -16,6 +16,7 @@
  * │ B. isPlentiSource_     发件人可信验证(规格 §5.1)             │
  * │      不可信 → review,plUntrustedReason_ 只细化 reason         │
  * │ C. parsePlentiReferral_ 仅可信邮件走到这;骨架期恒返回 unknown  │
+ * │    ⚠️ [R3 临时] PLENTI_FORCE_CREATE=true 可绕过置信度门(D-017) │
  * │ D. plResolve_          三层去重;referral 存储未实现即抛错      │
  * │ E. plCreateLead_       IV2_CREATE_ 防重锁 → POST → 回读        │
  * │ F. ivAttachSource_     仅 ATTACH_RAW_EMAIL==='true' 时执行     │
@@ -344,6 +345,50 @@ function parsePlentiReferral_(message){
 // D. 去重与解析目标
 // ============================================================
 
+// ============================================================
+// R3 临时强制创建开关 —— ⚠️ Phase 4 结束后必须整节删除
+// ============================================================
+
+/**
+ * ⚠️⚠️ 临时代码,DECISIONS D-017。Phase 4 验收结束后**连同 plForcedParse_
+ * 和两处调用点一起删掉**,不要留到上线。
+ *
+ * 存在理由:解析骨架恒返回 unknown/low,`plCreateLead_` 在正常路径上执行不到,
+ * 于是"真正写 Lead"这一跳是整条链里唯一没被任何代码验证过的。这个开关让它
+ * 在拿到样本之前也能被真实跑一次。
+ *
+ * PLENTI_FORCE_CREATE 精确等于字符串 'true' 才算开。未配置 = 关闭。
+ * 与 ATTACH_RAW_EMAIL 同样刻意不抛错 —— 默认关闭才是安全方向。
+ *
+ * **开关只在这一个函数里读。** 正常判定逻辑一行未改:调用点各是一个单行
+ * guard,`parsePlentiReferral_` 保持诚实(照旧返回 unknown/low,不让解析器
+ * 谎报自己解析成功)。
+ */
+function plForceCreate_(){return PropertiesService.getScriptProperties().getProperty('PLENTI_FORCE_CREATE')==='true';}
+
+/**
+ * ⚠️ 临时代码,随 plForceCreate_ 一起删。
+ *
+ * 把解析结果补成刚好能过 plResolve_ 的最小集合。**保留所有真实解析到的值**,
+ * 只填空缺 —— Phase 3 填了正则之后,强制模式仍会用真实值,只补缺的那几个。
+ *
+ * 合成值的两条安全约束:
+ *   - referralId 用 FORCED-<msgId>:与消息一一对应,重跑同一封不会变,
+ *     且一眼看得出是测试数据
+ *   - email 用 @example.invalid:`.invalid` 是 RFC 2606 保留的不可路由 TLD。
+ *     **这一条是防止 Salesforce 的自动回复 Flow 真的把邮件发给某个真实地址** ——
+ *     绝不能拿发件人地址来兜底,那正是规格 §5.2 禁止的事。
+ */
+function plForcedParse_(message,parsed){
+ var id=message.getId(),forced={kind:'referral',customer:{},confidence:'high',missing:[],ambiguous:[],
+  reason:'PLENTI_FORCE_CREATE bypassed the confidence gate; values below may be synthetic'};
+ forced.referralId=parsed.referralId||('FORCED-'+id);
+ Object.keys(parsed.customer).forEach(function(k){forced.customer[k]=parsed.customer[k];});
+ if(!forced.customer.lastName)forced.customer.lastName='Forced Test '+id;
+ if(!forced.customer.email)forced.customer.email='forced-'+id+'@example.invalid';
+ return forced;
+}
+
 /**
  * 业务级去重的第三层:按 Plenti referral ID 找已有 Lead(规格 §5.4)。
  *
@@ -371,7 +416,7 @@ function plFindReferral_(referralId){
  *      (info 与 eDocs 写入同一个 Salesforce,两边的锁无法跨项目原子操作,
  *       这是已知限制,不是完备方案)
  */
-function plResolve_(message,parsed){
+function plResolve_(message,parsed,forced){
  var email=String(parsed.customer.email||'').toLowerCase();
  if(!email)return {review:'Customer email missing; refusing to create a Lead from the sender address'};
  if(!parsed.referralId)return {review:'Plenti referral ID missing; business-level deduplication impossible'};
@@ -380,7 +425,11 @@ function plResolve_(message,parsed){
  var sourced=leads.filter(function(l){return String(l.Description||'').indexOf(marker)>=0;});
  if(sourced.length===1)return {lead:sourced[0]};
  if(sourced.length>1)return {review:'Multiple Leads carry this message marker; manual review required'};
- var byReferral=plFindReferral_(parsed.referralId);
+ // ⚠️ [R3 临时] 强制模式跳过业务级去重 —— plFindReferral_ 是必抛错的 fail-closed
+ // 桩,不跳过就到不了 plCreateLead_。跳过是安全的:强制模式的 referralId 是
+ // FORCED-<msgId>,与消息一一对应,而第一层的 marker 去重已经按消息 ID 挡过一次,
+ // 业务级这一层在此模式下本就是冗余的。D-017,Phase 4 后删。
+ var byReferral=forced?null:plFindReferral_(parsed.referralId);
  if(byReferral)return {lead:byReferral,supplement:true};
  var open=leads.filter(function(l){return !l.IsConverted&&l.Status!=='Unqualified';});
  if(open.length)return {review:'Existing active Lead for this customer email; confirm same request versus a new project'};
@@ -528,14 +577,24 @@ function plProcess_(message,force){
    ivSave_(id,state);
    return state;
   }
+  var forced=false;
   if(parsed.kind!=='referral'||parsed.confidence!=='high'){
-   state.state='review';
-   state.leadCandidate=true;
-   state.reason='Plenti referral could not be parsed with confidence: '+parsed.reason;
-   ivSave_(id,state);
-   return state;
+   // ⚠️ [R3 临时] 唯一一处绕过置信度判定的地方。D-017,Phase 4 后连同
+   // plForceCreate_ / plForcedParse_ 一起删。上面的判定逻辑一行未改。
+   if(!plForceCreate_()){
+    state.state='review';
+    state.leadCandidate=true;
+    state.reason='Plenti referral could not be parsed with confidence: '+parsed.reason;
+    ivSave_(id,state);
+    return state;
+   }
+   console.log('⚠️ PLENTI_FORCE_CREATE is enabled — bypassing the confidence gate for message '+id+' (was: '+parsed.reason+')');
+   parsed=plForcedParse_(message,parsed);
+   forced=true;
+   state.kind=parsed.kind;
+   state.forced=true;
   }
-  var resolved=plResolve_(message,parsed);
+  var resolved=plResolve_(message,parsed,forced);
   if(resolved.review){
    state.state='review';
    state.leadCandidate=true;
@@ -561,7 +620,7 @@ function plProcess_(message,force){
   state.attached=ivAttachSource_(message,{id:lead.Id});
   state.state='review';
   state.leadCandidate=true;
-  state.reason=state.created?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by message marker';
+  state.reason=(forced?'[FORCED] ':'')+(state.created?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by message marker');
   ivSave_(id,state);
   return state;
  }catch(e){

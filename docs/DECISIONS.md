@@ -492,6 +492,95 @@ Apps Script 会要求重新授权。** 部署时注意。
 
 ---
 
+## D-017 ⚠️ 临时强制创建开关 —— Phase 4 结束后必须删除
+
+**日期** 2026-09-08 · **决定人** Jack · **阶段** R3,已实现 · **状态:🔴 临时代码**
+
+### 为什么需要
+
+解析骨架恒返回 `unknown/low`,`plCreateLead_` 在正常路径上执行不到,于是
+**"真正写 Lead"这一跳是整条链里唯一没被任何代码验证过的**。昨天沙箱建 Lead
+成功走的是已废弃的 Apex 路线,与 `plCreateLead_` 无关。
+
+`PLENTI_FORCE_CREATE` 设为字符串 `'true'` 时绕过置信度判定直接走创建路径。
+未配置 = 关闭(与 `ATTACH_RAW_EMAIL` 同样刻意不抛错 —— 默认关闭才是安全方向)。
+
+### 加在哪一层
+
+要绕过的是**两道**门,不是一道:
+
+1. `plProcess_` 的置信度判定
+2. `plResolve_` 里的 `plFindReferral_` —— 那是必抛错的 fail-closed 桩,
+   不绕过照样到不了 `plCreateLead_`
+
+**开关只在 `plForceCreate_()` 一个函数里读**,两个调用点各是一个单行 guard,
+正常判定逻辑一行未改。
+
+**`parsePlentiReferral_` 保持诚实** —— 照旧返回 `unknown/low`,不让解析器谎报
+自己解析成功。有断言锁住这一点。
+
+### 保留了什么
+
+| 层 | 强制模式下 |
+|---|---|
+| 第 1 层 邮件级 marker 去重 | ✅ 保留 —— 同一封邮件跑两次不会建两个 Lead |
+| 第 2 层 业务级 referral ID | ⏭️ 跳过 —— 存储未实现,且强制模式的 ID 是 `FORCED-<msgId>`,与消息一一对应,第 1 层已按消息 ID 挡过一次,这一层在此模式下本就冗余 |
+| 第 3 层 跨邮箱活跃 Lead 检查 | ✅ 保留 |
+| `IV2_CREATE_` 防重锁 | ✅ 保留 |
+
+### 合成值的两条安全约束
+
+`plForcedParse_` **保留所有真实解析到的值,只填空缺**(Phase 3 填了正则之后仍
+适用)。合成的两个值:
+
+- `referralId` = `FORCED-<msgId>` —— 与消息一一对应,重跑不变,一眼看得出是测试数据
+- `email` = `forced-<msgId>@example.invalid` —— ⚠️ **`.invalid` 是 RFC 2606 保留的
+  不可路由 TLD。这一条是防止 Salesforce 的自动回复 Flow 真的把邮件发给某个真实
+  地址。** 绝不拿发件人地址兜底 —— 那正是规格 §5.2 禁止的事。
+
+### 可见性:三个地方都喊
+
+1. `console.log` 每轮开头:`⚠️⚠️ PLENTI_FORCE_CREATE is ENABLED …`
+2. 每轮 summary JSON 里 `forceCreate:true`
+3. **Sheet 的错误摘要列前缀 `[PLENTI_FORCE_CREATE ENABLED]`** —— 几个月后翻这张
+   表必须一眼看得出哪几轮是绕过判定写进去的。不新增列,用唯一的自由文本列。
+
+另有一条**只告警不拦截**的检查:开关打开但 `SF_LOGIN_URL` 不像沙箱域名时打一条
+更醒目的日志。不拦截是因为沙箱域名形态不是本项目能担保的判据,拦错了会挡住正常
+验收 —— 但这一层可以在上线前收紧成硬拦截。
+
+### 🔴 删除清单(Phase 4 验收结束后执行)
+
+```bash
+grep -rn "R3 临时\|D-017\|PLENTI_FORCE_CREATE\|plForceCreate_\|plForcedParse_" src/
+```
+
+逐项:
+
+| 文件 | 删什么 |
+|---|---|
+| `src/Plenti.gs` | 整节 "R3 临时强制创建开关"(`plForceCreate_` + `plForcedParse_`);`plResolve_` 的 `forced` 参数与那个三元;`plProcess_` 的 `if(!plForceCreate_())` 分支,恢复成直接 return;终态 reason 的 `[FORCED]` 前缀;文件头流程图那一行 |
+| `src/Code.gs` | `stats.forced` 及两条告警;summary JSON 的 `forceCreate`;`ivLogRun_` 的 `[PLENTI_FORCE_CREATE ENABLED]` 前缀;文件头注释那一行 |
+| `src/PlentiTests.gs` | 整个 `testPlentiForceCreate` 及入口里的调用 |
+| Script Properties | 删掉 `PLENTI_FORCE_CREATE` 键本身 |
+
+删完 `node test/offline.cjs` 应回到 31 项全绿。
+
+---
+
+## L-03 Sheet 错误摘要现在带消息 ID
+
+**日期** 2026-09-08
+
+L-01 触发后要人工删除的键是 `IV2_CREATE_<Gmail 消息 ID>`。原先该 ID 只出现在
+`console.log`(`Plenti intake error <id>: <reason>`),而 Apps Script 日志保留期短 ——
+Sheet 才是长期留底,却不带 ID,事后无从下手。
+
+现在 `stats.errors` 的每一条是 `<消息 ID>: <原因>`。这是在既有列里加内容,
+没有改列结构。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -698,6 +787,7 @@ watermark 的校验保持原样。
 |---|---|---|
 | `INTAKE_RECIPIENT_ALLOWLIST` | 收件人白名单(D-015)。格式同 `PLENTI_TRUSTED_SENDERS`:逗号分隔,`user@domain` 或 `@domain` | **抛错停止** |
 | `INTAKE_LOG_SHEET_ID` | 运行日志 Google Sheet 的 ID(D-016) | **跳过,不报错** |
+| `PLENTI_FORCE_CREATE` | 🔴 **临时**(D-017)。`'true'` 时绕过置信度判定直接建 Lead。**Phase 4 结束后连同代码一起删** | 视为 `false`,不报错 |
 
 ### 运行时写入(不要手工设置,不要清空)
 
@@ -720,7 +810,7 @@ watermark 的校验保持原样。
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
 | ~~Q6~~ | **已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
-| Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计** | 上线前 | §1 PLT003 |
+| Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |
 | Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
 | Q10 | **不可信邮件全部转 review 的审核噪音。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂 Review 标签。按规格实现,不放宽;Jack 去问 eDocs 日均邮件量,**决策依据是真实流量数据,不是"感觉太吵"** | 上线前评估 | §5.1 / D-010 |

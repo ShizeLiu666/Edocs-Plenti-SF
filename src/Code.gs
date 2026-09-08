@@ -14,6 +14,7 @@
  *   - ivRefreshOutstanding_:改调 plProcess_ / plRefreshReview_
  *   - [R1] runIntakeV2:收件人白名单过滤 + 本轮统计
  *   - [R2] 新增 ivLogRun_:每轮追加一行到 Google Sheet(可选,失败不影响主流程)
+ *   - [R3 临时] runIntakeV2:强制创建模式的告警与标注 —— Phase 4 后删(D-017)
  *
  * info 模型专有的逻辑已移至 src/Legacy.gs,本文件不引用其中任何函数。
  */
@@ -108,7 +109,10 @@ function ivLogRun_(began,stats){
  try{
   var sheet=SpreadsheetApp.openById(id).getSheets()[0];
   if(sheet.getLastRow()===0)sheet.appendRow(['Run at','Threads scanned','Messages processed','Leads created','Failures','Error summary','Duration (s)']);
-  sheet.appendRow([new Date(began).toISOString(),stats.threads,stats.processed,stats.created,stats.failed,stats.errors.join(' | ').slice(0,2000),Math.round((Date.now()-began)/1000)]);
+  // 强制模式写进错误摘要列(唯一的自由文本列),不新增列 —— 几个月后翻这张表
+  // 必须一眼看得出哪几轮是绕过判定写进去的。
+  var summary=(stats.forced?'[PLENTI_FORCE_CREATE ENABLED] ':'')+stats.errors.join(' | ');
+  sheet.appendRow([new Date(began).toISOString(),stats.threads,stats.processed,stats.created,stats.failed,summary.slice(0,2000),Math.round((Date.now()-began)/1000)]);
   return true;
  }catch(e){
   console.log('Run log could not be written to the sheet: '+String(e.message||e).slice(0,300));
@@ -141,7 +145,14 @@ function runIntakeV2(){
  // 一个本意为"收窄范围"的开关,缺失时不能反而变成最宽。
  var allow=plRecipientAllowlist_();
  // [R2] 本轮统计,执行结束后追加一行到 Google Sheet。
- var stats={threads:0,skipped:0,processed:0,created:0,failed:0,errors:[]};
+ var stats={threads:0,skipped:0,processed:0,created:0,failed:0,errors:[],forced:plForceCreate_()};
+ // ⚠️ [R3 临时] 强制创建会绕过置信度判定直接写 Lead。每轮都喊一次,避免忘了关。
+ // D-017,Phase 4 结束后连同 plForceCreate_ / plForcedParse_ 一起删。
+ if(stats.forced){
+  console.log('⚠️⚠️ PLENTI_FORCE_CREATE is ENABLED — the confidence gate is bypassed and Leads will be written. Turn this off after Phase 4 validation.');
+  // 只告警不拦截:sandbox 域名形态不是本项目能担保的判据,拦错了会挡住正常验收。
+  if(String(p.getProperty('SF_LOGIN_URL')||'').indexOf('.sandbox.my.salesforce.com')<0)console.log('⚠️⚠️⚠️ PLENTI_FORCE_CREATE is enabled but SF_LOGIN_URL does not look like a sandbox. Confirm the target org before continuing.');
+ }
  while(Date.now()-began<220000){
  var threads=GmailApp.search(query,offset,50);if(!threads.length){done=true;break;}
  for(var i=0;i<threads.length;i++){
@@ -157,7 +168,9 @@ function runIntakeV2(){
   if(!old||old.state==='error'){
    var result=plProcess_(msgs[j],false);count++;stats.processed++;
    if(result&&result.created&&result.record)stats.created++;
-   if(result&&result.state==='error'){stats.failed++;if(stats.errors.length<5)stats.errors.push(String(result.reason||'').slice(0,200));}
+   // 摘要带上消息 ID:L-01 触发后要删的键是 IV2_CREATE_<消息 ID>,
+   // Sheet 是长期留底,不带 ID 的话事后无从下手(console.log 保留期短)。
+   if(result&&result.state==='error'){stats.failed++;if(stats.errors.length<5)stats.errors.push(msgs[j].getId()+': '+String(result.reason||'').slice(0,200));}
   }
  }
  // [R1] 整条 thread 都不在范围内就不同步标签 —— 共用邮箱里这类 thread 占多数,
@@ -168,7 +181,7 @@ function runIntakeV2(){
  if(i<threads.length)break;offset+=threads.length;if(threads.length<50){done=true;break;}}
  var all=p.getProperties(),errors=Object.keys(all).some(function(k){if(k.indexOf('IV2_MSG_')!==0)return false;try{return JSON.parse(all[k]).state==='error'}catch(e){return true}});
  if(done&&!errors)p.setProperty('INTAKE_V2_WATERMARK',new Date(began).toISOString());
- console.log(JSON.stringify({reviewed:count,skippedOutOfScope:stats.skipped,threads:stats.threads,created:stats.created,failed:stats.failed,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
+ console.log(JSON.stringify({reviewed:count,skippedOutOfScope:stats.skipped,threads:stats.threads,created:stats.created,failed:stats.failed,forceCreate:stats.forced,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
  ivLogRun_(began,stats);
  }finally{lock.releaseLock();}
 }
