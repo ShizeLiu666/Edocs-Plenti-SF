@@ -413,6 +413,85 @@ Lead;§7 验收表"同一封邮件跑两次不重复建"走的也是同一条路
 
 ---
 
+## D-015 收件人白名单是范围过滤,不是分类判断
+
+**日期** 2026-09-08 · **决定人** Jack · **阶段** R1,已实现
+
+eDocs 是业务共用邮箱,进来的邮件绝大多数与 Plenti 无关。加一层前置过滤:
+只有投递给 `INTAKE_RECIPIENT_ALLOWLIST` 里指定地址的邮件才进 Plenti 处理流程。
+
+### 不命中的邮件直接跳过,不写状态、不打标签
+
+**这不违反规格 §2 "认不出来转人工,绝不静默丢弃"。** 那条针对的是**分类不确定**
+时不得丢弃;地址白名单是确定性的边界,与 §5.7 的 `list:` 查询同一性质 ——
+`list:` 也把组外邮件全部排除且不留任何记录。
+
+实现位置因此放在 `runIntakeV2` 的循环里(范围过滤),而不是 `plProcess_` 内部
+(那会为每封无关邮件写一条 `IV2_MSG_*`,而 Script Properties 有 500KB 上限)。
+
+### 检查哪些头:To / Cc / Delivered-To / X-Original-To,取并集
+
+| 头 | 依据 |
+|---|---|
+| `To` / `Cc` | 发信人写在信头上的收件人。Groups 转发后 To 通常仍是组地址,多数情况够用。但它**发信人可控**,且 BCC 投递时不出现 |
+| `Delivered-To` | 接收方 MTA 实际投递时加的,值是真正的投递信箱。Gmail 会写;Groups 投递给成员的副本通常带 `Delivered-To: <成员地址>` |
+| `X-Original-To` | Postfix 系约定。Gmail 一般**不**写,列上是兜底,成本为零 |
+
+⚠️ **我对 Google Groups 实际写哪个头没有百分百把握。** 取并集是为了实测不会因为
+猜错头而一封都进不来。代价是范围偏宽(例如只是被 Cc 也放行)。
+**实测拿到真实邮件后应收窄到实际存在的那个头。**
+
+### 属性缺失即抛错停止
+
+与 `EDOCS_GROUP_ADDRESS`、`INTERNAL_DOMAIN` 一致(规格 §3 禁止 #2)。
+理由:**一个本意为"收窄范围"的开关,缺失时不能反而变成最宽,而且不能是静默的。**
+
+匹配复用 D-009 的域名边界规则(只用相等比较,子域名不自动命中)。
+`plSenderTrusted_` 与 `plRecipientAllowed_` 共用 `plAddressMatches_` 核心,
+但保留各自的函数名 —— 语义不同,一个是"谁发的可信",一个是"投给谁才处理"。
+
+### 一处取舍:整条 thread 都不在范围内就不同步标签
+
+共用邮箱里这类 thread 占多数,每条省下 3 次 Gmail API 调用,避免 220 秒预算被
+无关邮件吃掉。**代价**:若日后把某地址移出白名单,那些 thread 的旧标签不会被
+自动清除,需人工处理。
+
+---
+
+## D-016 每轮执行追加一行到 Google Sheet
+
+**日期** 2026-09-08 · **决定人** Jack · **阶段** R2,已实现
+
+`ivLogRun_` 在 `runIntakeV2` 末尾追加一行。用途有两个:Apps Script 的执行日志
+保留期短,这是长期留底;将来跟 Plenti 做月度对账也用这张表。
+
+列(按 Jack 指定的顺序):
+
+```
+Run at | Threads scanned | Messages processed | Leads created | Failures | Error summary | Duration (s)
+```
+
+空表会先写一行表头。
+
+### 两条失败策略
+
+| 情况 | 行为 | 理由 |
+|---|---|---|
+| `INTAKE_LOG_SHEET_ID` 未配置 | 直接跳过,**不报错** | 这是可选的观测手段,没配不等于配置错误 |
+| 写入失败(ID 错 / 无权限 / 表被删) | 记 `console.log` 后**继续** | 到这一步邮件已处理完、状态已落盘。再抛错会把整轮落成失败,冻结 watermark 并触发 L-01 那条渐进劣化路径 —— **代价远大于丢一行日志** |
+
+⚠️ **需要新 OAuth scope**:`appsscript.json` 已加
+`https://www.googleapis.com/auth/spreadsheets`。**加了 scope 意味着现有授权失效,
+Apps Script 会要求重新授权。** 部署时注意。
+
+### 一处未采纳
+
+`stats.skipped`(被白名单跳过的邮件数)对调白名单很有用,但不在 Jack 指定的
+七列里,**没有加进表**以免改动列结构。它出现在 `console.log` 的
+`skippedOutOfScope` 字段里。要进表随时可加。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -613,6 +692,13 @@ watermark 的校验保持原样。
 | `PLENTI_TRUSTED_SENDERS` | 可信 Plenti 发件地址 / 域(规格 §5.1)。格式见 D-009:逗号分隔,`user@domain` 或 `@domain`,子域名不自动可信。**具体填什么待样本确认** —— 拿到样本第一件事是打印全部邮件头,确认 Groups 是否保留了 `X-Original-Sender` 与 `X-Original-Authentication-Results` |
 | `ATTACH_RAW_EMAIL` | 是否上传 `.eml` 原件到 Salesforce Files。**默认 `false`**,只有精确等于字符串 `'true'` 才开(规格 §5.6 / Q5)。这一项刻意**不抛错** —— 属性缺失即视为关闭,默认关闭才是安全方向 |
 
+### R1 / R2 新增(2026-09-08)
+
+| 属性 | 用途 | 缺失时 |
+|---|---|---|
+| `INTAKE_RECIPIENT_ALLOWLIST` | 收件人白名单(D-015)。格式同 `PLENTI_TRUSTED_SENDERS`:逗号分隔,`user@domain` 或 `@domain` | **抛错停止** |
+| `INTAKE_LOG_SHEET_ID` | 运行日志 Google Sheet 的 ID(D-016) | **跳过,不报错** |
+
 ### 运行时写入(不要手工设置,不要清空)
 
 `INTAKE_V2_WATERMARK`、`IV2_MSG_*`、`IV2_CREATE_*`、`IV2_REF_*`、
@@ -634,6 +720,7 @@ watermark 的校验保持原样。
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
 | ~~Q6~~ | **已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
+| Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计** | 上线前 | §1 PLT003 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |
 | Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
 | Q10 | **不可信邮件全部转 review 的审核噪音。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂 Review 标签。按规格实现,不放宽;Jack 去问 eDocs 日均邮件量,**决策依据是真实流量数据,不是"感觉太吵"** | 上线前评估 | §5.1 / D-010 |

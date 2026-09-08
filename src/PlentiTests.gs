@@ -63,6 +63,7 @@ function plTestSetProps_(obj){
 function plTestBaseline_(){
  plTestSetProps_({
   PLENTI_TRUSTED_SENDERS:'@plenti.example, referrals@partner.example',
+  INTAKE_RECIPIENT_ALLOWLIST:'edocs@example.org, jack.fixture@example.com',
   INTERNAL_DOMAIN:'example.org',
   EDOCS_GROUP_ADDRESS:'edocs@example.org',
   INTAKE_MAILBOX:'edocs-copy@example.org',
@@ -548,10 +549,61 @@ function testPlentiRefreshReviewStub(){
 }
 
 // ============================================================
+// 15. R1 收件人白名单
+// ============================================================
+
+function testPlentiRecipientAllowlist(){
+ plTestBaseline_();
+ var entries=plRecipientAllowlist_();
+
+ function withHeaders(headers){
+  return plTestMessageFrom_({id:'inline-recipient',subject:'New customer referral',
+   date:'2026-09-08T01:00:00.000Z',headers:headers,body:'Referral reference: FIXTURE-0100\n'});
+ }
+
+ // 四个头各自都能命中
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'eDocs <edocs@example.org>'}),entries),true,'To header hit');
+ plAssertEq_(plRecipientAllowed_(withHeaders({'Cc':'edocs@example.org'}),entries),true,'Cc header hit');
+ plAssertEq_(plRecipientAllowed_(withHeaders({'Delivered-To':'jack.fixture@example.com'}),entries),true,'Delivered-To header hit');
+ plAssertEq_(plRecipientAllowed_(withHeaders({'X-Original-To':'edocs@example.org'}),entries),true,'X-Original-To header hit');
+
+ // 一个头里有多个地址,命中在后面
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'"Someone, Else" <other@elsewhere.example>, eDocs <edocs@example.org>'}),entries),true,'second address in a multi-address header');
+
+ // 大小写不敏感
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'EDOCS@EXAMPLE.ORG'}),entries),true,'case insensitive');
+
+ // 全不命中
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'sales@elsewhere.example','Cc':'other@elsewhere.example'}),entries),false,'no allowlisted recipient');
+ plAssertEq_(plRecipientAllowed_(withHeaders({}),entries),false,'no recipient headers at all');
+
+ // 白名单也走域名边界匹配,不是子串
+ var domainEntries=['@plenti.example'];
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'x@plenti.example'}),domainEntries),true,'domain entry hit');
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'x@evil-plenti.example'}),domainEntries),false,'lookalike prefix must not match');
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'x@plenti.example.attacker.example'}),domainEntries),false,'trusted domain as a prefix must not match');
+ plAssertEq_(plRecipientAllowed_(withHeaders({'To':'x@mail.plenti.example'}),domainEntries),false,'subdomain is not automatically allowed');
+
+ // 发件人可信与收件人白名单共用匹配核心,但语义独立,互不影响
+ plAssertEq_(plSenderTrusted_('referrals@plenti.example',plTrustedSenders_()),true,'sender trust still works after refactor');
+ plAssertEq_(plSenderTrusted_('edocs@example.org',plTrustedSenders_()),false,'an allowlisted recipient is not thereby a trusted sender');
+
+ // 属性缺失即抛错停止 —— 收窄范围的开关缺失时不能变成最宽
+ plTestSetProps_({INTAKE_RECIPIENT_ALLOWLIST:null});
+ plAssertThrows_(function(){plRecipientAllowlist_();},/INTAKE_RECIPIENT_ALLOWLIST/,'missing allowlist must stop processing');
+ plTestSetProps_({INTAKE_RECIPIENT_ALLOWLIST:'  ,  '});
+ plAssertThrows_(function(){plRecipientAllowlist_();},/INTAKE_RECIPIENT_ALLOWLIST/,'a list of only separators counts as missing');
+
+ plTestBaseline_();
+ console.log('PASS: 15 recipient allowlist cases including domain-boundary bypasses');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiRecipientAllowlist();
  testPlentiSourceTrust();
  testPlentiTrustedSenderBoundary();
  testPlentiExclusions();

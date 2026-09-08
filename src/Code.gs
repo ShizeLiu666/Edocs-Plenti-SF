@@ -12,6 +12,8 @@
  *   - ivAttachSource_:加 ATTACH_RAW_EMAIL 开关(默认 false),改文件标题
  *   - runIntakeV2:收窄检索范围(规格 §5.7),改调 plProcess_ / plRefreshReview_
  *   - ivRefreshOutstanding_:改调 plProcess_ / plRefreshReview_
+ *   - [R1] runIntakeV2:收件人白名单过滤 + 本轮统计
+ *   - [R2] 新增 ivLogRun_:每轮追加一行到 Google Sheet(可选,失败不影响主流程)
  *
  * info 模型专有的逻辑已移至 src/Legacy.gs,本文件不引用其中任何函数。
  */
@@ -91,6 +93,28 @@ function ivSyncLabels_(thread){
  var flags=ivLeadLabelFlags_(thread.getMessages().map(function(m){return ivGet_(m.getId());}));
  ivLabel_(thread,'SF-Lead-Created',flags.created);ivLabel_(thread,'SF-Lead-Review',flags.review);ivLabel_(thread,'SF-Lead-Updated',flags.updated);
 }
+// [R2] 每轮执行往 Google Sheet 追加一行,供长期留底与将来跟 Plenti 月度对账。
+// Apps Script 的执行日志保留期短,console.log 不能当长期记录用。
+//
+// INTAKE_LOG_SHEET_ID 未配置 → 直接跳过,不报错:这是可选的观测手段,
+// 没配不等于配置错误。
+//
+// 写入失败 → 记 console.log 后继续,**绝不让观测失败拖垮主流程**。到这一步
+// 邮件已经处理完、状态已经落盘;此时再抛错会把整轮落成失败,进而冻结
+// watermark 并触发 L-01 那条渐进劣化路径 —— 代价远大于丢一行日志。
+function ivLogRun_(began,stats){
+ var id=PropertiesService.getScriptProperties().getProperty('INTAKE_LOG_SHEET_ID');
+ if(!id)return false;
+ try{
+  var sheet=SpreadsheetApp.openById(id).getSheets()[0];
+  if(sheet.getLastRow()===0)sheet.appendRow(['Run at','Threads scanned','Messages processed','Leads created','Failures','Error summary','Duration (s)']);
+  sheet.appendRow([new Date(began).toISOString(),stats.threads,stats.processed,stats.created,stats.failed,stats.errors.join(' | ').slice(0,2000),Math.round((Date.now()-began)/1000)]);
+  return true;
+ }catch(e){
+  console.log('Run log could not be written to the sheet: '+String(e.message||e).slice(0,300));
+  return false;
+ }
+}
 function runIntakeV2(){
  var p=PropertiesService.getScriptProperties();if(p.getProperty('INTAKE_V2_ENABLED')!=='true'){console.log('Intake v2 held pending validation.');return;}
  if(p.getProperty('EDOCS_ADAPTATION_VALIDATED')!=='true')throw new Error('Plenti adaptation has not been validated. Read handoff instructions.');
@@ -112,15 +136,40 @@ function runIntakeV2(){
  if(isNaN(cursor.getTime()))throw new Error('Missing valid intake start/watermark');
  ivRefreshOutstanding_(began+30000);
  var lower=Math.max(cut.getTime(),cursor.getTime()-172800000),before=Math.floor(began/1000)+1,query='list:'+ivGroupAddress_()+' after:'+Math.floor(lower/1000)+' before:'+before+' -in:spam -in:trash',offset=0,count=0,done=false;
+ // [R1] 收件人白名单。故意读在 query 构造之后:EDOCS_GROUP_ADDRESS 仍是第一个
+ // 被要求的属性,缺配置时的报错顺序不变。未配置即抛错停止(规格 §3 禁止 #2)——
+ // 一个本意为"收窄范围"的开关,缺失时不能反而变成最宽。
+ var allow=plRecipientAllowlist_();
+ // [R2] 本轮统计,执行结束后追加一行到 Google Sheet。
+ var stats={threads:0,skipped:0,processed:0,created:0,failed:0,errors:[]};
  while(Date.now()-began<220000){
  var threads=GmailApp.search(query,offset,50);if(!threads.length){done=true;break;}
  for(var i=0;i<threads.length;i++){
- var msgs=threads[i].getMessages();for(var j=0;j<msgs.length;j++){if(msgs[j].getDate().getTime()<cut.getTime())continue;plRefreshReview_(msgs[j]);var old=ivGet_(msgs[j].getId());if(!old||old.state==='error'){plProcess_(msgs[j],false);count++;}}
- ivSyncLabels_(threads[i]);if(Date.now()-began>=220000)break;}
+ stats.threads++;
+ var msgs=threads[i].getMessages(),inScope=false;
+ for(var j=0;j<msgs.length;j++){
+  if(msgs[j].getDate().getTime()<cut.getTime())continue;
+  // [R1] 不命中白名单 → 整条跳过,不写状态、不打标签、不占 Properties。
+  if(!plRecipientAllowed_(msgs[j],allow)){stats.skipped++;continue;}
+  inScope=true;
+  plRefreshReview_(msgs[j]);
+  var old=ivGet_(msgs[j].getId());
+  if(!old||old.state==='error'){
+   var result=plProcess_(msgs[j],false);count++;stats.processed++;
+   if(result&&result.created&&result.record)stats.created++;
+   if(result&&result.state==='error'){stats.failed++;if(stats.errors.length<5)stats.errors.push(String(result.reason||'').slice(0,200));}
+  }
+ }
+ // [R1] 整条 thread 都不在范围内就不同步标签 —— 共用邮箱里这类 thread 占多数,
+ // 每条省下 3 次 Gmail API 调用。代价:若日后把某地址移出白名单,那些 thread
+ // 的旧标签不会被自动清除,需人工处理。
+ if(inScope)ivSyncLabels_(threads[i]);
+ if(Date.now()-began>=220000)break;}
  if(i<threads.length)break;offset+=threads.length;if(threads.length<50){done=true;break;}}
  var all=p.getProperties(),errors=Object.keys(all).some(function(k){if(k.indexOf('IV2_MSG_')!==0)return false;try{return JSON.parse(all[k]).state==='error'}catch(e){return true}});
  if(done&&!errors)p.setProperty('INTAKE_V2_WATERMARK',new Date(began).toISOString());
- console.log(JSON.stringify({reviewed:count,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
+ console.log(JSON.stringify({reviewed:count,skippedOutOfScope:stats.skipped,threads:stats.threads,created:stats.created,failed:stats.failed,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
+ ivLogRun_(began,stats);
  }finally{lock.releaseLock();}
 }
 function runSalesforceLeadIntake(){return runIntakeV2();}

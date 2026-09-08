@@ -157,6 +157,10 @@ Phase 2 新增四项:`INTERNAL_DOMAIN`、`EDOCS_GROUP_ADDRESS`、
 | `https://mail.google.com/` | GmailApp:读邮件、加标签 |
 | `.../auth/script.external_request` | UrlFetchApp:调 Salesforce REST API |
 | `.../auth/script.storage` | PropertiesService:去重与处理状态 |
+| `.../auth/spreadsheets` | SpreadsheetApp:每轮执行的运行日志(D-016)|
+
+⚠️ `spreadsheets` 是 R2 新加的 scope。**加 scope 会使现有授权失效,Apps Script
+会要求重新授权。**
 
 `https://mail.google.com/` 是 Gmail 的**完全权限**(读 + 写 + 删),而本项目
 实际只需要读邮件和加标签。**这个 scope 大概率收不窄** —— Apps Script 的内置
@@ -191,6 +195,12 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **review 状态目前没有自动解除机制**(Q9)。标签需要人工处理。
 - `INTAKE_V2_START` 必须配置且可解析,否则 `runIntakeV2` 直接抛错停止 ——
   脚本**不会**在缺配置时回扫历史邮件(DECISIONS TODO-3 修复了模板的这个缺口)。
+- **收件人白名单不命中的邮件不留任何痕迹**(D-015)—— 不写状态、不打标签。
+  这是范围过滤,与 `list:` 查询同一性质,不是"静默丢弃"分类不确定的邮件。
+  若日后把某地址移出白名单,相关 thread 的旧标签不会自动清除。
+- **`IV2_CREATE_` 防重锁不回滚**(DECISIONS L-01):任何 Salesforce 写入失败
+  ——包括明摆着可重试的 500——都需要人工去 Script Properties 删键才能继续,
+  且会冻结 watermark 造成渐进劣化。
 - **Business Hours 当前配置错误**(Los Angeles 时区 + 24/7),必须改为
   Adelaide 时区、正确营业时间并加入南澳公共假期。这是本项目之外的
   Salesforce 配置任务,但**在它修好之前任何"工作日"计算都是错的**。

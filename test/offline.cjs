@@ -111,12 +111,18 @@ const gmail = {
   createLabel() { throw new Error('GMAIL CALL BLOCKED IN OFFLINE TEST'); }
 };
 
+// [R2] Google Sheet 桩。默认抛错(和其他外部服务一致),需要时按用例替换。
+const sheets = {
+  openById() { throw new Error('SPREADSHEET CALL BLOCKED IN OFFLINE TEST'); }
+};
+
 const context = vm.createContext({
   console,
   PLENTI_FIXTURES: fixtures,
   PropertiesService: { getScriptProperties: () => scriptProperties },
   UrlFetchApp: { fetch: () => { throw new Error('NETWORK CALL BLOCKED IN OFFLINE TEST'); } },
   GmailApp: gmail,
+  SpreadsheetApp: sheets,
   LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
   Utilities: {
     Charset: { UTF_8: 'UTF-8' },
@@ -183,11 +189,108 @@ assert.throws(() => context.runIntakeV2(), /EDOCS_GROUP_ADDRESS/,
   'the group address must be configured before any mailbox is scanned');
 
 props.set('EDOCS_GROUP_ADDRESS', 'edocs@example.org');
+
+// [R1] 白名单未配置必须抛错停止 —— 一个本意为"收窄范围"的开关,
+// 缺失时不能反而变成最宽,而且不能是静默的。
+assert.throws(() => context.runIntakeV2(), /INTAKE_RECIPIENT_ALLOWLIST/,
+  'a missing recipient allowlist must stop the run, never fall back to processing everything');
+
+props.set('INTAKE_RECIPIENT_ALLOWLIST', 'edocs@example.org, jack.fixture@example.com');
 let observedQuery = null;
 gmail.search = (q) => { observedQuery = q; throw new Error('GMAIL SEARCH BLOCKED IN OFFLINE TEST'); };
 assert.throws(() => context.runIntakeV2(), /GMAIL SEARCH BLOCKED/);
 assert.match(observedQuery, /^list:edocs@example\.org /, 'the scan must be limited to the eDocs group');
 assert.match(observedQuery, /-in:spam -in:trash/, 'spam and trash stay excluded');
 assert.match(observedQuery, /after:\d+ before:\d+/, 'the watermark window is still applied');
+assert.doesNotMatch(observedQuery, /in:inbox|is:unread/,
+  'the query must not depend on inbox location — the mailbox owner may auto-archive');
 console.log(`PASS: intake query narrowed to the eDocs group — ${observedQuery}`);
+
+// ──────────────────────────────────────────────────────────────
+// 8. [R1] + [R2] 循环接线的集成测试
+//    一个 thread、两封邮件:一封在白名单内,一封不在。
+// ──────────────────────────────────────────────────────────────
+const makeMessage = (id, to, when) => ({
+  getId: () => id,
+  getSubject: () => 'New customer referral',
+  getFrom: () => 'eDocs Group <edocs@example.org>',
+  getDate: () => new Date(when),
+  getPlainBody: () => 'Referral reference: FIXTURE-9001\n',
+  getHeader: (name) => ({
+    To: to,
+    'X-Original-Sender': 'referrals@plenti.example',
+    'X-Original-Authentication-Results': 'mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=plenti.example'
+  })[name] || '',
+  getRawContent: () => { throw new Error('getRawContent must not be called'); },
+  getThread: () => thread
+});
+
+const labelCalls = [];
+const thread = {
+  getMessages: () => [
+    makeMessage('wire-in-scope', 'eDocs <edocs@example.org>', '2026-09-08T01:00:00Z'),
+    makeMessage('wire-out-of-scope', 'someone@elsewhere.example', '2026-09-08T01:05:00Z')
+  ],
+  addLabel: (l) => labelCalls.push(['add', l.name]),
+  removeLabel: (l) => labelCalls.push(['remove', l.name])
+};
+
+let searchCalls = 0;
+gmail.search = () => (searchCalls++ === 0 ? [thread] : []);
+gmail.getUserLabelByName = (name) => ({ name });
+
+const sheetRows = [];
+sheets.openById = (id) => {
+  assert.equal(id, 'fixture-sheet-id', 'the sheet id comes from Script Properties');
+  return { getSheets: () => [{ getLastRow: () => sheetRows.length, appendRow: (r) => sheetRows.push(r) }] };
+};
+
+props.set('INTERNAL_DOMAIN', 'example.org');
+props.set('PLENTI_TRUSTED_SENDERS', '@plenti.example');
+props.set('INTAKE_MAILBOX', 'edocs-copy@example.org');
+props.set('INTAKE_LOG_SHEET_ID', 'fixture-sheet-id');
+context.runIntakeV2();
+
+// R1:只有白名单内那封被处理并落状态
+assert.ok(props.has('IV2_MSG_wire-in-scope'), 'the allowlisted message must be processed');
+assert.ok(!props.has('IV2_MSG_wire-out-of-scope'),
+  'an out-of-scope message must be skipped entirely — no state, no Properties footprint');
+const inScope = JSON.parse(props.get('IV2_MSG_wire-in-scope'));
+assert.equal(inScope.state, 'review', 'the parser skeleton routes it to review');
+assert.ok(labelCalls.length > 0, 'labels are synced for a thread that is in scope');
+
+// R2:表头 + 数据各一行,列序与约定一致
+assert.equal(sheetRows.length, 2, 'an empty sheet gets a header row plus the run row');
+// appendRow 的实参来自 vm 沙箱,是另一个 realm 的 Array —— deepStrictEqual 会
+// 比较原型而失败。展开成宿主数组再比(与前面 RangeError 那处同一类问题)。
+assert.deepEqual([...sheetRows[0]],
+  ['Run at', 'Threads scanned', 'Messages processed', 'Leads created', 'Failures', 'Error summary', 'Duration (s)']);
+const [runAt, threadsScanned, processed, created, failures, errorSummary, duration] = [...sheetRows[1]];
+assert.match(runAt, /^\d{4}-\d{2}-\d{2}T/, 'run timestamp is ISO 8601');
+assert.equal(threadsScanned, 1, 'one thread scanned');
+assert.equal(processed, 1, 'one message processed — the other was out of scope');
+assert.equal(created, 0, 'the parser skeleton never creates a Lead');
+assert.equal(failures, 0, 'no failures');
+assert.equal(errorSummary, '', 'no error summary');
+assert.equal(typeof duration, 'number', 'duration is a number of seconds');
+console.log(`PASS: allowlist filters the loop; run logged to sheet — ${JSON.stringify(sheetRows[1])}`);
+
+// R2:Sheet 写入失败不能拖垮本轮 —— 邮件此时已处理完
+sheetRows.length = 0;
+searchCalls = 0;
+props.delete('IV2_MSG_wire-in-scope');
+props.delete('INTAKE_V2_WATERMARK');
+sheets.openById = () => { throw new Error('SHEET PERMISSION DENIED'); };
+assert.doesNotThrow(() => context.runIntakeV2(),
+  'a logging failure must not fail the run: the mail is already processed and its state is saved');
+assert.ok(props.has('IV2_MSG_wire-in-scope'), 'the message state survives a logging failure');
+
+// R2:未配置 Sheet ID → 跳过,不报错
+props.delete('INTAKE_LOG_SHEET_ID');
+searchCalls = 0;
+props.delete('IV2_MSG_wire-in-scope');
+sheets.openById = () => { throw new Error('openById must not be called when no sheet is configured'); };
+assert.doesNotThrow(() => context.runIntakeV2(), 'no sheet configured means no logging, not an error');
+console.log('PASS: sheet logging is optional and never fails the run');
+
 props.clear();

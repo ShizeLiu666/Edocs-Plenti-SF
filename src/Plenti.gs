@@ -73,30 +73,95 @@ function plAddress_(raw){
 function plDomain_(address){var a=String(address||'').toLowerCase(),i=a.lastIndexOf('@');return i<0?'':a.slice(i+1);}
 
 /**
- * PLENTI_TRUSTED_SENDERS 格式:逗号分隔,每项是完整地址 user@domain
- * 或 @domain。大小写不敏感。属性缺失或为空 → 抛错停止(规格 §3 禁止 #2)。
+ * 从一个逗号分隔的地址清单属性读出规范化条目。每项是完整地址 user@domain
+ * 或 @domain,大小写不敏感。属性缺失或为空 → 抛错停止(规格 §3 禁止 #2)。
+ *
+ * PLENTI_TRUSTED_SENDERS 和 INTAKE_RECIPIENT_ALLOWLIST 共用这套格式与匹配。
  */
-function plTrustedSenders_(){
- var raw=PropertiesService.getScriptProperties().getProperty('PLENTI_TRUSTED_SENDERS'),out=[];
+function plAddressList_(propertyName){
+ var raw=PropertiesService.getScriptProperties().getProperty(propertyName),out=[];
  String(raw||'').split(',').forEach(function(part){var v=part.trim().toLowerCase();if(v)out.push(v);});
- if(!out.length)throw new Error('Configure PLENTI_TRUSTED_SENDERS');
+ if(!out.length)throw new Error('Configure '+propertyName);
  return out;
 }
 
 /**
- * 可信清单匹配。**只用相等比较,不用 indexOf / endsWith 子串匹配** ——
- * 否则 @plenti.example 会匹配到 @evil-plenti.example。
+ * 地址与清单条目的匹配核心。**只用相等比较,不用 indexOf / endsWith 子串
+ * 匹配** —— 否则 @plenti.example 会匹配到 @evil-plenti.example。
  *
- * @domain 条目只匹配该域名本身,**子域名不自动可信**:mail.plenti.example
+ * @domain 条目只匹配该域名本身,**子域名不自动命中**:mail.plenti.example
  * 必须显式列进属性。这是 fail-closed 的选择,放宽只需改配置、不必改代码。
  */
-function plSenderTrusted_(address,entries){
+function plAddressMatches_(address,entries){
  var addr=String(address||'').toLowerCase(),domain=plDomain_(addr),i,e;
  if(!addr||!domain)return false;
  for(i=0;i<entries.length;i++){
   e=entries[i];
   if(e.charAt(0)==='@'){if(domain===e.slice(1))return true;}
   else if(addr===e)return true;
+ }
+ return false;
+}
+
+/** PLENTI_TRUSTED_SENDERS 的条目清单。 */
+function plTrustedSenders_(){return plAddressList_('PLENTI_TRUSTED_SENDERS');}
+
+/** 可信发件人判定。保留独立名字,因为语义与收件人白名单不同。 */
+function plSenderTrusted_(address,entries){return plAddressMatches_(address,entries);}
+
+// ============================================================
+// R1 收件人白名单 —— 范围过滤,不是分类判断
+// ============================================================
+
+/**
+ * 判断"投递给了谁"时检查的邮件头,取**并集**:任一命中即放行。
+ *
+ * 为什么是这四个(依据与不确定性都写在这里):
+ *
+ *   To / Cc            发信人写在信头上的收件人。Google Groups 转发后 To 通常
+ *                      仍是组地址,所以多数情况够用。但它是**发信人可控**的,
+ *                      而且 BCC 投递时根本不出现。
+ *   Delivered-To       接收方 MTA 在实际投递时加的,值是真正的投递信箱。
+ *                      Gmail 会写这个头;Google Groups 投递给成员的副本
+ *                      通常带 `Delivered-To: <成员地址>`。
+ *   X-Original-To      Postfix 系 MTA 的约定。Gmail 一般**不**写这个头,
+ *                      列在这里是兜底,成本为零。
+ *
+ * ⚠️ **我对 Google Groups 实际写哪个头没有百分百把握。** 取并集是为了今天的
+ * 实测不会因为猜错头而一封都进不来。实测拿到真实邮件后应当收窄到实际存在的
+ * 那个头 —— 并集的代价是范围偏宽(例如你只是被 Cc 也会放行)。
+ *
+ * 一封邮件可能有多个 Delivered-To(转发链),`getHeader` 只返回第一个;
+ * plAddresses_ 会把单个头值里的所有地址都取出来,这一点不受影响。
+ */
+var PLENTI_RECIPIENT_HEADERS=['To','Cc','Delivered-To','X-Original-To'];
+
+/** 从一个邮件头的值里取出**全部**地址(小写去重)。To/Cc 可能有多个。 */
+function plAddresses_(raw){
+ var out=[],found=String(raw||'').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi);
+ if(found)found.forEach(function(a){var v=a.trim().toLowerCase();if(out.indexOf(v)<0)out.push(v);});
+ return out;
+}
+
+/** INTAKE_RECIPIENT_ALLOWLIST 的条目清单;未配置即抛错停止。 */
+function plRecipientAllowlist_(){return plAddressList_('INTAKE_RECIPIENT_ALLOWLIST');}
+
+/**
+ * plRecipientAllowed_(message, entries) → bool
+ *
+ * eDocs 是业务共用邮箱,进来的邮件绝大多数与 Plenti 无关。这一层把处理范围
+ * 收窄到"投递给指定地址"的邮件。
+ *
+ * ⚠️ **这是范围过滤,不是分类判断** —— 与 `list:` 查询同一性质(DECISIONS
+ * D-015)。不命中的邮件在 runIntakeV2 的循环里直接跳过:不写状态、不打标签、
+ * 不占 Script Properties。这不违反"绝不静默丢弃"原则 —— 那条针对的是**分类
+ * 不确定**时不得丢弃,而地址白名单是确定性的边界,和 `list:` 一样。
+ */
+function plRecipientAllowed_(message,entries){
+ var i,j,addresses;
+ for(i=0;i<PLENTI_RECIPIENT_HEADERS.length;i++){
+  addresses=plAddresses_(plHeader_(message,PLENTI_RECIPIENT_HEADERS[i]));
+  for(j=0;j<addresses.length;j++){if(plAddressMatches_(addresses[j],entries))return true;}
  }
  return false;
 }
