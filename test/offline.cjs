@@ -210,12 +210,13 @@ console.log(`PASS: intake query narrowed to the eDocs group — ${observedQuery}
 // 8. [R1] + [R2] 循环接线的集成测试
 //    一个 thread、两封邮件:一封在白名单内,一封不在。
 // ──────────────────────────────────────────────────────────────
-const makeMessage = (id, to, when) => ({
+const makeMessage = (id, to, when, body, html) => ({
   getId: () => id,
   getSubject: () => 'New customer referral',
   getFrom: () => 'eDocs Group <edocs@example.org>',
   getDate: () => new Date(when),
-  getPlainBody: () => 'Referral reference: FIXTURE-9001\n',
+  getPlainBody: () => (body === undefined ? 'Referral reference: FIXTURE-9001\n' : body),
+  getBody: () => html || '',
   getHeader: (name) => ({
     To: to,
     'X-Original-Sender': 'referrals@plenti.example',
@@ -226,9 +227,11 @@ const makeMessage = (id, to, when) => ({
 });
 
 const labelCalls = [];
+const LONG_BODY = 'x'.repeat(60000);
 const thread = {
   getMessages: () => [
-    makeMessage('wire-in-scope', 'eDocs <edocs@example.org>', '2026-09-08T01:00:00Z'),
+    makeMessage('wire-in-scope', 'eDocs <edocs@example.org>', '2026-09-08T01:00:00Z', LONG_BODY),
+    makeMessage('wire-html-only', 'eDocs <edocs@example.org>', '2026-09-08T01:02:00Z', '', '<table><tr><td>Ref</td></tr></table>'),
     makeMessage('wire-out-of-scope', 'someone@elsewhere.example', '2026-09-08T01:05:00Z')
   ],
   addLabel: (l) => labelCalls.push(['add', l.name]),
@@ -240,9 +243,36 @@ gmail.search = () => (searchCalls++ === 0 ? [thread] : []);
 gmail.getUserLabelByName = (name) => ({ name });
 
 const sheetRows = [];
+const messageRows = [];
+let setValuesCalls = 0;
+let insertedAtIndex = null;
+const makeTab = (rows) => ({
+  getLastRow: () => rows.length,
+  appendRow: (r) => rows.push(r),
+  getRange: (row, col, numRows) => ({
+    setValues: (values) => {
+      setValuesCalls += 1;
+      assert.equal(row, rows.length + 1, 'writes append below the last row');
+      assert.equal(values.length, numRows, 'range height matches the data');
+      values.forEach((v) => rows.push(v));
+    }
+  })
+});
+const summaryTab = makeTab(sheetRows);
+let messagesTab = null;
 sheets.openById = (id) => {
   assert.equal(id, 'fixture-sheet-id', 'the sheet id comes from Script Properties');
-  return { getSheets: () => [{ getLastRow: () => sheetRows.length, appendRow: (r) => sheetRows.push(r) }] };
+  return {
+    getSheets: () => [summaryTab],
+    getNumSheets: () => (messagesTab ? 2 : 1),
+    getSheetByName: (name) => (name === 'Messages' ? messagesTab : null),
+    insertSheet: (name, index) => {
+      assert.equal(name, 'Messages');
+      insertedAtIndex = index;
+      messagesTab = makeTab(messageRows);
+      return messagesTab;
+    }
+  };
 };
 
 props.set('INTERNAL_DOMAIN', 'example.org');
@@ -268,27 +298,68 @@ assert.deepEqual([...sheetRows[0]],
 const [runAt, threadsScanned, processed, created, failures, errorSummary, duration] = [...sheetRows[1]];
 assert.match(runAt, /^\d{4}-\d{2}-\d{2}T/, 'run timestamp is ISO 8601');
 assert.equal(threadsScanned, 1, 'one thread scanned');
-assert.equal(processed, 1, 'one message processed — the other was out of scope');
+assert.equal(processed, 2, 'two in-scope messages processed — the third was out of scope');
 assert.equal(created, 0, 'the parser skeleton never creates a Lead');
 assert.equal(failures, 0, 'no failures');
 assert.equal(errorSummary, '', 'no error summary');
 assert.equal(typeof duration, 'number', 'duration is a number of seconds');
 console.log(`PASS: allowlist filters the loop; run logged to sheet — ${JSON.stringify(sheetRows[1])}`);
 
+// ──────────────────────────────────────────────────────────────
+// 9. [R7] 消息级日志(Messages 标签页)
+// ──────────────────────────────────────────────────────────────
+assert.equal(insertedAtIndex, 1,
+  'the Messages tab must be inserted last — ivLogRun_ uses getSheets()[0] and would otherwise write into the wrong tab');
+assert.equal(setValuesCalls, 2, 'one setValues for the header, one batch for the rows — never row-by-row append');
+assert.equal(messageRows.length, 3, 'header plus two in-scope messages');
+assert.deepEqual([...messageRows[0]],
+  ['Processed at', 'Message date', 'Gmail message ID', 'Sender', 'Matched recipient', 'Subject',
+   'Final state', 'Parse confidence', 'Parsed JSON', 'SF Lead ID', 'Notes / error', 'Body']);
+
+const ids = messageRows.slice(1).map((r) => r[2]);
+assert.deepEqual([...ids], ['wire-in-scope', 'wire-html-only'],
+  'out-of-scope messages must never reach the Messages tab');
+
+const [, msgDate, msgId, sender, recipient, subject, finalState, confidence, parsedJson, leadId, notes, body] = [...messageRows[1]];
+assert.match(msgDate, /^2026-09-08T01:00:00/, 'message date is the real received time');
+assert.equal(msgId, 'wire-in-scope');
+assert.equal(sender, 'referrals@plenti.example', 'sender comes from X-Original-Sender');
+assert.equal(recipient, 'edocs@example.org', 'the matched allowlist address is recorded');
+assert.equal(subject, 'New customer referral');
+assert.equal(finalState, 'review', 'the parser skeleton routes to review');
+assert.equal(confidence, 'unknown / low', 'kind and confidence are recorded honestly');
+assert.equal(JSON.parse(parsedJson).kind, 'unknown', 'parsed JSON is the future Plenti_Parsed_JSON__c content');
+assert.equal(leadId, '', 'no Lead was created');
+
+// 超长正文:截断 + 在 Notes 列标注,且整行仍写得进去
+assert.ok(body.length <= 45000, `body must be truncated below the Sheets cell cap, got ${body.length}`);
+assert.ok(body.endsWith('… [TRUNCATED]'), 'truncation is marked in the cell itself');
+assert.match(notes, /\[BODY TRUNCATED from 60000 chars\]/, 'truncation is also flagged in the notes column');
+
+// 纯 HTML 邮件:回落 getBody(),标签原样保留,并在 Notes 里标注
+const htmlRow = [...messageRows[2]];
+assert.match(htmlRow[11], /<table>/, 'HTML is kept verbatim — no stripping this round');
+assert.match(htmlRow[10], /\[BODY IS RAW HTML/, 'the HTML fallback is flagged');
+console.log(`PASS: message log — ${messageRows.length - 1} rows, truncation and HTML fallback flagged`);
+
 // R2:Sheet 写入失败不能拖垮本轮 —— 邮件此时已处理完
 sheetRows.length = 0;
+messageRows.length = 0;
 searchCalls = 0;
 props.delete('IV2_MSG_wire-in-scope');
+props.delete('IV2_MSG_wire-html-only');
 props.delete('INTAKE_V2_WATERMARK');
 sheets.openById = () => { throw new Error('SHEET PERMISSION DENIED'); };
 assert.doesNotThrow(() => context.runIntakeV2(),
   'a logging failure must not fail the run: the mail is already processed and its state is saved');
-assert.ok(props.has('IV2_MSG_wire-in-scope'), 'the message state survives a logging failure');
+assert.ok(props.has('IV2_MSG_wire-in-scope'), 'the message state survives a run-log failure');
+assert.ok(props.has('IV2_MSG_wire-html-only'), 'the message state survives a message-log failure too');
 
 // R2:未配置 Sheet ID → 跳过,不报错
 props.delete('INTAKE_LOG_SHEET_ID');
 searchCalls = 0;
 props.delete('IV2_MSG_wire-in-scope');
+props.delete('IV2_MSG_wire-html-only');
 sheets.openById = () => { throw new Error('openById must not be called when no sheet is configured'); };
 assert.doesNotThrow(() => context.runIntakeV2(), 'no sheet configured means no logging, not an error');
 console.log('PASS: sheet logging is optional and never fails the run');

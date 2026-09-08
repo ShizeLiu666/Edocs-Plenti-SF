@@ -64,6 +64,31 @@ Google Groups 一定保留了 `X-Original-Sender` 和 `X-Original-Authentication
 
 ---
 
+## ⚠️ 运行日志 Sheet 含 PII —— 分享设置必须限制为指定人员
+
+`INTAKE_LOG_SHEET_ID` 指向的 Google Sheet 有两个标签页:
+
+| 标签页 | 内容 |
+|---|---|
+| 第一页(汇总) | 每轮执行一行:时间、线程数、处理数、建 Lead 数、失败数、错误摘要、耗时 |
+| `Messages` | **每封邮件一行,含完整邮件正文** |
+
+**`Messages` 页会包含真实客户的姓名、邮箱、电话、安装地址,以及邮件原文里
+的任何其他内容。**
+
+因此:
+
+- ❌ **绝不可设为「知道链接的人可查看」**(anyone with the link)
+- ❌ 不可设为对整个域可见
+- ✅ 分享设置必须限制为**逐个指定的人员**
+- ✅ Sheet ID 本身不写进本仓库,只放 Script Properties
+
+这张表存在的理由是排查和调解析正则(Apps Script 日志保留期短),
+**不是长期客户数据仓库**。解析规则稳定之后应当评估保留期与清理策略 ——
+这一条和 Q5(数据留存范围)是同一个问题。
+
+---
+
 ## 安全开关:两道锁,默认全关
 
 `runIntakeV2()` 在任何 Gmail / Salesforce 调用之前检查两个 Script Property,
@@ -157,7 +182,7 @@ Phase 2 新增四项:`INTERNAL_DOMAIN`、`EDOCS_GROUP_ADDRESS`、
 | `https://mail.google.com/` | GmailApp:读邮件、加标签 |
 | `.../auth/script.external_request` | UrlFetchApp:调 Salesforce REST API |
 | `.../auth/script.storage` | PropertiesService:去重与处理状态 |
-| `.../auth/spreadsheets` | SpreadsheetApp:每轮执行的运行日志(D-016)|
+| `.../auth/spreadsheets` | SpreadsheetApp:运行日志与消息级日志(D-016 / D-018)|
 
 ⚠️ `spreadsheets` 是 R2 新加的 scope。**加 scope 会使现有授权失效,Apps Script
 会要求重新授权。**
@@ -198,6 +223,9 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **收件人白名单不命中的邮件不留任何痕迹**(D-015)—— 不写状态、不打标签。
   这是范围过滤,与 `list:` 查询同一性质,不是"静默丢弃"分类不确定的邮件。
   若日后把某地址移出白名单,相关 thread 的旧标签不会自动清除。
+- **邮件正文这一轮不做任何清洗**(D-018)。`plCleanBody_` 是纯透传占位:
+  Plenti 的邮件格式 2026-09-09 才第一次见到,此刻写的清洗规则都是猜的。
+  回落到 HTML 时标签原样保留,不剥。
 - **`IV2_CREATE_` 防重锁不回滚**(DECISIONS L-01):任何 Salesforce 写入失败
   ——包括明摆着可重试的 500——都需要人工去 Script Properties 删键才能继续,
   且会冻结 watermark 造成渐进劣化。

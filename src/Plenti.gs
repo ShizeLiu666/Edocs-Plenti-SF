@@ -158,13 +158,56 @@ function plRecipientAllowlist_(){return plAddressList_('INTAKE_RECIPIENT_ALLOWLI
  * 不占 Script Properties。这不违反"绝不静默丢弃"原则 —— 那条针对的是**分类
  * 不确定**时不得丢弃,而地址白名单是确定性的边界,和 `list:` 一样。
  */
-function plRecipientAllowed_(message,entries){
+function plMatchedRecipient_(message,entries){
  var i,j,addresses;
  for(i=0;i<PLENTI_RECIPIENT_HEADERS.length;i++){
   addresses=plAddresses_(plHeader_(message,PLENTI_RECIPIENT_HEADERS[i]));
-  for(j=0;j<addresses.length;j++){if(plAddressMatches_(addresses[j],entries))return true;}
+  for(j=0;j<addresses.length;j++){if(plAddressMatches_(addresses[j],entries))return addresses[j];}
  }
- return false;
+ return '';
+}
+
+/** 布尔形式。R7 的消息级日志要记"命中的是哪个地址",所以核心改成返回地址。 */
+function plRecipientAllowed_(message,entries){return plMatchedRecipient_(message,entries)!=='';}
+
+// ============================================================
+// R7 消息正文取值
+// ============================================================
+
+/**
+ * ⚠️ [Phase 3 占位] 邮件正文清洗 —— **现在直接透传,一个字符都不动。**
+ *
+ * 为什么现在不写:Plenti 的邮件格式 2026-09-09 才第一次见到。此刻写的任何
+ * HTML 标签过滤或文本清洗规则都是猜的,大概率要推翻。而且 getPlainBody()
+ * 返回的已经是 Gmail 转好的纯文本,**可能本身就够用** —— 也可能表格结构被
+ * 拍扁导致 label 和 value 对不上。这个只有看到真实邮件才判断得了。
+ *
+ * 这一轮的目标是**把原料完整拿到手,不是加工它**。
+ *
+ * 将来的清洗逻辑就插在这个函数体里。改这里即可,调用点不用动:
+ *   - 回落到 HTML 时是否剥标签(isHtml 参数就是为此留的)
+ *   - 引用区/签名档/免责声明的处理
+ *   - 表格布局被拍扁后 label 与 value 的重新对齐
+ */
+function plCleanBody_(text,isHtml){
+ return text;
+}
+
+/**
+ * plMessageBody_(message) → {text, isHtml}
+ *
+ * 优先 getPlainBody():纯文本更省空间,调正则时也更直观。
+ * 为空时(纯 HTML 邮件且 Gmail 没生成文本版)回落 getBody(),**HTML 标签原样
+ * 保留,不剥**,并把 isHtml 标出来让日志能标注。
+ *
+ * ⚠️ 与 D-014 不冲突:那条说的是 **Salesforce 的 Plenti_Raw_Email__c 存
+ * getBody() 原始 HTML 作审计留底**。Sheet 是排查工具,用途不同,取值可以不同。
+ */
+function plMessageBody_(message){
+ var text=String(message.getPlainBody()||'');
+ if(text)return {text:plCleanBody_(text,false),isHtml:false};
+ var html=String(message.getBody()||'');
+ return {text:plCleanBody_(html,true),isHtml:true};
 }
 
 // ============================================================
@@ -538,7 +581,10 @@ function plRefreshReview_(message){
  * internal / ignore 和解析确认的 notice —— 这三类是有明确证据的排除,
  * 不是"认不出来"。
  */
-function plProcess_(message,force){
+function plProcess_(message,force,detail){
+ // [R7] detail 是**出参**,给消息级日志用。刻意不放进 state —— state 会被
+ // ivSave_ 序列化进 Script Properties,而解析结果 JSON 放进去会撑爆 500KB 上限。
+ detail=detail||{};
  var id=message.getId(),prior=ivGet_(id);
  if(prior&&!force&&prior.state!=='error')return prior;
  var state={state:'done',kind:'',leadCandidate:false,reason:'',date:message.getDate().toISOString()};
@@ -554,6 +600,8 @@ function plProcess_(message,force){
    return state;
   }
   var source=isPlentiSource_(message);
+  detail.sender=source.sender;
+  detail.trusted=source.trusted;
   if(!source.trusted){
    var refined=plUntrustedReason_(message.getSubject(),message.getPlainBody());
    state.kind='review';
@@ -564,6 +612,7 @@ function plProcess_(message,force){
    return state;
   }
   var parsed=parsePlentiReferral_(message);
+  detail.parsed=parsed;
   state.kind=parsed.kind;
   if(parsed.kind==='notice'){
    state.reason='Plenti non-referral notice, no Lead created: '+parsed.reason;
@@ -590,6 +639,7 @@ function plProcess_(message,force){
    }
    console.log('⚠️ PLENTI_FORCE_CREATE is enabled — bypassing the confidence gate for message '+id+' (was: '+parsed.reason+')');
    parsed=plForcedParse_(message,parsed);
+   detail.parsed=parsed;
    forced=true;
    state.kind=parsed.kind;
    state.forced=true;

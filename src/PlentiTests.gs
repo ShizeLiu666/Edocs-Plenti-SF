@@ -48,6 +48,7 @@ function plTestMessageFrom_(f){
   getFrom:function(){return f.from||'';},
   getDate:function(){return new Date(f.date||'2026-09-07T00:00:00.000Z');},
   getPlainBody:function(){return f.body||'';},
+  getBody:function(){return f.html||'';},
   getHeader:function(n){var h=f.headers||{};return Object.prototype.hasOwnProperty.call(h,n)?h[n]:'';},
   getRawContent:function(){throw new Error('getRawContent must not be called in offline tests');},
   getThread:function(){throw new Error('getThread must not be called in offline tests');}
@@ -677,10 +678,63 @@ function testPlentiForceCreate(){
 }
 
 // ============================================================
+// 17. R7 正文取值与清洗占位
+// ============================================================
+
+function testPlentiMessageBody(){
+ plTestBaseline_();
+
+ // 有纯文本版 → 用纯文本,不碰 HTML
+ var plain=plMessageBody_(plTestMessageFrom_({id:'body-plain',subject:'s',headers:{},
+  body:'Referral reference: FIXTURE-0200\nCustomer: Dale Example\n',html:'<p>should not be used</p>'}));
+ plAssertEq_(plain.isHtml,false,'plain text is preferred');
+ plAssert_(plain.text.indexOf('FIXTURE-0200')>=0,'plain body content');
+ plAssert_(plain.text.indexOf('<p>')<0,'the HTML version must not leak in when plain text exists');
+
+ // 纯文本为空 → 回落 HTML,标签**原样保留不剥**
+ var html=plMessageBody_(plTestMessageFrom_({id:'body-html',subject:'s',headers:{},
+  body:'',html:'<table><tr><td>Reference</td><td>FIXTURE-0201</td></tr></table>'}));
+ plAssertEq_(html.isHtml,true,'falls back to HTML when getPlainBody() is empty');
+ plAssert_(html.text.indexOf('<table>')>=0,'HTML tags are kept verbatim — no stripping this round');
+ plAssert_(html.text.indexOf('FIXTURE-0201')>=0,'HTML fallback carries the content');
+
+ // 两者都空
+ var empty=plMessageBody_(plTestMessageFrom_({id:'body-empty',subject:'s',headers:{},body:'',html:''}));
+ plAssertEq_(empty.text,'','an empty message yields an empty body');
+
+ // 清洗占位现在必须是纯透传 —— 任何加工都是在没见过真实邮件时瞎猜
+ plAssertEq_(plCleanBody_('  raw <b>text</b>  ',false),'  raw <b>text</b>  ','plCleanBody_ must pass through untouched for now');
+ plAssertEq_(plCleanBody_('<p>x</p>',true),'<p>x</p>','no HTML stripping this round');
+
+ // 命中的收件人地址要能取出来,不只是布尔
+ var entries=plRecipientAllowlist_();
+ var m=plTestMessageFrom_({id:'recip',subject:'s',headers:{'To':'other@elsewhere.example, eDocs <edocs@example.org>'},body:'x'});
+ plAssertEq_(plMatchedRecipient_(m,entries),'edocs@example.org','the matched address is returned, not just true');
+ plAssertEq_(plRecipientAllowed_(m,entries),true,'the boolean wrapper still works');
+ plAssertEq_(plMatchedRecipient_(plTestMessageFrom_({id:'no',subject:'s',headers:{'To':'nobody@elsewhere.example'},body:'x'}),entries),'','no match returns an empty string');
+
+ // detail 出参:解析结果给日志用,但**不得**进入落盘的 state
+ plTestClearState_();
+ plTestWithFakeApi_(function(){
+  var detail={},state=plProcess_(plTestMessage_('trusted-referral'),false,detail);
+  plAssert_(detail.parsed,'plProcess_ fills the detail out-parameter');
+  plAssertEq_(detail.parsed.kind,'unknown','detail carries the honest parse result');
+  plAssertEq_(detail.trusted,true,'detail records the trust decision');
+  plAssert_(!('parsed' in state),'the parse result must not be persisted into state — Script Properties has a 500KB cap');
+  var saved=JSON.parse(PropertiesService.getScriptProperties().getProperty('IV2_MSG_'+plTestMessage_('trusted-referral').getId()));
+  plAssert_(!('parsed' in saved),'the saved state stays small');
+ });
+
+ plTestBaseline_();
+ console.log('PASS: 14 message-body and detail out-parameter cases');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiMessageBody();
  testPlentiForceCreate();
  testPlentiRecipientAllowlist();
  testPlentiSourceTrust();

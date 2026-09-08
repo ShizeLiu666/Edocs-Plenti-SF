@@ -15,6 +15,7 @@
  *   - [R1] runIntakeV2:收件人白名单过滤 + 本轮统计
  *   - [R2] 新增 ivLogRun_:每轮追加一行到 Google Sheet(可选,失败不影响主流程)
  *   - [R3 临时] runIntakeV2:强制创建模式的告警与标注 —— Phase 4 后删(D-017)
+ *   - [R7] 新增 ivLogMessages_:每封邮件一行写入 Sheet 的 Messages 页(可选,失败不影响主流程)
  *
  * info 模型专有的逻辑已移至 src/Legacy.gs,本文件不引用其中任何函数。
  */
@@ -119,6 +120,75 @@ function ivLogRun_(began,stats){
   return false;
  }
 }
+// ============================================================
+// R7 消息级日志(Messages 标签页)
+// ============================================================
+
+// Google Sheets 单个单元格上限 50,000 字符。**超长会导致整行写入失败,
+// 不只是那一格**,所以留足余量截到 45,000(含 [TRUNCATED] 标记本身)。
+var IV_SHEET_CELL_LIMIT=45000;
+var IV_MESSAGE_LOG_SHEET='Messages';
+var IV_MESSAGE_LOG_HEADER=['Processed at','Message date','Gmail message ID','Sender','Matched recipient','Subject','Final state','Parse confidence','Parsed JSON','SF Lead ID','Notes / error','Body'];
+
+/** 截到上限并标注;返回 {text, truncatedFrom}(未截断时 truncatedFrom 为 0)。 */
+function ivTruncateCell_(value){
+ var text=String(value||''),marker='… [TRUNCATED]';
+ if(text.length<=IV_SHEET_CELL_LIMIT)return {text:text,truncatedFrom:0};
+ return {text:text.slice(0,IV_SHEET_CELL_LIMIT-marker.length)+marker,truncatedFrom:text.length};
+}
+
+/**
+ * 组装 Messages 页的一行。列序见 IV_MESSAGE_LOG_HEADER。
+ * detail 是 plProcess_ 填的出参(解析结果、发件人、可信与否)。
+ */
+function ivMessageLogRow_(message,recipient,state,detail){
+ var notes=[],body=plMessageBody_(message),cell=ivTruncateCell_(body.text);
+ var sender=detail.sender||'';
+ if(!sender){sender=String(message.getFrom()||'')+' [From fallback: X-Original-Sender missing]';}
+ if(cell.truncatedFrom)notes.push('[BODY TRUNCATED from '+cell.truncatedFrom+' chars]');
+ if(body.isHtml)notes.push('[BODY IS RAW HTML: getPlainBody() was empty]');
+ if(state.state==='error')notes.push(String(state.reason||''));
+ else if(state.forced)notes.push('[FORCED]');
+ var parsed=detail.parsed||null;
+ return [
+  new Date().toISOString(),
+  state.date||'',
+  message.getId(),
+  sender,
+  recipient||'',
+  ivTruncateCell_(message.getSubject()).text,
+  state.created?'created':state.state,
+  parsed?(parsed.kind+' / '+parsed.confidence):'',
+  parsed?ivTruncateCell_(JSON.stringify(parsed)).text:'{}',
+  state.record||'',
+  ivTruncateCell_(notes.join(' ')).text,
+  cell.text
+ ];
+}
+
+/**
+ * 一次 setValues 批量写入,不逐行 append —— 一轮可能有多封邮件。
+ *
+ * Messages 页不存在就建,**显式插到最后一个位置**:ivLogRun_ 用的是
+ * getSheets()[0],新页若插到最前面会让汇总日志静默写错标签页。
+ *
+ * 与 ivLogRun_ 相同的失败策略:未配置 → 跳过;写入失败 → 记日志继续。
+ * 到这一步邮件已处理完、状态已落盘,绝不让日志问题阻断建 Lead。
+ */
+function ivLogMessages_(rows){
+ var id=PropertiesService.getScriptProperties().getProperty('INTAKE_LOG_SHEET_ID');
+ if(!id||!rows.length)return false;
+ try{
+  var book=SpreadsheetApp.openById(id),sheet=book.getSheetByName(IV_MESSAGE_LOG_SHEET);
+  if(!sheet){sheet=book.insertSheet(IV_MESSAGE_LOG_SHEET,book.getNumSheets());}
+  if(sheet.getLastRow()===0)sheet.getRange(1,1,1,IV_MESSAGE_LOG_HEADER.length).setValues([IV_MESSAGE_LOG_HEADER]);
+  sheet.getRange(sheet.getLastRow()+1,1,rows.length,IV_MESSAGE_LOG_HEADER.length).setValues(rows);
+  return true;
+ }catch(e){
+  console.log('Message log could not be written to the sheet: '+String(e.message||e).slice(0,300));
+  return false;
+ }
+}
 function runIntakeV2(){
  var p=PropertiesService.getScriptProperties();if(p.getProperty('INTAKE_V2_ENABLED')!=='true'){console.log('Intake v2 held pending validation.');return;}
  if(p.getProperty('EDOCS_ADAPTATION_VALIDATED')!=='true')throw new Error('Plenti adaptation has not been validated. Read handoff instructions.');
@@ -145,7 +215,7 @@ function runIntakeV2(){
  // 一个本意为"收窄范围"的开关,缺失时不能反而变成最宽。
  var allow=plRecipientAllowlist_();
  // [R2] 本轮统计,执行结束后追加一行到 Google Sheet。
- var stats={threads:0,skipped:0,processed:0,created:0,failed:0,errors:[],forced:plForceCreate_()};
+ var stats={threads:0,skipped:0,processed:0,created:0,failed:0,errors:[],forced:plForceCreate_()},messageRows=[];
  // ⚠️ [R3 临时] 强制创建会绕过置信度判定直接写 Lead。每轮都喊一次,避免忘了关。
  // D-017,Phase 4 结束后连同 plForceCreate_ / plForcedParse_ 一起删。
  if(stats.forced){
@@ -161,12 +231,16 @@ function runIntakeV2(){
  for(var j=0;j<msgs.length;j++){
   if(msgs[j].getDate().getTime()<cut.getTime())continue;
   // [R1] 不命中白名单 → 整条跳过,不写状态、不打标签、不占 Properties。
-  if(!plRecipientAllowed_(msgs[j],allow)){stats.skipped++;continue;}
+  // [R7] 这类邮件也**不写进 Messages 页** —— 共用邮箱里它们占多数,全记会把表
+  // 撑爆,而且我们没有理由留存这些邮件的内容。
+  var recipient=plMatchedRecipient_(msgs[j],allow);
+  if(!recipient){stats.skipped++;continue;}
   inScope=true;
   plRefreshReview_(msgs[j]);
   var old=ivGet_(msgs[j].getId());
   if(!old||old.state==='error'){
-   var result=plProcess_(msgs[j],false);count++;stats.processed++;
+   var detail={},result=plProcess_(msgs[j],false,detail);count++;stats.processed++;
+   messageRows.push(ivMessageLogRow_(msgs[j],recipient,result,detail));
    if(result&&result.created&&result.record)stats.created++;
    // 摘要带上消息 ID:L-01 触发后要删的键是 IV2_CREATE_<消息 ID>,
    // Sheet 是长期留底,不带 ID 的话事后无从下手(console.log 保留期短)。
@@ -183,6 +257,7 @@ function runIntakeV2(){
  if(done&&!errors)p.setProperty('INTAKE_V2_WATERMARK',new Date(began).toISOString());
  console.log(JSON.stringify({reviewed:count,skippedOutOfScope:stats.skipped,threads:stats.threads,created:stats.created,failed:stats.failed,forceCreate:stats.forced,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
  ivLogRun_(began,stats);
+ ivLogMessages_(messageRows);
  }finally{lock.releaseLock();}
 }
 function runSalesforceLeadIntake(){return runIntakeV2();}
