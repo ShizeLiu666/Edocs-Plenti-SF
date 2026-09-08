@@ -447,116 +447,184 @@ curl -s -X DELETE "<instance_url>/services/data/v67.0/sobjects/Lead/<新建的 L
 
 ---
 
-# 第二部分:阻塞中 🔴 —— 等 Q2 / Q6 确认后
+# 第二部分:Plenti 自定义字段 🟡 —— 大部分已解锁
 
-**这两节现在做会返工,不要提前做。**
+**2026-09-08 更新**:Jack 已确定全部字段名与长度(DECISIONS **D-013**),
+Q2 / Q6 标为「已定,待沙箱建字段验证」。原来标 🔴 的两节现在可以做了,
+**只剩一处仍需样本**(第 7 节的字段长度与大小写敏感)。
+
+⚠️ **这四个字段今天的链路实测用不到** —— 当前解析骨架恒返回低置信度,
+不会创建 Lead。先做实测立基线还是先建字段,顺序随你。
 
 ---
 
-## 6. 🔴 `Plenti_Received_At__c`(阻塞于 Q2)
+## 6. 🟢 `Plenti_Received_At__c`(Q2 已定)
 
-### 做之前必须先定的
+### 做之前仍必须做的一步 ⚠️
 
-| 待定 | 谁定 | 说明 |
-|---|---|---|
-| **字段名是否就叫 `Plenti_Received_At__c`** | Jack | 规格 §5.3 写"字段命名需先与 Jack 确认" |
-| **org 里有没有可复用的现成字段** | Jack | 规格 §5.3 要求先检查。README_CN 也写了"优先复用已有字段并修改映射",不要为了跑通就新建 |
+字段名定了,但**规格 §5.3 要求的"检查 org 中是否已有可复用字段"照做,
+不能跳过**。README_CN 也写了"优先复用已有字段并修改映射",不要为了跑通就新建。
 
-⚠️ **先做检查再决定建不建。** 在 Object Manager → Lead → Fields 里搜
-`Received`、`Referral`、`Plenti`,看有没有语义相近的现成字段。
+Object Manager → Lead → Fields 里搜 `Received`、`Referral`、`Plenti`、`Source_Date`,
+看有没有语义相近的现成字段。**有的话先告诉 Jack,不要直接新建。**
 
-**操作(Q2 定了之后)**
+**操作**
 Setup → Object Manager → Lead → Fields & Relationships → New:
-- Data Type:**Date/Time**(不是 Date —— SLA 要精确到时刻)
-- Field Label:`Plenti Received At`
-- Field Name:`Plenti_Received_At`(API 名自动成为 `Plenti_Received_At__c`)
-- Required:**否**
-- Default:**留空**(绝不能有默认值,否则会掩盖"没取到时间"这个错误)
-- Description 填清楚:`Plenti 转介邮件的实际接收时间(message.getDate())。
-  PLT001 SLA 按此字段计算,不用 CreatedDate。`
-- FLS:对第 2.5 节那个 Permission Set **可见且可编辑**
-- Page Layout:加到审核人能看到的 Lead 布局上
+
+| 项 | 值 |
+|---|---|
+| Data Type | **Date/Time**(不是 Date —— SLA 要精确到时刻) |
+| Field Label | `Plenti Received At` |
+| Field Name | `Plenti_Received_At` → API 名 `Plenti_Received_At__c` |
+| Required | 否 |
+| Default | **留空**(有默认值会掩盖"没取到时间"这个错误) |
+| Description | `Plenti 转介邮件的实际接收时间(message.getDate())。PLT001 SLA 按此字段计算,不用 CreatedDate。` |
+
+FLS:对第 2.5 节那个 Permission Set **可见且可编辑**。
+Page Layout:加到审核人能看到的 Lead 布局。
 
 **改了什么**
 Lead 多一个 Date/Time 字段,承载 PLT001 SLA 的计时起点。
 
-**为什么不能用 `CreatedDate`**(规格 §5.3):Apps Script 是定时轮询
-(10–15 分钟),Lead 创建时间必然晚于邮件实际接收时间;而且模板"有 error
-未清理则 watermark 不前移"的逻辑可能把延迟放大。SLA 未达标 Plenti 可**立即
-终止合同,没有补救期**,这个差值不能靠估。
+**为什么不能用 `CreatedDate`**(规格 §5.3):Apps Script 是定时轮询(10–15 分钟),
+Lead 创建时间必然晚于邮件实际接收时间;"有 error 未清理则 watermark 不前移"
+的逻辑还可能把延迟放大。SLA 未达标 Plenti 可**立即终止合同,没有补救期**,
+这个差值不能靠估。
 
 **怎么验证**
-1. describe 里出现该字段且 `"createable":true`、`"type":"datetime"`
-2. 建一条测试 Lead 时带上这个字段,查回来确认值**没有被时区偏移改掉** ——
-   代码写入的是 `message.getDate().toISOString()`(UTC),
-   查回来应该是同一时刻
+1. describe 里出现该字段,`"createable":true`、`"type":"datetime"`
+2. 建一条测试 Lead 带上该字段,查回来确认值**没有被时区偏移改掉**
 
-⚠️ **时区**:`appsscript.json` 已设 `Australia/Adelaide`,但写入 Salesforce 的
-是 UTC ISO 字符串。显示时区由查看者的 Salesforce 个人设置决定 —— 显示成本地
-时间是正常的,**只要它代表同一时刻**。
+⚠️ **时区**:`appsscript.json` 已设 `Australia/Adelaide`,但写入 Salesforce 的是
+UTC ISO 字符串。显示时区由查看者的个人设置决定 —— 显示成本地时间是正常的,
+**只要代表同一时刻**。
 
-⚠️ 顺带记一下:org 的 **Business Hours 目前是 Los Angeles 时区 + 24/7**
-(规格 §4),必须改成 Adelaide 时区、正确营业时间并加入南澳公共假期。
-**那是本项目之外的配置任务,但在它修好之前任何"工作日"计算都是错的。**
-本项目只负责准确记录时间戳,不负责算工作日差值。
+⚠️ 顺带:org 的 **Business Hours 目前是 Los Angeles 时区 + 24/7**(规格 §4),
+必须改成 Adelaide 时区、正确营业时间并加入南澳公共假期。**那是本项目之外的任务,
+但在它修好之前任何"工作日"计算都是错的。** 本项目只负责准确记录时间戳。
 
 **生产环境的差异**
 操作相同,但:
-- ⚠️ 生产要**再检查一次有没有可复用字段** —— 沙箱刷新之后生产可能新加了字段
-- FLS 要配给生产的那个专用集成用户的 Permission Set
-- Page Layout 在生产通常更多,要确认加到了正确的那几个
+- ⚠️ 生产要**再检查一次有没有可复用字段** —— 沙箱刷新后生产可能新加了字段
+- FLS 配给生产那个专用集成用户的 Permission Set
+- Page Layout 在生产通常更多,确认加到了正确的那几个
 
 ---
 
-## 7. 🔴 referral ID 字段(阻塞于 Q6 + 样本)
+## 7. 🟡 `Plenti_Lead_ID__c`(Q6 已定,长度与大小写仍需样本)
 
-### 做之前必须先定的
+这是规格 §5.4 第三层去重的载体,也是 D-013 任务 B 的 upsert 目标。
 
-| 待定 | 阻塞于 | 说明 |
+**操作**
+
+| 项 | 值 | 说明 |
 |---|---|---|
-| **存 Lead 字段还是 Script Properties** | Q6 | 倾向 Lead 字段 —— Properties 有 500KB 上限且不可靠(规格 §5.4) |
-| **ID 的格式与长度** | 2026-09-09 样本 | 决定字段类型和长度 |
-| **同一转介重发时 ID 是否不变** | 2026-09-09 样本 | ⚠️ **这是第三层去重能否成立的前提**。若 ID 会变,整个方案要重想 |
+| Data Type | **Text** | |
+| Field Label | `Plenti Lead ID` | |
+| Field Name | `Plenti_Lead_ID` → `Plenti_Lead_ID__c` | |
+| Length | **255** | ⚠️ 见下方说明 |
+| **Unique** | ✅ **勾** | |
+| **External ID** | ✅ **勾** | |
+| Case Sensitive | ⬜ **不勾**(默认) | ⚠️ 见下方说明 |
+| Required | 否 | 非 Plenti 来源的 Lead 不会有这个值 |
 
-⚠️ **在这三项定下来之前不要建字段。** 长度和唯一性一旦定错,改起来比重建麻烦。
+FLS + Page Layout:同第 6 节。
 
-**操作(Q6 + 样本都定了之后)**
+**⚠️ 关于 Length = 255**
+样本还没到,ID 格式未知。Text 字段上限就是 255,**取满不会有坏处**:
+真实 ID 更短也放得下,而且**加长容易、缩短难**(缩短要先确认没有超长数据)。
+所以现在取 255 是安全的,不必等样本。
 
-建议配置(**待样本确认后再定稿**):
-- Data Type:**Text**(长度按样本定,留余量)
-- Field Label / Name:待 Jack 定,例如 `Plenti Referral ID`
-- ⚠️ **Unique**:建议勾。勾了之后 Salesforce 会在**数据库层**拒绝重复 ——
-  同一 referral ID 建第二条 Lead 会直接返回 `DUPLICATE_VALUE`。
-  这是比"先查询再创建"更强的保证,因为查询和创建之间存在竞态窗口,
-  而我们**无法跨 info / eDocs 两个项目做原子去重**(规格 §5.5 的已知限制)。
-- ⚠️ **External ID**:建议勾。勾了会建索引(查询更快),而且让
-  **upsert by External ID** 成为可能 —— 那是解决"API 超时结果不确定"
-  (§7 验收表)最干净的办法:upsert 天然幂等,不需要先查再建。
+**⚠️ 关于 Case Sensitive 不勾**
+Unique 文本字段默认大小写**不敏感**,即 `ABC123` 和 `abc123` 视为同一个。
 
-  **这两条是给 Q6 的输入,不是我替你决定。** 若采纳 upsert 方案,
-  `src/Plenti.gs` 的 `plFindReferral_` / `plCreateLead_` 要相应重写 ——
-  那是 Phase 3 的事。
+这是**更安全的失败方向**:它偏向"认为是同一个转介"→ 拒绝重复创建;
+勾上则偏向"认为是两个不同转介"→ 可能建出重复 Lead。在没有样本的情况下,
+偏向去重是对的(fail-closed)。
 
-- Case Sensitive:⚠️ Unique 文本字段默认**大小写不敏感**。若 Plenti 的 ID
-  区分大小写(样本确认),要勾上 Case Sensitive,否则 `ABC123` 和 `abc123`
-  会被当成同一个。
-- FLS + Page Layout:同第 6 节
+样本到手后若发现 Plenti 的 ID 确实区分大小写,再评估是否要改 —— ⚠️ 但**在已有
+数据的字段上改 Unique / Case Sensitive 设置是受限操作**,所以这一条要在
+2026-09-09 之后、正式收数据之前确认掉。
 
 **改了什么**
-Lead 多一个承载 Plenti 业务主键的字段。若勾了 Unique,同时获得一条**数据库层
-的去重约束** —— 这是规格 §5.4 第三层去重的最强实现形式。
+Lead 多一个承载 Plenti 业务主键的字段。勾了 Unique 之后同时获得一条**数据库层
+的去重约束**。
+
+这比"先查询再创建"强:查询和创建之间存在竞态窗口,而我们**无法跨 info / eDocs
+两个项目做原子去重**(规格 §5.5 的已知限制)。External ID 则让 **upsert by
+External ID** 成为可能 —— 那是解决"API 超时结果不确定"(§7 验收表)最干净的
+办法,天然幂等,不需要先查再建。
 
 **怎么验证**
-1. describe 确认字段存在、类型和长度正确
-2. ⚠️ **专门验证 Unique 约束真的生效**:用虚构数据建两条带同一个 referral ID
-   的 Lead,第二条**必须失败**并返回 `DUPLICATE_VALUE`。
-   建完记得两条都删掉。
-3. 若勾了 Case Sensitive,再用大小写不同的同一个 ID 试一次,确认行为符合预期
+1. describe 确认字段存在、`"externalId":true`、`"unique":true`
+2. ⚠️ **专门验证 Unique 约束真的生效**:用虚构数据建两条带同一个 ID 的 Lead,
+   第二条**必须失败**并返回 `DUPLICATE_VALUE`。两条都记得删掉。
+3. ⚠️ **验证 upsert 的响应体形态**(D-013 里标为存疑的那一点)。分两次:
+
+   ```bash
+   curl -s -i -X PATCH "<instance_url>/services/data/v67.0/sobjects/Lead/Plenti_Lead_ID__c/FIXTURE-UPSERT-1" -H "Authorization: Bearer <access_token>" -H "Content-Type: application/json" -d '{"LastName":"Fixture Example","Company":"Individual / Residential","Status":"New","LeadSource":"Plenti","OwnerId":"<005 开头的 ID>"}'
+   ```
+
+   第一次应返回 **201** 带 `{"id":"...","created":true}`。
+   **把完全相同的命令再跑一次**,记下第二次的**状态码和响应体** —— 是 204 空体
+   还是 200 带体。这个结果直接决定 D-013 里那个"回落查询"要不要保留。
+   把结果告诉我。
+
+   验证完删掉那条 Lead。
 
 **生产环境的差异**
-⚠️ **生产上勾 Unique 之前,必须先确认现有 Lead 里没有会冲突的值。**
-如果生产已经有历史数据在这个字段上重复,加 Unique 约束会失败或需要先清洗。
-沙箱数据量小,不一定能暴露这个问题。
+⚠️ **生产上勾 Unique 之前,必须先确认现有 Lead 在这个字段上没有冲突值。**
+若生产已有历史数据重复,加 Unique 会失败或需要先清洗。沙箱数据量小,
+不一定能暴露这个问题。
+
+---
+
+## 8. 🟢 `Plenti_Raw_Email__c` 与 `Plenti_Parsed_JSON__c`(D-013)
+
+这两个字段把**审计留底**和**解析结果**从 Description 里搬出来,
+让邮件格式变化只影响解析、不影响存储。
+
+**操作** —— 建两个 Long Text Area 字段:
+
+| 项 | `Plenti_Raw_Email__c` | `Plenti_Parsed_JSON__c` |
+|---|---|---|
+| Data Type | Long Text Area | Long Text Area |
+| Field Label | `Plenti Raw Email` | `Plenti Parsed JSON` |
+| **Length** | **131072** | **32768** |
+| Visible Lines | 10 左右 | 10 左右 |
+| Description | `Plenti 转介邮件的原始 HTML(message.getBody()),审计留底。超长截断并标注 [TRUNCATED]。` | `parsePlentiReferral_ 的解析结果 JSON。解析不到任何字段时为 {}。` |
+
+**改了什么**
+Lead 多两个长文本字段。`Plenti_Raw_Email__c` 存的是**原始 HTML**,
+不是转换后的文本(DECISIONS **D-014**)。
+
+**为什么留底存 HTML 而不是纯文本**(Jack 的理由):Gmail 的 HTML→文本转换是
+有损的,尤其表格布局的邮件,label 和 value 可能被拆到不相邻的位置。留底若存
+转换后的文本,等于把审计原件变成了一个我们不控制的派生物 —— 将来发现解析漏了
+字段,原文已经没了。
+
+⚠️ **FLS 要单独想一下,不能照抄前面几个字段。**
+`Plenti_Raw_Email__c` 里是**完整原始邮件**,可能含融资申请资料与身份证明
+(规格 §5.6 / **Q5**)。建议:
+
+- 对第 2.5 节那个集成用的 Permission Set:**可见 + 可编辑**(脚本要写)
+- 对普通销售用户:**建议不可见**,除非 Jack 明确要开
+- Page Layout:⚠️ **建议先不要**加到通用 Lead 布局上;需要看的人通过字段级
+  权限单独开
+
+这条比其他字段更需要你拍板,因为它决定谁能看到客户的完整申请资料。
+
+**怎么验证**
+1. describe 确认两个字段存在、`"length"` 分别是 131072 和 32768
+2. 用虚构数据写一段超过 131072 的文本进 `Plenti_Raw_Email__c`,确认 Salesforce
+   按预期拒绝(证明上限是真的)—— 之后代码会在客户端先截断,不依赖服务端行为
+3. 用一个非管理员测试用户登录,确认 `Plenti_Raw_Email__c` 的可见性符合你的决定
+
+**生产环境的差异**
+⚠️ **FLS 在生产更要收紧。** 生产的 Lead 布局和 Profile 更多,
+逐个确认哪些角色能看到 `Plenti_Raw_Email__c`。
+这一项和 **Q5**(数据留存范围)绑在一起 —— Q5 没拍板之前,
+生产上建议只给集成用户和你自己可见。
 
 ---
 
@@ -572,8 +640,8 @@ Lead 多一个承载 Plenti 业务主键的字段。若勾了 Unique,同时获�
 | Consumer Key | 第 2.6 节 | `SF_CLIENT_ID` |
 | 审核人 User ID(`005…`) | 第 5 节 | `INTAKE_ADMIN_ID` |
 | Run As 用户的用户名 | 第 2.5 节 | (不入属性,记档用) |
-| `Plenti_Received_At__c` 最终 API 名 | 第 6 节 | (改代码用) |
-| referral ID 字段最终 API 名 | 第 7 节 | (改代码用) |
+| upsert 第二次 PATCH 的**状态码与响应体** | 第 7 节 | ⚠️ 决定 D-013 的回落查询要不要保留 |
+| 第 6 节可复用字段检查的结果 | 第 6 节 | 规格 §5.3 要求 |
 
 ## ❌ 绝不记进仓库
 

@@ -328,6 +328,164 @@ Description 的每一行都必须命中上述前缀之一。Phase 3 填字段正
 
 ---
 
+## D-013 Plenti 数据存储结构:存储与解析解耦
+
+**日期** 2026-09-08 · **决定人** Jack · **阶段** 下一轮实施(本文件记录决策,不是进度)
+
+**背景**:真实邮件格式仍未知(2026-09-09 才拿到样本)。当前解析逻辑基于假设
+格式,上线前必然要改。因此把**存储结构**和**解析逻辑**解耦,让格式变化只影响
+解析、不影响存储。
+
+### 字段映射
+
+| 字段 | 内容 | 上限 |
+|---|---|---|
+| `Plenti_Raw_Email__c` | **原始 HTML**(`message.getBody()`),完整不截断 | Long Text Area **131072** |
+| `Plenti_Parsed_JSON__c` | 解析结果 `JSON.stringify`;解析不到任何字段时为 `"{}"` | Long Text Area **32768** |
+| `Plenti_Received_At__c` | `message.getDate()`,ISO 8601 带时区 | Date/Time |
+| `Plenti_Lead_ID__c` | 解析到的 Plenti 唯一 ID;**解析不到则整个字段不传** | Text,External ID + Unique |
+| `Description` | 不再写完整原文,改为**一行摘要** | 标准字段 **32000** |
+
+⚠️ **两个上限不一样,不要混。** 131072 是**新建自定义** Long Text Area 的上限;
+`Description` 是 Lead 的**标准**字段,上限 32000(规格 §9)。截断阈值按字段分别取。
+
+超长时截断并在末尾标注 `[TRUNCATED]`,**标注算在上限之内**(截到 `上限 - 11`)。
+
+### Description 摘要格式 —— marker 必须保留
+
+```
+[Intake: <msgId>] Plenti referral received <ISO8601>; N fields parsed
+```
+
+**`[Intake: <msgId>]` 是承重结构,不能删。** 审计(下方"Phase 2 审计记录"问题 2)
+表明:POST 路径下,崩溃窗口的恢复**完全依赖** `plResolve_` 按这个标记过滤已建
+Lead;§7 验收表"同一封邮件跑两次不重复建"走的也是同一条路径。
+
+任务 B 的 upsert 落地后,PATCH by External ID 天然幂等,这条路径重要性下降 ——
+但**只在解析到 `Plenti_Lead_ID__c` 时才走 upsert**,解析不到 ID 的 POST 路径仍
+只能靠 marker 恢复。所以标记还不能撤。
+
+### 创建 Lead 的两种模式(任务 B)
+
+抽成一个函数,模式由**是否解析到 Plenti Lead ID** 自动决定:
+
+| 条件 | 调用 |
+|---|---|
+| 无 ID | `POST /sobjects/Lead` |
+| 有 ID | `PATCH /sobjects/Lead/Plenti_Lead_ID__c/{id}` |
+
+两条路径现在都要能跑,**即使 Salesforce 侧的 External ID 字段还没建** —— 先让
+代码就位。
+
+⚠️ **PATCH 的响应体形态存疑,不凭记忆写。** 创建时返回 201 带
+`{id, created:true}`;更新时不同 API 版本可能是 204 无响应体、也可能是 200 带体。
+`ivReq_` 对空 body 返回 `{}` 不会崩,但 `result.id` 会是 `undefined`。
+
+**防御式实现**:拿不到 `id` 时回落到按 `Plenti_Lead_ID__c` 查一次取 Id。
+多一次往返,但不依赖记不准的 API 行为。**Phase 4 沙箱实测确认后再决定要不要
+去掉这个回落。**
+
+---
+
+## D-014 审计留底存原始 HTML,解析输入用纯文本
+
+**日期** 2026-09-08 · **决定人** Jack · **阶段** 随 D-013 实施
+
+两个用途分开:
+
+| 用途 | 取值 |
+|---|---|
+| 审计留底 → `Plenti_Raw_Email__c` | **`message.getBody()`**(原始 HTML) |
+| 解析输入 → `parsePlentiReferral_` | `message.getPlainBody()` |
+
+**为什么留底不能存转换后的文本**(Jack 的理由,原样记录):
+
+> Gmail 的 HTML→文本转换是有损的,尤其表格布局的邮件,label 和 value 可能被拆到
+> 不相邻的位置。如果留底存的是转换后的文本,等于把审计原件变成了一个我们不控制
+> 的派生物 —— 将来发现解析漏了字段,原文已经没了。
+
+解析先用 `getPlainBody()` 图省事没问题。样本到了如果发现它丢结构,再换成自己
+转换 —— 那时原始 HTML 还在,可以回填历史记录。
+
+⚠️ 与 D-012 的关系:D-012 说的是 **Description 不复制正文**,那条继续有效。
+正文现在有了专用的留底字段,受 `Plenti_Raw_Email__c` 的字段级安全控制,
+而不是散落在人人可见的 Description 里。数据留存范围本身仍是 **Q5**。
+
+---
+
+## Phase 2 审计记录(2026-09-08)
+
+Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
+完整分析见对话记录。
+
+### 1. SF 写入失败时邮件会不会被标记为"已处理"?
+
+**不会。** 失败落 `state:'error'`,而 `error` 在三处都被显式当作待重试:
+`plProcess_`(`prior.state!=='error'` 才短路)、`runIntakeV2` 扫描循环、
+以及 watermark 前移条件(任何一条 error 都会冻结 watermark)。
+`leadCandidate:true` 保证邮件挂上 `SF-Lead-Review` 标签,可见不丢失。
+
+**但重试会永久失败,直到人工介入** —— 见下方已知限制 L-01。
+
+### 2. 打标记与 SF 写入的顺序 / 崩溃窗口
+
+**顺序正确(write-ahead)**:中间态 `error` 先落盘 → 防重锁 `requested` 先落盘
+→ POST → 锁推进 `created` → 回读 → 终态落盘。**任何时刻崩溃都不会留下"成功"
+状态而 Salesforce 里没记录。**
+
+- **Properties 窗口**:POST 返回到终态落盘之间,实质只有一次 SOQL 回读往返,
+  量级几百毫秒。窗口内崩溃 → 下次靠 Description 的 `[Intake: …]` 标记恢复,
+  不重复创建。**这是 D-013 必须保留 marker 的原因。**
+- **Gmail 标签窗口**:`plProcess_` 完全不打标签,标签由 `ivSyncLabels_` 在整个
+  thread 处理完之后统一打。窗口更大(秒级),但后果最轻且**自愈** ——
+  下次扫描无条件重打标签,符合 §7 验收"写入成功但打标签失败 → 只补标签"。
+- **最外层硬窗口**:Apps Script 6 分钟执行上限。`runIntakeV2` 自留 220 秒预算。
+  硬杀时 `finally` 不保证执行,但 Apps Script 在执行结束时会自动释放 script
+  lock。⚠️ **最后这一句有把握但非百分百确定,Phase 4 沙箱实测确认。**
+
+### 3. 触发器重叠保护
+
+**有** —— `LockService.getScriptLock()` + `tryLock(1000)`,`finally` 释放。
+在两道安全开关检查之后获取,顺序正确;`ivRefreshOutstanding_` 在锁内执行。
+拿不到锁就跳过本次(不排队、不报错),配合 10–15 分钟触发间隔合理。
+
+**边界**:只保护同一项目。跨项目(info ↔ eDocs)无法原子去重(规格 §5.5);
+锁保护的是扫描,不是 Salesforce 记录的 exactly-once。
+
+---
+
+## 已知限制(代码层面,区别于规格 §9 的设计层面限制)
+
+### L-01 `IV2_CREATE_` 防重锁不回滚,任何写入失败都需人工介入
+
+**发现于** 2026-09-08 审计 · **本轮不改**(Jack 决定)
+
+`plCreateLead_` 在 POST **之前**把 `IV2_CREATE_<msgId>` 写成 `requested`,
+POST 抛错时**不回滚**。下次重试直接抛
+`Earlier create outcome is uncertain; check Salesforce before retrying creation`,
+必须有人去 Script Properties 删掉那个键才能继续。
+
+这是 §7 验收表"API 超时结果不确定 → 不盲目重建"要的行为,设计如此。
+**代价是这把锁不区分"确定失败"和"结果未知"** —— 一个明摆着可重试的 HTTP 500
+或网络抖动,和一次真正的超时,后果完全一样。
+
+叠加 watermark 冻结(任何 error 都阻止前移),后果是**渐进劣化**而非立刻停摆:
+新邮件仍在窗口内会被处理,已处理的会被便宜跳过,但 `lower` 不前移导致每次扫描
+要列举的线程越来越多,最终撞上 220 秒预算 → `done=false` → watermark 更不前移。
+这就是 EXPORT_NOTES 说的"积压需监控"。
+
+**可能的改法(未决,不在本轮)**:按 HTTP 状态码区分 —— 4xx 且非 timeout 视为
+"确定失败"可回滚锁;5xx / 超时 / 网络错误保持现状。需要 `ivReq_` 把状态码带出来。
+
+### L-02 崩溃恢复后 `SF-Lead-Created` 标签不会亮
+
+崩溃窗口恢复后 `state.created` 为 false,`ivLeadLabelFlags_.created` 因此为 false,
+只亮 `SF-Lead-Review`。记录是对的,标签偏保守。影响很小,记录备查。
+
+同一场景下 `IV2_CREATE_` 会永远停在 `requested` —— 无害,但是垃圾数据。
+
+---
+
 ## 跨阶段待办(TODO)
 
 ### TODO-1 硬编码生产域名 → `INTERNAL_DOMAIN` 【✅ Phase 2 已完成】
@@ -470,11 +628,11 @@ watermark 的校验保持原样。
 | # | 问题 | 阻塞 | 规格出处 |
 |---|---|---|---|
 | Q1 | **Plenti 线索由谁跟进?** 目前全部指派给 `INTAKE_ADMIN_ID`,意味着 SLA 时钟开始跑但无人被分配联系客户 | **上线** | §5.9 |
-| Q2 | `Plenti_Received_At__c` 字段命名需确认,并检查 org 中是否已有可复用字段。**脚本不自动创建 Salesforce 字段** | Phase 4 | §5.3 |
+| ~~Q2~~ | **已定** —— 字段名确认为 `Plenti_Received_At__c`(Jack,2026-09-08)。⏳ 状态:**待沙箱建字段验证**。⚠️ 规格 §5.3 要求的"先检查 org 中是否已有可复用字段"**照做,不能因为名字定了就跳过** | 待验证 | §5.3 |
 | Q3 | `LeadSource` picklist 是否已有 `Plenti` 值?没有需先加(Setup 操作,不由脚本做) | Phase 4 | §5.9 |
 | Q4 | `Company` 字段:模板写死 `Individual / Residential`,是否适用于 Plenti 转介 | Phase 3 | §5.9 |
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
-| Q6 | referral ID 存哪里:Lead 自定义字段 vs Script Properties。**倾向 Lead 字段**(Properties 有 500KB 上限且不可靠),待样本确认 ID 格式后定 | Phase 3 | §5.4 |
+| ~~Q6~~ | **已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |
 | Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
