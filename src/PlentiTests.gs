@@ -98,6 +98,26 @@ function plTestWithFakeApi_(fn){
 
 function plTestPosts_(calls){return calls.filter(function(c){return c.kind==='req'&&c.method==='post';});}
 
+/**
+ * [R8] 用假的 UrlFetchApp 跑一段逻辑。handler(url) 返回 {code, text},
+ * 返回 null 表示模拟抛错(网络故障)。离线测试默认的 UrlFetchApp 桩是抛错的,
+ * 这里只在用例内临时替换,跑完还原。
+ */
+function plTestWithFetch_(handler,fn){
+ var real=UrlFetchApp.fetch,fetched=[];
+ UrlFetchApp.fetch=function(url,options){
+  fetched.push({url:url,options:options});
+  var r=handler(url);
+  if(!r)throw new Error('SIMULATED NETWORK FAILURE');
+  return {getResponseCode:function(){return r.code;},getContentText:function(){return r.text||'';}};
+ };
+ try{return fn(fetched);}finally{UrlFetchApp.fetch=real;}
+}
+
+/** 合成页面 fixture 的 HTML。 */
+function plTestBrowserHtml_(){return plFixtures_()['browser-view-sample'].html;}
+function plTestBrowserToken_(){return plFixtures_()['browser-view-sample'].token;}
+
 /** 一个通过解析的虚构转介,用于绕过骨架期的空正则测试下游逻辑。 */
 function plTestParsed_(){
  return {kind:'referral',referralId:'FIXTURE-0001',
@@ -295,23 +315,28 @@ function testPlentiParserSkeleton(){
 
 function testPlentiReferralLookupFailClosed(){
  plTestBaseline_();
- plAssertThrows_(function(){plFindReferral_('FIXTURE-0001');},/not implemented/,'referral lookup stub must throw');
-
+ // [R8] plFindReferral_ 已从 fail-closed 桩落地为真实 SOQL 查询(Q6 已定:
+ // delivery token 存 Plenti_Lead_ID__c)。这里改测它的查询语义。
  plTestWithFakeApi_(function(calls){
-  plAssertThrows_(function(){plResolve_(plTestMessage_('trusted-referral'),plTestParsed_());},
-   /Refusing to create a Lead without business-level deduplication/,'plResolve_ must not fall through to creation');
-  plAssertEq_(plTestPosts_(calls).length,0,'fail-closed path must not write anything');
+  plAssertEq_(plFindReferral_(''),null,'an empty token never queries');
+  plAssertEq_(calls.length,0,'no query is issued for an empty token');
  });
-
- // 缺 referral ID / 缺客户邮箱 → review,不进创建路径
+ plTestWithFakeApi_(function(calls){
+  ivQuery_=function(q){calls.push({kind:'query',query:q});return [];};
+  plAssertEq_(plFindReferral_('TOKEN-1'),null,'no match returns null');
+  plAssert_(/Plenti_Lead_ID__c='TOKEN-1'/.test(calls[0].query),'the lookup queries Plenti_Lead_ID__c');
+ });
+ plTestWithFakeApi_(function(calls){
+  ivQuery_=function(q){calls.push({kind:'query',query:q});return [{Id:'00Qexisting00001AAA'},{Id:'00Qexisting00002AAA'}];};
+  plAssertThrows_(function(){plFindReferral_('TOKEN-2');},/Multiple Leads share/,'duplicate tokens must stop and ask for a human');
+ });
+ // 没有 token 就不建 Lead —— 身份不确定时依旧转 review
  plTestWithFakeApi_(function(calls){
   var noId=plTestParsed_();noId.referralId='';
-  plAssert_(/referral ID missing/.test(plResolve_(plTestMessage_('trusted-referral'),noId).review||''),'missing referral id must review');
-  var noEmail=plTestParsed_();noEmail.customer.email='';
-  plAssert_(/Customer email missing/.test(plResolve_(plTestMessage_('trusted-referral'),noEmail).review||''),'missing customer email must review');
-  plAssertEq_(plTestPosts_(calls).length,0,'neither case may write');
+  plAssert_(/No Plenti delivery token/.test(plResolve_(plTestMessage_('trusted-referral'),noId).review||''),'missing token must review');
+  plAssertEq_(plTestPosts_(calls).length,0,'nothing is written without an identifier');
  });
- console.log('PASS: 4 fail-closed deduplication cases');
+ console.log('PASS: 6 referral-lookup cases (token-keyed deduplication)');
 }
 
 // ============================================================
@@ -321,32 +346,35 @@ function testPlentiReferralLookupFailClosed(){
 function testPlentiDeduplicationLayers(){
  plTestBaseline_();
  var message=plTestMessage_('trusted-referral'),parsed=plTestParsed_();
- var realFind=plFindReferral_;
 
- // D1 邮件级:Description 已带本邮件标记 → 返回已有 Lead,不重复创建
+ // 第 2 层 业务级:同一 delivery token 已建过 → 返回既有 Lead,不重复创建。
+ // 这一层同时覆盖"同一封邮件跑两次"和"同一转介重发成新邮件"。
  plTestWithFakeApi_(function(calls){
-  ivQuery_=function(q){calls.push({kind:'query',query:q});return [{Id:'00Qexisting00001AAA',Description:'[Intake: '+message.getId()+']',IsConverted:false,Status:'New'}];};
+  ivQuery_=function(q){calls.push({kind:'query',query:q});return [{Id:'00Qexisting00001AAA',Description:'',IsConverted:false,Status:'New'}];};
   var r=plResolve_(message,parsed);
-  plAssert_(r.lead&&r.lead.Id==='00Qexisting00001AAA','existing marker must resolve to the existing Lead');
+  plAssert_(r.lead&&r.lead.Id==='00Qexisting00001AAA','an existing delivery token resolves to the existing Lead');
   plAssert_(!r.create,'must not request creation');
-  plAssertEq_(plTestPosts_(calls).length,0,'re-running the same message must not create anything');
+  plAssertEq_(plTestPosts_(calls).length,0,'a resent referral must not create a second Lead');
  });
 
- // D3 跨邮箱缓解:同客户邮箱已有活跃 Lead → review(规格 §5.5)
- plFindReferral_=function(){return null;};
+ // 第 3 层 跨邮箱缓解:仅在有客户邮箱时可用
  plTestWithFakeApi_(function(calls){
-  ivQuery_=function(q){calls.push({kind:'query',query:q});return [{Id:'00Qother0000001AAA',Description:'from the info mailbox',IsConverted:false,Status:'New'}];};
+  var n=0;
+  ivQuery_=function(q){calls.push({kind:'query',query:q});n++;
+   if(/Plenti_Lead_ID__c/.test(q))return [];
+   return [{Id:'00Qother0000001AAA',Description:'from the info mailbox',IsConverted:false,Status:'New'}];};
   var r=plResolve_(message,parsed);
-  plAssert_(/Existing active Lead/.test(r.review||''),'active Lead for the same customer must go to review');
+  plAssert_(/Existing active Lead/.test(r.review||''),'an active Lead for the same customer email goes to review');
   plAssertEq_(plTestPosts_(calls).length,0,'cross-mailbox collision must not create a second Lead');
  });
 
- // 已转换 / Unqualified 的旧 Lead 不算活跃,不挡新转介
+ // 没有客户邮箱时(Plenti 的常态)跨邮箱这一层不可用,但仍然要建 Lead
  plTestWithFakeApi_(function(calls){
-  ivQuery_=function(q){calls.push({kind:'query',query:q});return [{Id:'00Qold000000001AAA',Description:'',IsConverted:true,Status:'Closed'}];};
-  plAssertEq_(plResolve_(message,parsed).create,true,'a converted Lead must not block a new referral');
+  ivQuery_=function(q){calls.push({kind:'query',query:q});return [];};
+  var noEmail=plTestParsed_();noEmail.customer.email='';
+  plAssertEq_(plResolve_(message,noEmail).create,true,'a referral without a customer email is still created');
+  plAssertEq_(calls.length,1,'only the token lookup runs when there is no email to query by');
  });
- plFindReferral_=realFind;
  console.log('PASS: 3 deduplication-layer cases');
 }
 
@@ -395,7 +423,9 @@ function testPlentiCreateLock(){
 
 function testPlentiLeadPayload(){
  plTestBaseline_();
- var message=plTestMessage_('trusted-referral'),parsed=plTestParsed_(),payload=plLeadPayload_(message,parsed);
+ var message=plTestMessage_('trusted-referral'),parsed=plTestParsed_();
+ var enrichment={html:'<html>browser view</html>',meta:{url:'https://e.customeriomail.com/deliveries/T==',token:'T==',ok:true,found:['name','address','systems'],missing:[],degraded:false}};
+ var payload=plLeadPayload_(message,parsed,enrichment);
 
  plAssertEq_(payload.Email,'dale.example@example.net','Lead.Email must be the customer address');
  plAssert_(payload.Email!=='referrals@plenti.example','Lead.Email must never be the Plenti sender address');
@@ -407,19 +437,46 @@ function testPlentiLeadPayload(){
  plAssert_(!('Lead_Category__c' in payload),'Lead_Category__c is deliberately not written (D-011)');
  plAssertEq_(payload.StateCode,'SA','state code is upper-cased');
  plAssertEq_(payload.CountryCode,'AU','country code accompanies an Australian address');
- plAssert_(payload.Description.indexOf('[Intake: '+message.getId()+']')===0,'Description starts with the message marker');
- plAssert_(payload.Description.indexOf('FIXTURE-0001')>=0,'Description records the referral id');
- plAssert_(payload.Description.indexOf('12 Fictional Street')<0,'the raw email body is not copied into Description (D-012)');
- plAssert_(payload.Description.length<=32000,'Description stays within the Salesforce limit');
 
- // D-012 最小集合:Description 的每一行都必须命中白名单。Phase 3 填字段
- // 正则时若把 application ID / broker ID / 客户编号顺手塞进摘要,这里会变红。
- var allowed=[/^\[Intake: /,/^PLENTI REFERRAL - PENDING ADMIN REVIEW$/,/^Source: /,/^Plenti referral ID: /,/^Subject: /,/^Raw email body is intentionally not copied/];
- payload.Description.split('\n').forEach(function(line){
-  if(!line.trim())return;
-  plAssert_(allowed.some(function(re){return re.test(line);}),'Description carries a line outside the D-012 minimum set: '+line);
- });
- console.log('PASS: 15 Lead field-mapping cases including the Description minimum set');
+ // [R8/D-013] delivery token 进 Plenti_Lead_ID__c;取不到就**不传该字段**
+ plAssertEq_(payload.Plenti_Lead_ID__c,'FIXTURE-0001','the delivery token is stored as the external identifier');
+ var noToken=plTestParsed_();noToken.referralId='';
+ plAssert_(!('Plenti_Lead_ID__c' in plLeadPayload_(message,noToken,enrichment)),'no token means the field is omitted entirely, not written empty');
+
+ // [D-014] 审计留底存**原始 HTML**,不是 Gmail 转好的纯文本
+ plAssertEq_(payload.Plenti_Raw_Email__c,message.getBody(),'the raw email field stores getBody() HTML verbatim');
+ plAssertEq_(payload.Plenti_Browser_View_HTML__c,'<html>browser view</html>','the fetched page is stored separately from the email');
+ plAssert_(payload.Plenti_Raw_Email__c!==payload.Plenti_Browser_View_HTML__c,'the two sources are kept in separate fields');
+
+ // 解析结果 JSON,且**不含**抓回来的页面本身
+ var stored=JSON.parse(payload.Plenti_Parsed_JSON__c);
+ plAssertEq_(stored.referralId,'FIXTURE-0001','parsed JSON carries the identifier');
+ plAssert_(payload.Plenti_Parsed_JSON__c.indexOf('browser view')<0,'the 40KB page must not be duplicated into the JSON field');
+
+ // [D-013] Description 是一行摘要,marker 是承重结构不能删
+ plAssert_(payload.Description.indexOf('[Intake: '+message.getId()+']')===0,'Description starts with the message marker');
+ plAssert_(payload.Description.indexOf('3 fields parsed')>=0,'Description records how many fields were parsed');
+ plAssert_(payload.Description.split('\n').length===1,'Description is a single line');
+ plAssert_(payload.Description.length<=32000,'Description stays within the standard-field limit');
+ plAssert_(payload.Description.indexOf('12 Fictional Street')<0,'the email body is not copied into Description (D-012)');
+
+ // 降级时 Description 要显眼地标出来
+ var degraded=plLeadPayload_(message,parsed,{html:'',meta:{found:[],degraded:true}});
+ plAssert_(/BROWSER VIEW UNAVAILABLE/.test(degraded.Description),'a degraded Lead says so in Description so a human knows to open the link');
+ plAssertEq_(degraded.Plenti_Browser_View_HTML__c,'','no page means an empty field, not a fabricated one');
+
+ // 客户姓名取不到时用 token 兜底,**绝不用发件人地址**
+ var anon=plTestParsed_();anon.customer.lastName='';anon.customer.email='';
+ var anonPayload=plLeadPayload_(message,anon,{html:'',meta:{found:[],degraded:true}});
+ plAssert_(/Plenti referral/.test(anonPayload.LastName),'a nameless referral still gets a usable LastName');
+ plAssert_(!('Email' in anonPayload),'no customer email means the field is omitted, never filled with the sender address');
+
+ // 截断:上限内含标记
+ var huge=plTestParsed_();
+ var hugePayload=plLeadPayload_(message,huge,{html:new Array(140000).join('x'),meta:{found:[]}});
+ plAssert_(hugePayload.Plenti_Browser_View_HTML__c.length<=131072,'long text is truncated below the Salesforce field limit');
+ plAssert_(/\[TRUNCATED\]$/.test(hugePayload.Plenti_Browser_View_HTML__c),'truncation is marked, and the marker counts inside the limit');
+ console.log('PASS: 24 Lead field-mapping cases');
 }
 
 // ============================================================
@@ -477,9 +534,9 @@ function testPlentiRequiredProperties(){
 function testPlentiProcessFlow(){
  plTestBaseline_();
  var cases=[
-  ['trusted-referral','review',true,/could not be parsed with confidence/],
-  ['trusted-noreply','review',true,/could not be parsed with confidence/],
-  ['trusted-with-promo-footer','review',true,/could not be parsed with confidence/],
+  ['trusted-referral','review',true,/Not identifiable as a Plenti referral/],
+  ['trusted-noreply','review',true,/Not identifiable as a Plenti referral/],
+  ['trusted-with-promo-footer','review',true,/Not identifiable as a Plenti referral/],
   ['spoofed-plenti','review',true,/not a verified Plenti sender/],
   ['unlisted-sender-dmarc-pass','review',true,/not a verified Plenti sender/],
   ['auth-header-missing','review',true,/not a verified Plenti sender/],
@@ -497,7 +554,7 @@ function testPlentiProcessFlow(){
    plAssertEq_(s.leadCandidate,c[2],c[0]+' leadCandidate');
    plAssert_(c[3].test(s.reason),c[0]+' reason should match '+c[3]+', got: '+s.reason);
   });
-  plAssertEq_(plTestPosts_(calls).length,0,'the parser skeleton must never create a Lead');
+  plAssertEq_(plTestPosts_(calls).length,0,'a message with no browser-view link must never create a Lead');
  });
 
  // 可信邮件的页脚营销话术不得把它变成 promotion(D-010 的漏单路径)
@@ -730,10 +787,155 @@ function testPlentiMessageBody(){
 }
 
 // ============================================================
+// 18. R8 Browser view —— 链接提取、页面解析、降级路径
+// ============================================================
+
+function testPlentiBrowserView(){
+ plTestBaseline_();
+ var linked=plTestMessage_('trusted-referral-with-link');
+ var token=plTestBrowserToken_(),url='https://e.customeriomail.com/deliveries/'+token;
+
+ // ---- 1. 链接提取:纯文本版和 HTML 版都要能提 ----
+ plAssertEq_(plBrowserViewUrl_(linked),url,'the link is extracted from the plain-text body');
+ var htmlOnly=plTestMessageFrom_({id:'link-html-only',subject:'s',headers:{},body:'',
+  html:'<p><a href="'+url+'">View in Browser</a></p>'});
+ plAssertEq_(plBrowserViewUrl_(htmlOnly),url,'the link is extracted from the HTML body when there is no plain text');
+ var entity=plTestMessageFrom_({id:'link-entity',subject:'s',headers:{},body:'',
+  html:'<a href="https://e.customeriomail.com/deliveries/AB&amp;cd==">x</a>'});
+ plAssert_(plBrowserViewUrl_(entity).indexOf('&amp;')<0,'HTML entities in the href are unescaped before matching');
+ plAssertEq_(plBrowserViewUrl_(plTestMessage_('trusted-referral')),'','a message with no link yields an empty URL');
+ // 尾随标点不能被吞进 token
+ plAssertEq_(plDeliveryToken_('https://e.customeriomail.com/deliveries/'+token),token,'the delivery token is the last path segment');
+ plAssertEq_(plDeliveryToken_('https://example.com/other'),'','a non-delivery URL has no token');
+
+ // ---- 2. 页面解析:必须取第一组的真值,不能取第二组的空值 ----
+ var fields=plParseBrowserView_(plTestBrowserHtml_());
+ plAssertEq_(fields.name,'Fixture Example','customer name comes from the populated block');
+ plAssertEq_(fields.systems,'Battery, Solar','renewable systems parsed');
+ plAssertEq_(fields.found.length,3,'all three labelled fields are found');
+ plAssertEq_(fields.missing.length,0,'nothing missing');
+ // 地址:<br/> 与换行都要合并成一行
+ plAssertEq_(fields.address,'12 Fictional Street, Sampletown SA 5000','the address is merged onto one line');
+ plAssert_(fields.address.indexOf('\n')<0,'no newline survives in the address');
+ plAssert_(fields.address.indexOf('<br')<0,'no markup survives in the address');
+
+ // 第二组的空值绝不能被选中
+ plAssert_(fields.name!=='','the empty duplicate block must not win');
+ plAssert_(fields.systems!=='[]','the literal [] placeholder is treated as empty, not as a value');
+
+ // 只有空值区块时,三个字段都应为空而不是 []
+ var emptyOnly=plParseBrowserView_(
+  '<p><strong>Customer name</strong></p><p></p>'+
+  '<p><strong>Customer address</strong></p><p></p>'+
+  '<p><strong>Renewable systems</strong></p><p>[]</p>');
+ plAssertEq_(emptyOnly.name,'','an empty block yields no name');
+ plAssertEq_(emptyOnly.systems,'','[] is not a value');
+ plAssertEq_(emptyOnly.missing.length,3,'all three are reported missing');
+
+ // ---- 3. 地址拆分:匹配不上就整串塞 Street,不猜 ----
+ var au=plSplitAuAddress_('12 Fictional Street, Sampletown SA 5000');
+ plAssertEq_(au.street,'12 Fictional Street','street');
+ plAssertEq_(au.city,'Sampletown','city');
+ plAssertEq_(au.state,'SA','state');
+ plAssertEq_(au.postcode,'5000','postcode');
+ var odd=plSplitAuAddress_('Somewhere unusual without a postcode');
+ plAssertEq_(odd.street,'Somewhere unusual without a postcode','an unrecognised format goes into Street whole');
+ plAssertEq_(odd.city,'','nothing is guessed when the pattern does not hold');
+ plAssertEq_(odd.state,'','no state is invented');
+
+ // ---- 4. 抓取成功:字段合并进 parsed,身份来自 token ----
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(fetched){
+  var parsed=parsePlentiReferral_(linked),result=plEnrichFromBrowserView_(linked,parsed);
+  plAssertEq_(fetched.length,1,'exactly one fetch');
+  plAssertEq_(fetched[0].options.muteHttpExceptions,true,'HTTP errors must not throw out of the fetch');
+  plAssertEq_(parsed.kind,'referral','a delivery token identifies the message as a referral');
+  plAssertEq_(parsed.referralId,token,'the delivery token becomes the referral id');
+  plAssertEq_(parsed.confidence,'high','fields parsed means high confidence');
+  plAssertEq_(parsed.customer.lastName,'Fixture Example','the customer name comes from the page, not the email');
+  plAssertEq_(parsed.customer.street,'12 Fictional Street','address split into Street');
+  plAssertEq_(parsed.customer.state,'SA','address split into StateCode');
+  plAssertEq_(parsed.systems,'Battery, Solar','renewable systems recorded');
+  plAssertEq_(result.html,plTestBrowserHtml_(),'the raw page is returned for audit storage');
+  plAssert_(!parsed.browserView.degraded,'not degraded');
+  plAssert_(/^\d{4}-\d{2}-\d{2}T/.test(parsed.browserView.fetchedAt),'the fetch timestamp is recorded — these links may expire');
+  plAssert_(JSON.stringify(parsed).indexOf('Fixture Example')>=0,'the parsed JSON carries the customer data');
+  plAssert_(JSON.stringify(parsed).indexOf('<p style')<0,'the page HTML must not be embedded in the parsed JSON');
+ });
+
+ // ---- 5. 降级:抓取失败仍然要能建 Lead(SLA 时钟不等人)----
+ var failures=[
+  ['HTTP 404',function(){return {code:404,text:'not found'};},/HTTP 404/],
+  ['network error',function(){return null;},/SIMULATED NETWORK FAILURE/],
+  ['empty body',function(){return {code:200,text:''};},/empty body/]
+ ];
+ failures.forEach(function(c){
+  plTestWithFetch_(c[1],function(){
+   var parsed=parsePlentiReferral_(linked),result=plEnrichFromBrowserView_(linked,parsed);
+   plAssertEq_(parsed.kind,'referral',c[0]+': identity still comes from the token');
+   plAssertEq_(parsed.referralId,token,c[0]+': the token survives a failed fetch');
+   plAssertEq_(parsed.confidence,'low',c[0]+': degraded confidence');
+   plAssertEq_(parsed.browserView.degraded,true,c[0]+': marked degraded');
+   plAssert_(c[2].test(parsed.browserView.error),c[0]+': the reason is recorded, got '+parsed.browserView.error);
+   plAssertEq_(result.html,'',c[0]+': no page to store');
+   plAssert_(/open the link manually/.test(parsed.reason),c[0]+': the reason tells a human what to do');
+  });
+ });
+
+ // 没有链接 → 不抓取,也不建 Lead(身份不确定)
+ plTestWithFetch_(function(){throw new Error('must not fetch without a link');},function(fetched){
+  var parsed=parsePlentiReferral_(plTestMessage_('trusted-referral'));
+  plEnrichFromBrowserView_(plTestMessage_('trusted-referral'),parsed);
+  plAssertEq_(fetched.length,0,'no link means no network call at all');
+  plAssertEq_(parsed.kind,'unknown','without a token the message is not identifiable as a referral');
+ });
+
+ // ---- 6. 端到端:抓取成功 → 真的建出 Lead ----
+ plTestClearState_();
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+  plTestWithFakeApi_(function(calls){
+   ivQuery_=function(q){calls.push({kind:'query',query:q});
+    if(/WHERE Id='/.test(q))return [{Id:'00Qfixture000001AAA'}];
+    return [];};
+   var state=plProcess_(linked,false);
+   plAssertEq_(state.created,true,'a fetched referral creates a Lead');
+   var posts=plTestPosts_(calls);
+   plAssertEq_(posts.length,1,'exactly one Lead POST');
+   plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'the delivery token is stored as the external id');
+   plAssertEq_(posts[0].data.LastName,'Fixture Example','the customer name came from the browser view');
+   plAssertEq_(posts[0].data.Plenti_Browser_View_HTML__c,plTestBrowserHtml_(),'the page is stored for audit');
+   plAssert_(!('Email' in posts[0].data),'Plenti never supplies a customer email — the field stays absent');
+  });
+ });
+
+ // ---- 7. 端到端降级:抓取失败照样建 Lead ----
+ plTestClearState_();
+ plTestWithFetch_(function(){return {code:503,text:'busy'};},function(){
+  plTestWithFakeApi_(function(calls){
+   ivQuery_=function(q){calls.push({kind:'query',query:q});
+    if(/WHERE Id='/.test(q))return [{Id:'00Qfixture000002AAA'}];
+    return [];};
+   var state=plProcess_(linked,false);
+   plAssertEq_(state.created,true,'a failed fetch must NOT stop the Lead from being created — the SLA clock is running');
+   plAssert_(/\[DEGRADED\]/.test(state.reason),'the state says the Lead is degraded');
+   var posts=plTestPosts_(calls);
+   plAssertEq_(posts.length,1,'still exactly one Lead');
+   plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'identity is preserved even when the page could not be read');
+   plAssert_(/BROWSER VIEW UNAVAILABLE/.test(posts[0].data.Description),'Description tells the reviewer to open the link');
+   plAssertEq_(posts[0].data.Plenti_Browser_View_HTML__c,'','no page stored');
+  });
+ });
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 48 browser-view cases (link extraction, page parsing, degradation, end-to-end)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiBrowserView();
  testPlentiMessageBody();
  testPlentiForceCreate();
  testPlentiRecipientAllowlist();

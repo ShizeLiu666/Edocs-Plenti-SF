@@ -530,12 +530,32 @@ UTC ISO 字符串。显示时区由查看者的个人设置决定 —— 显示�
 
 FLS + Page Layout:同第 6 节。
 
-**⚠️ 关于 Length = 255**
-样本还没到,ID 格式未知。Text 字段上限就是 255,**取满不会有坏处**:
-真实 ID 更短也放得下,而且**加长容易、缩短难**(缩短要先确认没有超长数据)。
-所以现在取 255 是安全的,不必等样本。
+**⚠️ 关于 Length = 255 —— 2026-09-09 更新**
 
-**⚠️ 关于 Case Sensitive 不勾**
+ID 格式**已确定**:Plenti 用 Customer.io 发信,browser view 链接末段那串
+base64 就是 delivery token,形如 `dgSEywoBABYVAaCDQ6WGk5mjxvpUM8VINQ==`
+(36 字符,含 `=` 补位)。每封邮件唯一。
+
+Text 上限就是 255,取满仍是最优:真实 token 远短于此,而**加长容易、缩短难**。
+
+⚠️ **这个字段现在是主键路径上的必需品,不再是可选项。** `plFindReferral_`
+按它做 SOQL 查询做业务级去重。**字段不存在 → `INVALID_FIELD` → error 状态
+→ 触发 L-01(防重锁不回滚,要人工删 Script Property 才能恢复)。**
+启用前必须先建好。
+
+**⚠️ 关于 Case Sensitive —— 现在建议**勾上**
+
+原先建议不勾(fail-closed 偏向去重)。**token 是 base64,大小写有意义**:
+`dgSE...` 和 `DGSE...` 是不同的 token。不勾会让两个不同 delivery 被误判成
+同一个,直接导致漏建 Lead。
+
+原先"不勾"的推理基于"referral ID 大小写差异不太可能有意义" —— base64 推翻了
+这个前提。
+
+⚠️ **在已有数据的字段上改 Unique / Case Sensitive 是受限操作**,
+所以这一条要在正式收数据之前定掉。
+
+(以下为原先的分析,保留备查)
 Unique 文本字段默认大小写**不敏感**,即 `ABC123` 和 `abc123` 视为同一个。
 
 这是**更安全的失败方向**:它偏向"认为是同一个转介"→ 拒绝重复创建;
@@ -579,20 +599,25 @@ External ID** 成为可能 —— 那是解决"API 超时结果不确定"(§7 �
 
 ---
 
-## 8. 🟢 `Plenti_Raw_Email__c` 与 `Plenti_Parsed_JSON__c`(D-013)
+## 8. 🟢 三个长文本字段(D-013 / D-019)
 
-这两个字段把**审计留底**和**解析结果**从 Description 里搬出来,
-让邮件格式变化只影响解析、不影响存储。
+这三个字段把**审计留底**和**解析结果**从 Description 里搬出来,
+让邮件与页面格式变化只影响解析、不影响存储。
 
-**操作** —— 建两个 Long Text Area 字段:
+⚠️ **`Plenti_Browser_View_HTML__c` 是 2026-09-09 新增的**(D-019)——
+客户数据不在邮件正文里,在 browser view 页面上,那一份也要留底。
+它与邮件原文**分开存**,不合并:两份 HTML 各约 40K+,合并可能撑破上限,
+而被截断掉的正是审计原件。
 
-| 项 | `Plenti_Raw_Email__c` | `Plenti_Parsed_JSON__c` |
-|---|---|---|
-| Data Type | Long Text Area | Long Text Area |
-| Field Label | `Plenti Raw Email` | `Plenti Parsed JSON` |
-| **Length** | **131072** | **32768** |
-| Visible Lines | 10 左右 | 10 左右 |
-| Description | `Plenti 转介邮件的原始 HTML(message.getBody()),审计留底。超长截断并标注 [TRUNCATED]。` | `parsePlentiReferral_ 的解析结果 JSON。解析不到任何字段时为 {}。` |
+**操作** —— 建三个 Long Text Area 字段:
+
+| 项 | `Plenti_Raw_Email__c` | `Plenti_Browser_View_HTML__c` | `Plenti_Parsed_JSON__c` |
+|---|---|---|---|
+| Data Type | Long Text Area | Long Text Area | Long Text Area |
+| Field Label | `Plenti Raw Email` | `Plenti Browser View HTML` | `Plenti Parsed JSON` |
+| **Length** | **131072** | **131072** | **32768** |
+| Visible Lines | 10 左右 | 10 左右 | 10 左右 |
+| Description | `Plenti 转介邮件的原始 HTML(message.getBody()),审计留底。超长截断并标注 [TRUNCATED]。` | `View in Browser 页面的原始 HTML,客户数据的真实来源。空 = 抓取失败,人工可点邮件里的链接查看。` | `解析结果 JSON,含 browserView 抓取元数据与时间戳。解析不到任何字段时为 {}。` |
 
 **改了什么**
 Lead 多两个长文本字段。`Plenti_Raw_Email__c` 存的是**原始 HTML**,
@@ -604,8 +629,8 @@ Lead 多两个长文本字段。`Plenti_Raw_Email__c` 存的是**原始 HTML**,
 字段,原文已经没了。
 
 ⚠️ **FLS 要单独想一下,不能照抄前面几个字段。**
-`Plenti_Raw_Email__c` 里是**完整原始邮件**,可能含融资申请资料与身份证明
-(规格 §5.6 / **Q5**)。建议:
+`Plenti_Raw_Email__c` 与 `Plenti_Browser_View_HTML__c` 里是**完整原件**,
+后者必定含客户姓名与安装地址(规格 §5.6 / **Q5**)。建议:
 
 - 对第 2.5 节那个集成用的 Permission Set:**可见 + 可编辑**(脚本要写)
 - 对普通销售用户:**建议不可见**,除非 Jack 明确要开

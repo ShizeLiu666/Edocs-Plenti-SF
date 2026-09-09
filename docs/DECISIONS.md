@@ -650,6 +650,150 @@ eDocs 是业务共用邮箱,这类邮件占多数。全记会把表撑爆,**而�
 
 ---
 
+## D-019 数据源反转:客户数据在 browser view 页面,不在邮件正文
+
+**日期** 2026-09-09 · **决定人** Jack · **阶段** R8,已实现
+
+### 事实
+
+Plenti 邮件正文的客户字段是**空的**。Lily 直接收到的原件也一样 —— 不是转发
+导致的。Plenti 是上市金融机构,让他们改邮件模板不现实,**我们只能自适应**。
+
+**邮件正文的作用只剩两个:触发处理,以及提供 View in Browser 链接。**
+
+Jack 用真实浏览器实测该页面,我用本地 curl 复核,两边一致:
+
+| 项 | 结果 |
+|---|---|
+| HTTP | 200,0 次重定向 |
+| cookie | `document.cookie` 长度 0 —— 纯靠 URL 里的 token 授权 |
+| `<script>` / `<iframe>` | 各 0 个 |
+| 服务器原始 HTML | 直接含三项数据,与渲染后 DOM 一致 |
+| 大小 | 约 43K 字符(52KB 字节,UTF-8 多字节) |
+
+**结论:纯静态页,`UrlFetchApp.fetch()` 直接可取,不需要无头浏览器。**
+
+### 页面上有什么、没有什么(全文搜索结果)
+
+页面**只有三项**:Customer name / Customer address / Renewable systems。
+
+Jack 猜测模板里可能残留完整收件人变量 —— **搜过了,没有**:
+
+| 搜索 | 结果 |
+|---|---|
+| `0400000000` | 0 处 |
+| 任何澳洲手机号形态 | 0 处 |
+| 客户邮箱 | 0 处 |
+| 任何邮箱地址 | 只有 `renewables-referrals@plenti.com.au` —— **Plenti 自己的服务邮箱,按 §5.2 绝不可当客户邮箱** |
+| HTML 注释(138 条) | 全是 Outlook 条件注释,无数据 |
+| `display:none` 元素(22 个) | 全是布局与预览文本,无数据 |
+| meta 标签 | 全是渲染控制,无数据 |
+| View in Portal 链接 | `https://portal.plenti.com.au/`,**不带 lead id** |
+
+**所以电话和客户邮箱拿不到,自动化到不了"零人工补录"。** delivery token 是
+页面上唯一的稳定标识。
+
+### ⚠️ 解析的关键坑:每个标签在页面上出现两次
+
+模板为桌面/移动两套布局各渲染一份:
+
+```
+第一组   <strong>Customer name</strong>  →  <p text-align:right>Gabby TEST</p>
+第二组   <strong>Customer name</strong>  →  <p></p>          ← 空的
+第二组   <strong>Renewable systems</strong> → <p>[]</p>      ← 字面量 []
+```
+
+**朴素的"找到标签就取下一段文本"会取到第二组的空值。**
+
+配对算法:按文档顺序扫描 `<p>` 序列,每个标签向后找值,**撞到下一个标签就停**。
+第二组标签后面紧跟空值和下一个标签,天然配不出值;只有第一组能配出。
+值优先取 `text-align: right` 的段落(模板用右对齐区分值列),取不到再退回该区间
+内第一个非空普通段落。`[]` 与空串一律视为"没取到"。
+
+### 字段拆分:能确定就拆,不能就整串保留
+
+- **姓名不拆。** 页面只给一个 "Customer name",拆 first/last 是猜。整串进
+  `LastName`,Salesforce 的 Name 显示完全一样,而且不会切错复合姓氏。
+- **地址轻量拆。** 只认最保守的 `<街道>, <城市> <州> <四位邮编>`,州必须是八个
+  法定缩写之一。**匹配不上就整串塞 `Street`,不猜** —— 与 D-018 不清洗正文同
+  一条理由:一个样本撑不起更激进的规则。
+
+### 判定门的语义变更 ⚠️
+
+原来:`kind==='referral' && confidence==='high'` 才建 Lead。
+现在:**`kind==='referral' && referralId`(拿到 delivery token)就建。**
+
+理由是 Jack 的 R8 第 6 点:
+
+> 绝不能因为抓取失败就不建 Lead —— SLA 时钟不等人。
+
+**身份与数据分开对待**:token 拿到 = 身份确定;字段抓到 = 数据完整。
+`confidence` 从"门"降级为"标记",记录数据完整度,不再决定建不建。
+
+**"认不出来转人工"原则没有松动** —— 没有 browser-view 链接的邮件
+(`kind==='unknown'`)依旧一律转 review,一封都不建。
+
+降级建出的 Lead 有三重标记:`state.reason` 带 `[DEGRADED]`、
+Description 里写 `[BROWSER VIEW UNAVAILABLE — open the link in the raw email
+for customer details]`、`Plenti_Parsed_JSON__c` 里 `browserView.degraded=true`
+并记录失败原因。
+
+### 连带变更:客户邮箱不再是必要条件
+
+Plenti **从不**提供客户邮箱。原来 `plResolve_` 在没有客户邮箱时转 review ——
+那等于永远不建 Lead。
+
+现在:主键换成 delivery token;**取不到客户邮箱就不写 `Email` 字段**。
+§5.2 真正禁止的是"拿 Plenti 的地址当客户邮箱",这一条继续严守 ——
+有断言验证 `Email` 字段是被省略而不是被填成发件人地址。
+
+⚠️ **已知能力退化**:规格 §5.5 的跨邮箱去重靠客户邮箱查询,Plenti 路径通常
+没有邮箱,**这一层实际上失效了**。info 与 eDocs 同时收到同一客户时不再能自动
+拦截。记为 **Q15**。
+
+### Q6 关闭:`plFindReferral_` 从 fail-closed 桩落地为真实查询
+
+delivery token(URL 末段 base64,每封邮件唯一)存 `Plenti_Lead_ID__c`,
+`plFindReferral_` 按该字段 SOQL 查询。同一 token 已建过就返回既有 Lead ——
+这一层同时覆盖"同一封邮件跑两次"和"同一转介重发成新邮件"。
+命中多条则抛错要人工核查(Unique 约束本应挡住,抛错是防它没勾上)。
+
+⚠️ **该查询要求 `Plenti_Lead_ID__c` 已存在。字段不存在 → `INVALID_FIELD`
+→ error 状态 → 触发 L-01(防重锁不回滚)。启用前必须先建字段。**
+
+### 留底字段怎么分 —— 单独开一个字段
+
+Jack 让我定。**`Plenti_Browser_View_HTML__c` 独立于 `Plenti_Raw_Email__c`**,
+不合并。四条理由:
+
+1. **尺寸**:两份 HTML 各约 40K+,合并可能撑破 131,072,而截断掉的正是审计原件
+2. **来源可分**:两者来自不同系统、不同时刻、可靠性不同;混成一坨就无法只对
+   其中一份重跑解析
+3. **失败可辨**:抓取会失败。独立字段下"空 = 抓取失败"含义明确,合并则要靠标记
+4. **D-014 的本意**:审计原件不能是派生物,拼接就把它变成了派生物
+
+抓取时间戳记在 `Plenti_Parsed_JSON__c` 的 `browserView.fetchedAt`,不单开
+DateTime 字段 —— 少一个字段要建。**这类链接可能有有效期**,时间戳是判断页面
+新鲜度的依据。若日后需要按抓取时间查询,再加 DateTime 字段。
+
+### ⚠️ UrlFetchApp 没有超时参数
+
+Jack 要求"设一个合理的 timeout"。**Apps Script 的 `UrlFetchApp.fetch` 不提供
+可配置的 timeout 选项** —— 我没有办法在这一层设。已做的是
+`muteHttpExceptions: true`(任何 HTTP 状态都不抛错)+ 全程 try/catch,
+**任何失败都落在返回值里由调用方降级,不会抛出去中断流程**。
+真实耗时等 Phase 4 观察后再评估是否需要更强保护。
+
+### 任务 A 随 R8 落地,任务 B(upsert)仍未做
+
+R8 第 4、5 点要求写 `Plenti_Lead_ID__c` 和留底字段,没有 D-013 的字段映射就
+无法实现,因此**任务 A 的存储结构随本轮一起落地**。
+
+**任务 B 的 upsert 没做**,按 Jack 的"先只存字段,upsert 等这一轮跑通再切"。
+当前写入路径仍是 `POST /sobjects/Lead` + 事前 SOQL 查重。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -877,8 +1021,9 @@ watermark 的校验保持原样。
 | Q3 | `LeadSource` picklist 是否已有 `Plenti` 值?没有需先加(Setup 操作,不由脚本做) | Phase 4 | §5.9 |
 | Q4 | `Company` 字段:模板写死 `Individual / Residential`,是否适用于 Plenti 转介 | Phase 3 | §5.9 |
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
-| ~~Q6~~ | **已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
+| ~~Q6~~ | ✅ **已关闭**(2026-09-09)—— delivery token 落地为 `Plenti_Lead_ID__c`,`plFindReferral_` 已实现为真实查询,见 D-019。原文:**已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
+| Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |
 | Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |

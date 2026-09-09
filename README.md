@@ -28,14 +28,23 @@ Salesforce 沙箱配置手册见 [docs/SANDBOX_SETUP.md](docs/SANDBOX_SETUP.md)(
 - 收信范围收窄到 eDocs 群组(规格 §5.7)
 - `.eml` 留存开关,默认关闭(规格 §5.6)
 
+### ⚠️ 数据源是 browser view 页面,不是邮件正文(D-019)
+
+2026-09-09 实测确认:**Plenti 邮件正文的客户字段是空的**(Lily 直接收到的
+原件也一样)。Plenti 是上市金融机构,让他们改模板不现实,我们只能自适应。
+
+**邮件只负责两件事:触发处理,提供 View in Browser 链接。** 真实数据由脚本
+抓取该链接指向的页面得到 —— 纯静态页,不需要 cookie、不需要执行 JS。
+
+页面上**只有三项**:客户姓名 / 客户地址 / 可再生系统。**没有电话,没有客户
+邮箱**(已全文搜索确认,包括注释、meta 与隐藏元素)。因此 Lead 上不会有
+`Email`,`Phone` 也拿不到 —— 这不是缺陷,是数据源就没有。
+
 **尚未完成**:
 
-- **Plenti 字段提取正则**(Phase 3,等 2026-09-09 真实样本)。骨架期
-  `parsePlentiReferral_` 恒返回 `unknown` / 低置信度,所有邮件转 review,
-  **永远不会创建 Lead** —— 这是设计如此,不是缺陷
-- **业务级去重的 referral ID 存储**(Q6)。`plFindReferral_` 是 fail-closed
-  桩,直接抛错;宁可整条路径卡死,也不在没有业务级去重的情况下建 Lead
-- **补充资料更新已有 Lead 的路径**(Q6)。`kind==='supplement'` 目前只转 review
+- **任务 B upsert**(D-013)。当前是 `POST` + 事前 SOQL 查重,尚未切到
+  `PATCH /sobjects/Lead/Plenti_Lead_ID__c/{token}`
+- **补充资料更新已有 Lead 的路径**。`kind==='supplement'` 目前只转 review
 - **review 状态的自动解除**(Q9,阻塞于 Q1)。`plRefreshReview_` 是空操作桩,
   `SF-Lead-Review` 标签需人工处理
 - 任何 Salesforce 连接与字段映射验证(Phase 4)
@@ -220,6 +229,12 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **review 状态目前没有自动解除机制**(Q9)。标签需要人工处理。
 - `INTAKE_V2_START` 必须配置且可解析,否则 `runIntakeV2` 直接抛错停止 ——
   脚本**不会**在缺配置时回扫历史邮件(DECISIONS TODO-3 修复了模板的这个缺口)。
+- **跨邮箱去重在 Plenti 路径上实际失效**(Q15)。规格 §5.5 那一层靠客户邮箱
+  查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能
+  自动拦截,只能靠人工审核兜住。
+- **browser view 链接可能有有效期。** 抓取时间戳记在 `Plenti_Parsed_JSON__c`
+  的 `browserView.fetchedAt`;抓取失败时 Lead 照建并标记 `[DEGRADED]`,
+  人工可以自己点邮件里的链接查看。
 - **收件人白名单不命中的邮件不留任何痕迹**(D-015)—— 不写状态、不打标签。
   这是范围过滤,与 `list:` 查询同一性质,不是"静默丢弃"分类不确定的邮件。
   若日后把某地址移出白名单,相关 thread 的旧标签不会自动清除。

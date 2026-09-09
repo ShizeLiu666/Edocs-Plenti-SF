@@ -1,0 +1,14 @@
+{
+  "_note": "虚构样本。可信 Plenti 转介邮件 —— 正文里客户字段是空的(与真实邮件一致),只提供 View in Browser 链接。真数据在该链接指向的页面上,见 browser-view-sample.json。",
+  "id": "fixture-referral-with-link",
+  "subject": "Action required: New lead",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-09T02:15:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@plenti.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=plenti.example",
+    "To": "eDocs <edocs@example.org>"
+  },
+  "body": "Hi Sunterra,\n\nA new customer lead is now available in your Plenti Portal.\n\nView in Browser: https://e.customeriomail.com/deliveries/FIXTUREtoken0001AAA==\n\nPlease contact your lead within 1 business day.\n",
+  "html": "<html><body><p>Hi Sunterra,</p><p><a href=\"https://e.customeriomail.com/deliveries/FIXTUREtoken0001AAA==\">View in Browser</a></p></body></html>"
+}

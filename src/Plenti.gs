@@ -15,8 +15,9 @@
  * │ A. plExclude_          与可信无关的排除(不需要正文)          │
  * │ B. isPlentiSource_     发件人可信验证(规格 §5.1)             │
  * │      不可信 → review,plUntrustedReason_ 只细化 reason         │
- * │ C. parsePlentiReferral_ 仅可信邮件走到这;骨架期恒返回 unknown  │
- * │    ⚠️ [R3 临时] PLENTI_FORCE_CREATE=true 可绕过置信度门(D-017) │
+ * │ C. parsePlentiReferral_ 对邮件正文解析(Plenti 路径下正文为空)  │
+ * │ C2. plEnrichFromBrowserView_ 抓 browser view 页面,真数据在这里 │
+ * │    ⚠️ [R3 临时] PLENTI_FORCE_CREATE=true 可绕过判定门(D-017)   │
  * │ D. plResolve_          三层去重;referral 存储未实现即抛错      │
  * │ E. plCreateLead_       IV2_CREATE_ 防重锁 → POST → 回读        │
  * │ F. ivAttachSource_     仅 ATTACH_RAW_EMAIL==='true' 时执行     │
@@ -316,6 +317,215 @@ function plUntrustedReason_(subject,plain){
 }
 
 // ============================================================
+// R8 Browser view 抓取与解析(D-019)
+// ============================================================
+
+/**
+ * ⚠️ 数据源反转:**客户数据不在邮件正文里,在 browser view 页面上。**
+ *
+ * 2026-09-09 实测确认:Plenti 邮件正文的客户字段是空的(Lily 直接收到的原件
+ * 也一样,不是转发导致的)。Plenti 是上市金融机构,让他们改邮件模板不现实,
+ * 我们只能自适应。**邮件正文的作用只剩两个:触发处理,以及提供这个链接。**
+ *
+ * 页面实测特征(Jack 用真实浏览器 + 本地 curl 双向验证):
+ *   HTTP 200,0 次重定向,不依赖 cookie(纯靠 URL 里的 token 授权),
+ *   0 个 <script>、0 个 <iframe> —— 纯静态,UrlFetchApp 直接可取。
+ */
+var PLENTI_BROWSER_VIEW_RE=/https?:\/\/[A-Za-z0-9.-]*customeriomail\.com\/deliveries\/[A-Za-z0-9_\-+\/=]+/i;
+
+/**
+ * 页面上的三个字段标签。**顺序无关**,配对靠文档顺序扫描,见 plParseBrowserView_。
+ */
+var PLENTI_BROWSER_LABELS=[
+ {key:'name',label:'customer name'},
+ {key:'address',label:'customer address'},
+ {key:'systems',label:'renewable systems'}
+];
+
+/** 页面把"空值"渲染成空串或字面量 []。两者都算没取到。 */
+function plBrowserValueEmpty_(text){var t=String(text||'').trim();return t===''||t==='[]';}
+
+function plHtmlUnescape_(text){
+ return String(text||'')
+  .replace(/&nbsp;/gi,' ').replace(/&lt;/gi,'<').replace(/&gt;/gi,'>')
+  .replace(/&quot;/gi,'"').replace(/&#0?39;/g,"'").replace(/&apos;/gi,"'")
+  .replace(/&#(\d+);/g,function(all,code){return String.fromCharCode(Number(code));})
+  .replace(/&amp;/gi,'&');
+}
+
+/**
+ * 片段 → 纯文本。`<br>` 转空格再压缩空白,这样**地址的换行会被合并成一行**
+ * (Jack 观察到的逗号后换行:实测样本里是 CSS 窄列自动折行,不是 <br>;
+ * 两种都靠这里的空白压缩兜住)。
+ */
+function plHtmlText_(fragment){
+ return plHtmlUnescape_(String(fragment||'').replace(/<br\s*\/?>/gi,' ').replace(/<[^>]+>/g,' ')).replace(/\s+/g,' ').trim();
+}
+
+/** 从 URL 取 delivery token(末段 base64)。每封邮件唯一,用作 Plenti_Lead_ID__c。 */
+function plDeliveryToken_(url){
+ var m=String(url||'').match(/\/deliveries\/([A-Za-z0-9_\-+\/=]+)/);
+ return m?m[1]:'';
+}
+
+/**
+ * 从邮件里提取 View in Browser 链接。**纯文本版和 HTML 版形态不同,两种都要能提**:
+ *   纯文本版:URL 裸露在正文里
+ *   HTML 版: 藏在 <a href="..."> 里,且可能带 HTML 实体转义
+ * 先试纯文本(更干净),取不到再试 HTML。
+ */
+function plBrowserViewUrl_(message){
+ var sources=[String(message.getPlainBody()||''),String(message.getBody()||'')],i,m;
+ for(i=0;i<sources.length;i++){
+  m=plHtmlUnescape_(sources[i]).match(PLENTI_BROWSER_VIEW_RE);
+  if(m)return m[0];
+ }
+ return '';
+}
+
+/**
+ * 抓取页面。**任何失败都不抛错**,一律落在返回值里由调用方降级处理 ——
+ * 抓取失败绝不能阻断建 Lead,SLA 时钟不等人(R8 第 6 点)。
+ *
+ * ⚠️ **UrlFetchApp 不提供超时参数。** Apps Script 的 fetch 没有可配置的
+ * timeout 选项,我没有办法在这一层设。替代做法是调用方按本轮剩余预算决定
+ * 要不要发起抓取(见 plProcess_ 的 deadline 判断)。这一点等 Phase 4 实测
+ * 观察真实耗时后再评估是否需要更强的保护。
+ */
+function plFetchBrowserView_(url){
+ var out={url:url||'',token:plDeliveryToken_(url),fetchedAt:new Date().toISOString(),ok:false,status:0,error:'',html:''};
+ if(!out.url){out.error='No browser-view link found in the message';return out;}
+ try{
+  var response=UrlFetchApp.fetch(out.url,{method:'get',muteHttpExceptions:true,followRedirects:true});
+  out.status=response.getResponseCode();
+  if(out.status!==200){out.error='Browser view returned HTTP '+out.status;return out;}
+  out.html=String(response.getContentText()||'');
+  if(!out.html){out.error='Browser view returned an empty body';return out;}
+  out.ok=true;
+ }catch(e){out.error=String(e.message||e).slice(0,300);}
+ return out;
+}
+
+function plBrowserLabelKey_(text){
+ var t=String(text||'').replace(/[:：]\s*$/,'').trim().toLowerCase(),i;
+ for(i=0;i<PLENTI_BROWSER_LABELS.length;i++){if(PLENTI_BROWSER_LABELS[i].label===t)return PLENTI_BROWSER_LABELS[i].key;}
+ return '';
+}
+
+/**
+ * plParseBrowserView_(html) → {name, address, systems, found:[], missing:[]}
+ *
+ * ⚠️ **页面里每个标签出现两次。** 模板为桌面/移动两套布局各渲染一份:
+ *   第一组 标签 + 右对齐的真值
+ *   第二组 标签 + **空值**(空 <p> 或字面量 [])
+ * 朴素的"找到标签就取下一段文本"会取到第二组的空值。
+ *
+ * 配对算法:按文档顺序扫描 <p> 序列,每个标签向后找值,**撞到下一个标签就停**。
+ * 第二组的标签后面紧跟着的是空值和下一个标签,因此天然取不到东西;
+ * 只有第一组能配出值。首个配出值的occurrence 生效。
+ *
+ * 值优先取 `text-align: right` 的段落(实测模板用右对齐区分值列);
+ * 取不到再退回该区间内第一个非空普通段落。
+ */
+function plParseBrowserView_(html){
+ var out={name:'',address:'',systems:'',found:[],missing:[]};
+ // 去掉全部 HTML 注释,连同 Outlook 的 <!--[if ...]> 条件块一起 —— 真值不在注释里。
+ var body=String(html||'').replace(/<!--[\s\S]*?-->/g,'');
+ var tokens=[],re=/<p\b([^>]*)>([\s\S]*?)<\/p>/gi,m,i,j,key,value,fallback,token;
+ while((m=re.exec(body))!==null){
+  tokens.push({right:/text-align\s*:\s*right/i.test(m[1]),label:/<strong\b/i.test(m[2]),text:plHtmlText_(m[2])});
+ }
+ for(i=0;i<tokens.length;i++){
+  if(!tokens[i].label)continue;
+  key=plBrowserLabelKey_(tokens[i].text);
+  if(!key||out[key])continue;
+  value='';fallback='';
+  for(j=i+1;j<tokens.length;j++){
+   token=tokens[j];
+   if(token.label)break;
+   if(plBrowserValueEmpty_(token.text))continue;
+   if(token.right){value=token.text;break;}
+   if(!fallback)fallback=token.text;
+  }
+  if(!value)value=fallback;
+  if(value)out[key]=value;
+ }
+ for(i=0;i<PLENTI_BROWSER_LABELS.length;i++){
+  key=PLENTI_BROWSER_LABELS[i].key;
+  if(out[key])out.found.push(key);else out.missing.push(key);
+ }
+ return out;
+}
+
+/**
+ * 澳洲地址轻量拆分。**匹配不上就整串塞 Street,不猜。**
+ *
+ * 只认最保守的一种形态:`<街道>, <城市> <州> <四位邮编>`,州必须是八个法定
+ * 缩写之一。一个样本不足以支撑更激进的拆分规则(与 D-018 不清洗正文同一条
+ * 理由),匹配不上时宁可让人看到完整原文,也不切错。
+ */
+function plSplitAuAddress_(raw){
+ var out={street:String(raw||'').trim(),city:'',state:'',postcode:''};
+ var m=out.street.match(/^(.*?),\s*([A-Za-z][A-Za-z '\-]*?)\s+(NSW|VIC|QLD|SA|WA|TAS|NT|ACT)\s+(\d{4})$/i);
+ if(m){out.street=m[1].trim();out.city=m[2].trim();out.state=m[3].toUpperCase();out.postcode=m[4];}
+ return out;
+}
+
+/**
+ * 抓取 + 解析 + 合并进 parsed。返回 {html, meta}:
+ *   html —— 原始页面,进 Plenti_Browser_View_HTML__c(**不进 parsed**,
+ *           否则 44KB 页面会被 JSON.stringify 进 Plenti_Parsed_JSON__c)
+ *   meta —— 抓取元数据,进 parsed.browserView,随解析 JSON 一起留底
+ *
+ * 身份与数据分开对待:
+ *   token 取到 → 身份确定,kind='referral',**即使抓取失败也要建 Lead**
+ *   字段解析到 → confidence='high';否则 'low',Lead 照建但标记降级
+ */
+function plEnrichFromBrowserView_(message,parsed){
+ var url=plBrowserViewUrl_(message),fetched=plFetchBrowserView_(url);
+ var meta={url:fetched.url,token:fetched.token,fetchedAt:fetched.fetchedAt,ok:fetched.ok,
+  status:fetched.status,error:fetched.error,found:[],missing:[],degraded:false};
+ parsed.browserView=meta;
+ if(!fetched.token){
+  meta.degraded=true;
+  parsed.reason='No Plenti browser-view link found in the message; '+parsed.reason;
+  return {html:'',meta:meta};
+ }
+ // 有 token 就有稳定身份 —— 这是 Plenti 转介,后面无论如何都要建 Lead。
+ parsed.kind='referral';
+ if(!parsed.referralId)parsed.referralId=fetched.token;
+ if(!fetched.ok){
+  meta.degraded=true;
+  meta.missing=['name','address','systems'];
+  parsed.confidence='low';
+  parsed.reason='Browser view fetch failed: '+fetched.error+'. Lead created from the email alone; open the link manually for customer details.';
+  return {html:'',meta:meta};
+ }
+ var fields=plParseBrowserView_(fetched.html);
+ meta.found=fields.found;
+ meta.missing=fields.missing;
+ parsed.systems=fields.systems;
+ if(fields.name)parsed.customer.lastName=fields.name;
+ if(fields.address){
+  var address=plSplitAuAddress_(fields.address);
+  parsed.customer.addressRaw=fields.address;
+  parsed.customer.street=address.street;
+  parsed.customer.city=address.city;
+  parsed.customer.state=address.state;
+  parsed.customer.postcode=address.postcode;
+ }
+ if(fields.name){
+  parsed.confidence='high';
+  parsed.reason='Parsed '+fields.found.length+' field(s) from the Plenti browser view';
+ }else{
+  meta.degraded=true;
+  parsed.confidence='low';
+  parsed.reason='Browser view fetched but the customer name could not be parsed; template may have changed';
+ }
+ return {html:fetched.html,meta:meta};
+}
+
+// ============================================================
 // C. 解析骨架(字段正则本期留空)
 // ============================================================
 
@@ -444,8 +654,29 @@ function plForcedParse_(message,parsed){
  * 重发成新邮件就会产生第二个 Lead(§7 验收表明确禁止)。Gmail ID 只能防
  * 同一封邮件,防不住重发。宁可整条路径卡死,也不放行。
  */
+/** Plenti 路径的查询字段集 = 基础字段 + delivery token 字段。 */
+function plLeadFields_(){return ivLeadFields_()+',Plenti_Lead_ID__c';}
+
+/**
+ * 业务级去重的第三层(规格 §5.4),**已从 fail-closed 桩落地为真实查询**。
+ *
+ * Q6 已定:delivery token 存 Lead 自定义字段 Plenti_Lead_ID__c。token 来自
+ * browser-view URL 末段,每封邮件唯一且稳定 —— 这正是之前拿不到、导致这层
+ * 只能抛错卡住的那个稳定标识。
+ *
+ * ⚠️ 这个查询要求 Plenti_Lead_ID__c 在目标 org 中**已存在**。字段不存在时
+ * SOQL 会报 INVALID_FIELD,落 error 状态并触发 L-01(防重锁不回滚)。
+ * 启用前必须先按 SANDBOX_SETUP 第 7 节建好字段。
+ *
+ * 命中多条 → 抛错要求人工核查,不猜。Unique 约束本应挡住这种情况,
+ * 抛错是防它没被勾上。
+ */
 function plFindReferral_(referralId){
- throw new Error('Referral ID lookup is not implemented (blocked on Q6: where referral IDs are stored). Refusing to create a Lead without business-level deduplication. Referral ID: '+String(referralId||''));
+ var token=String(referralId||'');
+ if(!token)return null;
+ var rows=ivQuery_("SELECT "+plLeadFields_()+" FROM Lead WHERE Plenti_Lead_ID__c='"+ivQuote_(token)+"'");
+ if(rows.length>1)throw new Error('Multiple Leads share Plenti_Lead_ID__c '+token+'; manual review required');
+ return rows.length?rows[0]:null;
 }
 
 /**
@@ -460,22 +691,29 @@ function plFindReferral_(referralId){
  *       这是已知限制,不是完备方案)
  */
 function plResolve_(message,parsed,forced){
- var email=String(parsed.customer.email||'').toLowerCase();
- if(!email)return {review:'Customer email missing; refusing to create a Lead from the sender address'};
- if(!parsed.referralId)return {review:'Plenti referral ID missing; business-level deduplication impossible'};
+ // [R8] 主键换成 delivery token。客户邮箱不再是必要条件 —— Plenti 从不提供
+ // 客户邮箱(2026-09-09 实测确认),要求它等于永远不建 Lead。§5.2 真正禁止的是
+ // "拿 Plenti 的地址当客户邮箱",那一条继续守着:取不到就不写 Email 字段。
+ if(!parsed.referralId)return {review:'No Plenti delivery token; refusing to create a Lead without a stable identifier'};
  var marker='[Intake: '+message.getId()+']';
- var leads=ivQuery_("SELECT "+ivLeadFields_()+" FROM Lead WHERE Email='"+ivQuote_(email)+"'");
- var sourced=leads.filter(function(l){return String(l.Description||'').indexOf(marker)>=0;});
- if(sourced.length===1)return {lead:sourced[0]};
- if(sourced.length>1)return {review:'Multiple Leads carry this message marker; manual review required'};
- // ⚠️ [R3 临时] 强制模式跳过业务级去重 —— plFindReferral_ 是必抛错的 fail-closed
- // 桩,不跳过就到不了 plCreateLead_。跳过是安全的:强制模式的 referralId 是
- // FORCED-<msgId>,与消息一一对应,而第一层的 marker 去重已经按消息 ID 挡过一次,
- // 业务级这一层在此模式下本就是冗余的。D-017,Phase 4 后删。
+ // 第 2 层 业务级:同一 delivery token 已建过 → 直接返回,不重复创建。
+ // 这一层同时覆盖了"同一封邮件跑两次"和"同一转介重发成新邮件"两种情况。
+ // ⚠️ [R3 临时] 强制模式跳过,因为它的 token 是合成的 FORCED-<msgId>,
+ // 查 Salesforce 没有意义。D-017,Phase 4 后删。
  var byReferral=forced?null:plFindReferral_(parsed.referralId);
- if(byReferral)return {lead:byReferral,supplement:true};
- var open=leads.filter(function(l){return !l.IsConverted&&l.Status!=='Unqualified';});
- if(open.length)return {review:'Existing active Lead for this customer email; confirm same request versus a new project'};
+ if(byReferral)return {lead:byReferral};
+ // 第 1 层 邮件级:Description 里的 [Intake: msgId] 标记。token 查询已经覆盖
+ // 绝大多数情况,这一层是 Plenti_Lead_ID__c 尚未建好时的退路(D-013)。
+ if(parsed.customer.email){
+  var leads=ivQuery_("SELECT "+ivLeadFields_()+" FROM Lead WHERE Email='"+ivQuote_(String(parsed.customer.email).toLowerCase())+"'");
+  var sourced=leads.filter(function(l){return String(l.Description||'').indexOf(marker)>=0;});
+  if(sourced.length===1)return {lead:sourced[0]};
+  if(sourced.length>1)return {review:'Multiple Leads carry this message marker; manual review required'};
+  // 第 3 层 跨邮箱缓解(规格 §5.5):仅在有客户邮箱时可用。Plenti 路径通常没有,
+  // 这是一处**已知的能力退化**,记在 DECISIONS D-019。
+  var open=leads.filter(function(l){return !l.IsConverted&&l.Status!=='Unqualified';});
+  if(open.length)return {review:'Existing active Lead for this customer email; confirm same request versus a new project'};
+ }
  return {create:true};
 }
 
@@ -502,20 +740,40 @@ function plResolve_(message,parsed,forced){
  * 这条由 testPlentiLeadPayload 的白名单断言强制:Description 的每一行都
  * 必须命中允许的前缀,加新行会让测试变红。
  */
-function plLeadPayload_(message,parsed){
- var c=parsed.customer,marker='[Intake: '+message.getId()+']';
+var PLENTI_LONG_TEXT_LIMIT=131072;
+var PLENTI_JSON_LIMIT=32768;
+var PLENTI_DESCRIPTION_LIMIT=32000;
+
+/** 截断并标注,标注算在上限之内(D-013)。 */
+function plTruncateField_(value,limit){
+ var text=String(value||''),marker='… [TRUNCATED]';
+ return text.length<=limit?text:text.slice(0,limit-marker.length)+marker;
+}
+
+function plLeadPayload_(message,parsed,enrichment){
+ var c=parsed.customer,marker='[Intake: '+message.getId()+']',meta=(enrichment&&enrichment.meta)||{};
+ var fieldCount=(meta.found||[]).length;
  var payload={
-  LastName:String(c.lastName||'').slice(0,80),
-  Email:c.email,
+  LastName:plTruncateField_(c.lastName||('Plenti referral '+String(parsed.referralId||'').slice(0,24)),80),
   Status:'New',
   OwnerId:ivAdmin_(),
   LeadSource:'Plenti',
   Company:'Individual / Residential',
   Contact_Attempt_Count__c:0,
   Plenti_Received_At__c:message.getDate().toISOString(),
-  Description:(marker+'\nPLENTI REFERRAL - PENDING ADMIN REVIEW\nSource: '+ivSource_()+'\nPlenti referral ID: '+parsed.referralId+'\nSubject: '+String(message.getSubject()||'')+'\nRaw email body is intentionally not copied here (see DECISIONS D-012 / Q5).').slice(0,32000)
+  // D-014:审计留底存**原始 HTML**,不存 Gmail 转好的文本 —— 转换有损,
+  // 留底若存派生物,将来发现解析漏字段就没有原文可回填了。
+  Plenti_Raw_Email__c:plTruncateField_(message.getBody(),PLENTI_LONG_TEXT_LIMIT),
+  Plenti_Browser_View_HTML__c:plTruncateField_((enrichment&&enrichment.html)||'',PLENTI_LONG_TEXT_LIMIT),
+  Plenti_Parsed_JSON__c:plTruncateField_(JSON.stringify(parsed),PLENTI_JSON_LIMIT),
+  // D-013:一行摘要,不复制原文。marker 是承重结构,不能删。
+  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(meta.degraded?' [BROWSER VIEW UNAVAILABLE — open the link in the raw email for customer details]':''),PLENTI_DESCRIPTION_LIMIT)
  };
- if(c.firstName)payload.FirstName=String(c.firstName).slice(0,40);
+ // 解析不到 delivery token 就**不传该字段**(R8 第 4 点)。
+ if(parsed.referralId)payload.Plenti_Lead_ID__c=parsed.referralId;
+ // §5.2:客户邮箱取不到就不写,**绝不拿 Plenti 的地址兜底**。
+ if(c.email)payload.Email=c.email;
+ if(c.firstName)payload.FirstName=plTruncateField_(c.firstName,40);
  if(c.phone)payload.Phone=c.phone;
  if(c.street)payload.Street=c.street;
  if(c.city)payload.City=c.city;
@@ -532,14 +790,14 @@ function plLeadPayload_(message,parsed){
  * 没收到响应。盲目重建会产生重复 Lead。
  * requested → POST → created 的写入顺序不能调换。
  */
-function plCreateLead_(message,parsed){
+function plCreateLead_(message,parsed,enrichment){
  var id=message.getId(),p=PropertiesService.getScriptProperties();
  if(p.getProperty('IV2_CREATE_'+id))throw new Error('Earlier create outcome is uncertain; check Salesforce before retrying creation');
- var payload=plLeadPayload_(message,parsed);
+ var payload=plLeadPayload_(message,parsed,enrichment);
  p.setProperty('IV2_CREATE_'+id,JSON.stringify({state:'requested',at:new Date().toISOString()}));
  var result=ivReq_('sobjects/Lead','post',payload);
  p.setProperty('IV2_CREATE_'+id,JSON.stringify({state:'created',id:result.id,at:new Date().toISOString()}));
- return ivQuery_("SELECT "+ivLeadFields_()+" FROM Lead WHERE Id='"+ivQuote_(result.id)+"'")[0];
+ return ivQuery_("SELECT "+plLeadFields_()+" FROM Lead WHERE Id='"+ivQuote_(result.id)+"'")[0];
 }
 
 // ============================================================
@@ -612,8 +870,13 @@ function plProcess_(message,force,detail){
    return state;
   }
   var parsed=parsePlentiReferral_(message);
+  // [R8] 数据源反转:客户数据不在邮件正文,在 browser view 页面上。
+  // 邮件只负责触发处理和提供链接,真正的字段由这一步抓回来。
+  var enrichment=plEnrichFromBrowserView_(message,parsed);
   detail.parsed=parsed;
+  detail.browserView=parsed.browserView;
   state.kind=parsed.kind;
+  state.browserView=parsed.browserView?{ok:parsed.browserView.ok,status:parsed.browserView.status,degraded:parsed.browserView.degraded}:null;
   if(parsed.kind==='notice'){
    state.reason='Plenti non-referral notice, no Lead created: '+parsed.reason;
    ivSave_(id,state);
@@ -626,14 +889,20 @@ function plProcess_(message,force,detail){
    ivSave_(id,state);
    return state;
   }
+  // [R8] 判定门的语义变更(D-019),理由见该条:
+  //   身份确定(拿到 delivery token)→ 建 Lead,**即使字段抓取失败**。
+  //   Jack:"绝不能因为抓取失败就不建 Lead —— SLA 时钟不等人。"
+  //   身份不确定(没有 browser-view 链接)→ 仍然转 review,不建。
+  // confidence 从"门"降级为"标记":它记录数据完整度,不再决定建不建。
+  // "认不出来转人工"原则没有松动 —— kind==='unknown' 依旧一律 review。
   var forced=false;
-  if(parsed.kind!=='referral'||parsed.confidence!=='high'){
-   // ⚠️ [R3 临时] 唯一一处绕过置信度判定的地方。D-017,Phase 4 后连同
+  if(parsed.kind!=='referral'||!parsed.referralId){
+   // ⚠️ [R3 临时] 唯一一处绕过判定的地方。D-017,Phase 4 后连同
    // plForceCreate_ / plForcedParse_ 一起删。上面的判定逻辑一行未改。
    if(!plForceCreate_()){
     state.state='review';
     state.leadCandidate=true;
-    state.reason='Plenti referral could not be parsed with confidence: '+parsed.reason;
+    state.reason='Not identifiable as a Plenti referral: '+parsed.reason;
     ivSave_(id,state);
     return state;
    }
@@ -663,14 +932,14 @@ function plProcess_(message,force,detail){
   var lead=resolved.lead;
   if(!lead){
    ivSave_(id,{state:'error',reason:'Lead creation in progress',date:state.date,leadCandidate:true});
-   lead=plCreateLead_(message,parsed);
+   lead=plCreateLead_(message,parsed,enrichment);
    state.created=true;
   }
   state.record=lead.Id;
   state.attached=ivAttachSource_(message,{id:lead.Id});
   state.state='review';
   state.leadCandidate=true;
-  state.reason=(forced?'[FORCED] ':'')+(state.created?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by message marker');
+  state.reason=(forced?'[FORCED] ':'')+(parsed.confidence!=='high'?'[DEGRADED] ':'')+(state.created?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by delivery token or message marker');
   ivSave_(id,state);
   return state;
  }catch(e){
