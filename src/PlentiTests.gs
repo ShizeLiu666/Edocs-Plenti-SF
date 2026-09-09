@@ -72,6 +72,8 @@ function plTestBaseline_(){
   ATTACH_RAW_EMAIL:null
  });
  plTestClearState_();
+ // [R12] 可选字段探测按执行缓存,用例之间必须清掉,否则会互相污染
+ plLeadFieldMap_.cache=null;
 }
 
 /** 清掉运行时状态属性,让每个用例互不影响。 */
@@ -1201,8 +1203,13 @@ function testPlentiFieldSelfCheck(){
  plAssert_(names.length>20,'the probe should cover the whole payload plus the read list');
  plAssert_(names.indexOf('Plenti_Browser_View_HTML__c')>=0,'write-only fields are covered');
  plAssert_(names.indexOf('IsConverted')>=0,'read-only fields are covered');
- plAssert_(names.indexOf('Plenti_Received_At__c')<0,'a field the org lacks must not be referenced at all (D-022)');
- plAssert_(names.indexOf('Lead_Category__c')<0,'nor the template leftover');
+ // [R12] Plenti_Received_At__c 现在是**可选**字段:必须出现在自检清单里
+ // (否则探测失败时它会从清单消失、正好躲开检查),但运行期按探测结果决定写不写。
+ plAssert_(names.indexOf('Plenti_Received_At__c')>=0,'the optional field must still be listed in the self-check');
+ function optionalOf(n){var j;for(j=0;j<used.length;j++)if(used[j].name===n)return used[j].optional===true;return false;}
+ plAssertEq_(optionalOf('Plenti_Received_At__c'),true,'and flagged as optional so a missing field is not reported as an error');
+ plAssertEq_(optionalOf('Plenti_Lead_ID__c'),false,'required fields are not flagged optional');
+ plAssert_(names.indexOf('Lead_Category__c')<0,'the template leftover stays gone');
 
  // 用法标注要正确 —— write-only 与 read+write 要分得开
  function usageOf(n){var j;for(j=0;j<used.length;j++)if(used[j].name===n)return used[j].usage;return '';}
@@ -1227,7 +1234,15 @@ function testPlentiFieldSelfCheck(){
  plAssertEq_(complete.missing.length,0,'a complete org reports nothing missing');
  plAssertEq_(complete.used,names.length,'the report counts every field the code uses');
 
- // 拿掉一个自定义字段 → 必须被点名
+ // [R12] 可选字段缺失 → 走 optionalMissing,**不算错误**
+ var noOptional=[],j;
+ for(j=0;j<names.length;j++)if(names[j]!=='Plenti_Received_At__c')noOptional.push(names[j]);
+ var degraded=withDescribe(noOptional,function(){return plTestDescribeLead();});
+ plAssertEq_(degraded.missing.length,0,'a missing OPTIONAL field is not reported as an error');
+ plAssertEq_(degraded.optionalMissing.length,1,'it is reported separately');
+ plAssertEq_(degraded.optionalMissing[0],'Plenti_Received_At__c','named exactly');
+
+ // 拿掉一个必需的自定义字段 → 必须被点名
  var without=[],skipped='Plenti_Browser_View_HTML__c';
  for(i=0;i<names.length;i++)if(names[i]!==skipped)without.push(names[i]);
  var gap=withDescribe(without,function(){return plTestDescribeLead();});
@@ -1262,10 +1277,119 @@ function testPlentiFieldSelfCheck(){
 }
 
 // ============================================================
+// 22. R12 Plenti_Received_At__c —— PLT001 的计时起点
+// ============================================================
+
+function testPlentiReceivedAt(){
+ plTestBaseline_();
+ var message=plTestMessage_('trusted-referral'),parsed=plTestParsed_();
+ var enrichment={html:'',meta:{found:['name']}};
+
+ /** 假装 org 里有/没有这些字段。 */
+ function withFields(present,fn){
+  var real=ivReq_;
+  plLeadFieldMap_.cache=null;
+  ivReq_=function(path){
+   if(path!=='sobjects/Lead/describe')throw new Error('unexpected request: '+path);
+   var out=[],i;
+   for(i=0;i<present.length;i++)out.push({name:present[i],createable:true,updateable:true});
+   return {fields:out};
+  };
+  try{return fn();}finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ }
+
+ // ---- 1. ⚠️ 值必须是邮件时间,不是脚本运行时间 ----
+ var payload=withFields(['Plenti_Received_At__c'],function(){return plLeadPayload_(message,parsed,enrichment);});
+ plAssertEq_(payload.Plenti_Received_At__c,message.getDate().toISOString(),
+  'Plenti_Received_At__c must be the message date — PLT001 is measured from it and a wrong value cannot be recovered afterwards');
+ plAssertEq_(payload.Plenti_Received_At__c,'2026-09-07T02:15:00.000Z','the exact fixture timestamp, verbatim');
+ // 运行时间会落在"现在"附近;邮件时间不会。这一条专门挡住有人改成 new Date()。
+ plAssert_(Math.abs(new Date(payload.Plenti_Received_At__c).getTime()-Date.now())>60000,
+  'a run-time value would be within seconds of now — this must not be the script clock');
+ // 也不能被 parsed.receivedAt 顶替(那一层可能被 plForcedParse_ 之类改写)
+ var tampered=plTestParsed_();tampered.receivedAt='1999-01-01T00:00:00.000Z';
+ var fromMessage=withFields(['Plenti_Received_At__c'],function(){return plLeadPayload_(message,tampered,enrichment);});
+ plAssertEq_(fromMessage.Plenti_Received_At__c,message.getDate().toISOString(),
+  'the field is taken straight from message.getDate(), never from a value that passed through parsing');
+
+ // ---- 2. 字段不存在 → 跳过,POST 照常成功 ----
+ var without=withFields(['Id','Name'],function(){return plLeadPayload_(message,parsed,enrichment);});
+ plAssert_(!('Plenti_Received_At__c' in without),'an absent field is omitted, not written empty — one bad field fails the whole request');
+ plAssertEq_(JSON.parse(without.Plenti_Parsed_JSON__c).receivedAt,message.getDate().toISOString(),
+  'the timestamp is still preserved in the parsed JSON when the field is absent');
+
+ // 字段存在但不可写 → 同样跳过
+ var readOnly=(function(){
+  var real=ivReq_;plLeadFieldMap_.cache=null;
+  ivReq_=function(){return {fields:[{name:'Plenti_Received_At__c',createable:false,updateable:false}]};};
+  try{return plLeadPayload_(message,parsed,enrichment);}finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ })();
+ plAssert_(!('Plenti_Received_At__c' in readOnly),'a present-but-not-createable field is skipped too');
+
+ // ---- 3. describe 本身失败 → 降级,绝不阻断建 Lead ----
+ var broken=(function(){
+  var real=ivReq_;plLeadFieldMap_.cache=null;
+  ivReq_=function(){throw new Error('SIMULATED DESCRIBE FAILURE');};
+  try{return plLeadPayload_(message,parsed,enrichment);}finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ })();
+ plAssert_(!('Plenti_Received_At__c' in broken),'a describe failure skips the optional field');
+ plAssertEq_(broken.LeadSource,'Plenti','but the rest of the payload is intact — the Lead is still created');
+
+ // ---- 4. describe 每次执行只发一次 ----
+ (function(){
+  var real=ivReq_,calls=0;plLeadFieldMap_.cache=null;
+  ivReq_=function(path){calls++;return {fields:[{name:'Plenti_Received_At__c',createable:true}]};};
+  try{
+   plLeadPayload_(message,parsed,enrichment);
+   plLeadPayload_(message,parsed,enrichment);
+   plLeadPayload_(message,parsed,enrichment);
+   plAssertEq_(calls,1,'the field map is cached per execution — three Leads must not cost three describes');
+  }finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ })();
+ // 失败也要记住,不能每封邮件重试一次
+ (function(){
+  var real=ivReq_,calls=0;plLeadFieldMap_.cache=null;
+  ivReq_=function(){calls++;throw new Error('SIMULATED DESCRIBE FAILURE');};
+  try{
+   plLeadPayload_(message,parsed,enrichment);
+   plLeadPayload_(message,parsed,enrichment);
+   plAssertEq_(calls,1,'a failed describe is remembered too — no retry storm across a batch');
+  }finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ })();
+
+ // ---- 5. 端到端:真的写进 POST ----
+ plTestClearState_();
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+  var real=ivReq_;plLeadFieldMap_.cache=null;
+  var linked=plTestMessage_('trusted-referral-with-link'),posts=[];
+  ivReq_=function(path,method,data){
+   if(path==='sobjects/Lead/describe')return {fields:[{name:'Plenti_Received_At__c',createable:true}]};
+   if(method==='post')posts.push(data);
+   return {id:'00Qr12000000001AAA'};
+  };
+  var realQuery=ivQuery_;
+  ivQuery_=function(q){if(/WHERE Id='/.test(q))return [{Id:'00Qr12000000001AAA'}];return [];};
+  try{
+   var state=plProcess_(linked,false);
+   plAssertEq_(state.created,true,'the Lead is created');
+   plAssertEq_(posts.length,1,'exactly one POST');
+   plAssertEq_(posts[0].Plenti_Received_At__c,linked.getDate().toISOString(),
+    'the timestamp that reaches Salesforce is the message date');
+   plAssertEq_(posts[0].Plenti_Received_At__c,'2026-09-09T02:15:00.000Z','verbatim');
+  }finally{ivReq_=real;ivQuery_=realQuery;plLeadFieldMap_.cache=null;}
+ });
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 16 received-at cases (message date, never the script clock; absent field degrades)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiReceivedAt();
  testPlentiFieldSelfCheck();
  testPlentiSenderOverride();
  testPlentiTestEntryPoint();

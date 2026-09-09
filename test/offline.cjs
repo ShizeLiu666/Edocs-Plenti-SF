@@ -170,10 +170,12 @@ for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTest
     'Plenti_Browser_View_HTML__c',
     'Plenti_Lead_ID__c',
     'Plenti_Parsed_JSON__c',
-    'Plenti_Raw_Email__c'
+    'Plenti_Raw_Email__c',
+    'Plenti_Received_At__c'   // [R12] 沙箱已建;org 里没有时运行期会自动跳过
   ];
   props.set('INTAKE_ADMIN_ID', '005000000000000AAA');
   const used = context.plLeadFieldsUsed_().map((f) => f.name);
+  context.plLeadFieldMap_.cache = null;   // 探测缓存不能渗进后面的用例
   props.clear();
   const custom = used.filter((n) => n.endsWith('__c')).sort();
   assert.deepEqual([...custom], ALLOWED_CUSTOM_FIELDS,

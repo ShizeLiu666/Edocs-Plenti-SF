@@ -1055,6 +1055,81 @@ JSON 里的时间戳能满足审计,但**不可用于报表查询**,做不了 SL
 
 ---
 
+## D-023 可选 Lead 字段用 describe 探测,不用开关
+
+**日期** 2026-09-09 · **决定人** Jack(方式由我选) · **阶段** R12,已实现
+
+### 背景
+
+`Plenti_Received_At__c` 已在沙箱建好(Date/Time),按 D-022 放开写入。
+但**生产还没建**,切过去时不能被它卡住 —— Salesforce 是全有全无,
+一个字段不存在整个 POST 就失败。
+
+Jack 给了两个选项:describe 探测,或 Script Property 开关,让我选。
+
+### 为什么选探测 —— 开关的两种默认值都不安全
+
+| 默认值 | 后果 |
+|---|---|
+| 默认**关** | 生产建好字段后没人记得打开 → PLT001 的计时字段**静默为空**。而这是合同 SLA 的计算依据,静默失败是最坏的一种 |
+| 默认**开** | 切生产当天直接被 `INVALID_FIELD` 卡死,正是这次要避免的事 |
+
+探测则两边都自洽,**不需要任何人记得做什么** —— 字段在就写,不在就跳过。
+
+### 实现:按执行缓存的字段表
+
+`plLeadFieldMap_()` 取一次 Lead describe,缓存在函数属性上(与模板
+`ivReq_.token` 同一手法)。
+
+- **一次 Apps Script 执行只发一个 describe**,且只在真的要建 Lead 时才触发。
+  没有新线索的轮次一次请求都不发。有断言:连建三个 Lead 只发一次 describe。
+- **describe 本身失败时返回空表并记住失败** —— 跳过可选字段但**照常建 Lead**。
+  SLA 时钟不等人,宁可少一个字段也不能不建;收件时间仍在
+  `Plenti_Parsed_JSON__c` 的 `receivedAt` 里。有断言:失败也只发一次,
+  不会在一批邮件里形成重试风暴。
+
+`plTestVerifyLead_` 的回读列表同样按探测结果拼 —— 查一个不存在的字段
+会让整条 SOQL 报错。
+
+### ⚠️ 值必须来自邮件时间,不是脚本时间
+
+```javascript
+payload.Plenti_Received_At__c = message.getDate().toISOString();
+```
+
+**刻意直接取 `message.getDate()`,不经过 `parsed.receivedAt`** —— 后者会流经
+解析、可能被 `plForcedParse_` 之类改写,少一层被污染的可能。
+
+规格 §5.3 明确不用 `CreatedDate`:轮询 10–15 分钟一次,创建时间必然晚于接收
+时间,而"有 error 则 watermark 不前移"会放大这个偏差。**取错了整个 SLA 统计
+都是错的,而且事后无法从记录里还原。**
+
+四条断言锁住这一点:
+
+1. 等于 `message.getDate().toISOString()`
+2. 等于 fixture 的确切字面量
+3. **与"现在"相差超过 60 秒** —— 专门挡住有人改成 `new Date()`
+4. 即使 `parsed.receivedAt` 被篡改成别的值,写入的仍是邮件时间
+
+已反向验证:把取值改成 `new Date().toISOString()`,套件立刻变红并指出
+拿到的是运行时间。
+
+### 自检清单里可选字段的处理
+
+`plLeadFieldsUsed_()` **无论探测结果如何都列出可选字段**,并打 `optional` 标记。
+否则探测失败时它会从清单里消失,正好躲开检查。
+
+`plTestDescribeLead()` 把可选字段缺失单独报成 `ⓘ optional and absent —
+skipped at runtime, the request still succeeds`,不混进红色的 MISSING 清单 ——
+那是预期内的降级,不是错误。
+
+### Q16 关闭
+
+字段已在沙箱建好并放开写入。⚠️ **生产上仍未建** —— 探测保证不会卡住,
+但在建好之前生产的 PLT001 仍然无法从专用字段统计。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -1285,7 +1360,7 @@ watermark 的校验保持原样。
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
 | ~~Q6~~ | ✅ **已关闭**(2026-09-09)—— delivery token 落地为 `Plenti_Lead_ID__c`,`plFindReferral_` 已实现为真实查询,见 D-019。原文:**已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
-| Q16 | **`Plenti_Received_At__c` 要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
+| ~~Q16~~ | ✅ **已关闭**(2026-09-09)—— 沙箱已建 Date/Time 字段并放开写入,值取自 `message.getDate()`,见 D-023。⚠️ **生产上仍未建**,探测保证不卡住,但建好之前生产无法从专用字段统计 PLT001。原文:**要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |

@@ -50,10 +50,11 @@ Salesforce 沙箱配置手册见 [docs/SANDBOX_SETUP.md](docs/SANDBOX_SETUP.md)(
   ⚠️ **开着那个属性时规格 §5.1 的可信验证整个是假的** —— 它是本项目安全性
   最关键的控制,进组之后必须单独补测,不能因为测试通过就认为它验证过了。
   两者都在 Phase 4 后删除。
-- **`Plenti_Received_At__c` 尚未建出来**(Q16)。收件时间暂存在
-  `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询,做不了
-  PLT001 SLA 统计**。规格 §5.3 要求按该字段计算而非 `CreatedDate`,
-  建议尽快建好并放开 `plLeadPayload_` 里那一行。
+- **`Plenti_Received_At__c` 在生产上尚未建出来**(D-023)。沙箱已建并写入。
+  代码会用 describe 探测该字段是否存在:**不存在就跳过,不会阻断建 Lead**,
+  收件时间仍留在 `Plenti_Parsed_JSON__c` 的 `receivedAt` 里。但在生产建好
+  之前,**PLT001 SLA 无法从专用字段统计**(规格 §5.3 要求按该字段计算而非
+  `CreatedDate`)。
 - **任务 B upsert**(D-013)。当前是 `POST` + 事前 SOQL 查重,尚未切到
   `PATCH /sobjects/Lead/Plenti_Lead_ID__c/{token}`
 - **补充资料更新已有 Lead 的路径**。`kind==='supplement'` 目前只转 review

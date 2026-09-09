@@ -745,6 +745,43 @@ function plResolve_(message,parsed,forced){
  * 这条由 testPlentiLeadPayload 的白名单断言强制:Description 的每一行都
  * 必须命中允许的前缀,加新行会让测试变红。
  */
+/**
+ * [R12] **可选** Lead 字段:org 里有就写,没有就跳过,**绝不让整个 POST 失败**。
+ *
+ * Salesforce 是全有全无,一个字段不存在整个请求就失败(D-022)。沙箱已经建好
+ * Plenti_Received_At__c,生产还没建 —— 切生产时不能被它卡住。
+ *
+ * ⚠️ 为什么用 describe 探测而不是 Script Property 开关(D-023):
+ * 开关的**两种默认值都不安全**。默认关 → 生产建好字段后没人记得打开,
+ * PLT001 的计时字段静默为空,而这是合同 SLA 的计算依据;默认开 → 切生产
+ * 当天直接被 INVALID_FIELD 卡死。探测则两边都自洽,且不需要任何人记得做什么。
+ */
+var PLENTI_OPTIONAL_LEAD_FIELDS=['Plenti_Received_At__c'];
+
+/**
+ * Lead 字段表 {字段名: 是否可写},**按执行缓存**(与模板 ivReq_.token 同一手法)。
+ *
+ * 一次 Apps Script 执行只发一个 describe;只在真的要建 Lead 时才触发,
+ * 没有新线索的那些轮次一次请求都不发。
+ *
+ * describe 本身失败时返回空表并记住失败 —— 结果是**跳过可选字段但照常建 Lead**。
+ * SLA 时钟不等人,宁可少一个字段也不能不建(收件时间仍在 Plenti_Parsed_JSON__c 里)。
+ */
+function plLeadFieldMap_(){
+ if(plLeadFieldMap_.cache)return plLeadFieldMap_.cache;
+ var map={};
+ try{
+  var data=ivReq_('sobjects/Lead/describe'),list=(data&&data.fields)||[],i;
+  for(i=0;i<list.length;i++)map[list[i].name]=list[i].createable===true;
+ }catch(e){
+  console.log('Lead describe failed; optional fields are skipped for this run: '+String(e.message||e).slice(0,200));
+ }
+ plLeadFieldMap_.cache=map;
+ return map;
+}
+
+function plLeadFieldExists_(name){return plLeadFieldMap_()[name]===true;}
+
 var PLENTI_LONG_TEXT_LIMIT=131072;
 var PLENTI_JSON_LIMIT=32768;
 var PLENTI_DESCRIPTION_LIMIT=32000;
@@ -765,12 +802,6 @@ function plLeadPayload_(message,parsed,enrichment){
   LeadSource:'Plenti',
   Company:'Individual / Residential',
   Contact_Attempt_Count__c:0,
-  // ⚠️ [R11] Plenti_Received_At__c **暂时不写** —— 该字段在 org 里没建出来,
-  // 写它会让整个请求报 INVALID_FIELD(DECISIONS D-022)。
-  // 时间戳没有丢:parsed.receivedAt 会随 Plenti_Parsed_JSON__c 一起落库。
-  // 🔴 但这只是权宜之计:规格 §5.3 明确要求 PLT001 SLA 按该字段计算、
-  // 不用 CreatedDate(轮询延迟 + watermark 冻结会放大偏差),而 SLA 未达标
-  // Plenti 可立即终止合同、没有补救期。**字段建好后必须放开这一行。**
   // D-014:审计留底存**原始 HTML**,不存 Gmail 转好的文本 —— 转换有损,
   // 留底若存派生物,将来发现解析漏字段就没有原文可回填了。
   Plenti_Raw_Email__c:plTruncateField_(message.getBody(),PLENTI_LONG_TEXT_LIMIT),
@@ -779,6 +810,15 @@ function plLeadPayload_(message,parsed,enrichment){
   // D-013:一行摘要,不复制原文。marker 是承重结构,不能删。
   Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(meta.degraded?' [BROWSER VIEW UNAVAILABLE — open the link in the raw email for customer details]':''),PLENTI_DESCRIPTION_LIMIT)
  };
+ // [R12] PLT001 SLA 的计时起点(规格 §5.3)。
+ // ⚠️ 值**必须**取自 message.getDate() —— 邮件的接收时间,**不是脚本运行时间**。
+ // 取错了整个 SLA 统计都是错的,而且事后无法从记录里还原。这里刻意直接取
+ // message.getDate(),不经过 parsed.receivedAt,少一层被污染的可能。
+ // 规格 §5.3 明确不用 CreatedDate:轮询是 10–15 分钟一次,创建时间必然晚于
+ // 接收时间,而"有 error 则 watermark 不前移"会把这个偏差放大。
+ // 字段不存在时跳过(见 PLENTI_OPTIONAL_LEAD_FIELDS),收件时间仍在
+ // Plenti_Parsed_JSON__c 的 receivedAt 里,不会丢。
+ if(plLeadFieldExists_('Plenti_Received_At__c'))payload.Plenti_Received_At__c=message.getDate().toISOString();
  // 解析不到 delivery token 就**不传该字段**(R8 第 4 点)。
  if(parsed.referralId)payload.Plenti_Lead_ID__c=parsed.referralId;
  // §5.2:客户邮箱取不到就不写,**绝不拿 Plenti 的地址兜底**。
@@ -860,10 +900,17 @@ function plLeadFieldsUsed_(){
    street:'1 Probe St',city:'Probe',state:'sa',postcode:'5000'},
   confidence:'high',missing:[],ambiguous:[],reason:'probe'};
  var payload=plLeadPayload_(probeMessage,probeParsed,{html:'',meta:{found:[]}});
- var usage={},read=plLeadFields_().split(','),write=Object.keys(payload),out=[],i,name;
+ var usage={},optional={},read=plLeadFields_().split(','),write=Object.keys(payload),out=[],i,name;
  for(i=0;i<read.length;i++){name=read[i].replace(/\s+/g,'');if(name)usage[name]='read';}
  for(i=0;i<write.length;i++){name=write[i];usage[name]=usage[name]?'read+write':'write';}
- for(name in usage){if(Object.prototype.hasOwnProperty.call(usage,name))out.push({name:name,usage:usage[name]});}
+ // [R12] 可选字段无论探测结果如何都要列出来 —— 自检要覆盖"代码可能碰到的"
+ // 全集,否则探测失败时它会从清单里消失,正好躲开检查。
+ for(i=0;i<PLENTI_OPTIONAL_LEAD_FIELDS.length;i++){
+  name=PLENTI_OPTIONAL_LEAD_FIELDS[i];
+  optional[name]=true;
+  if(!usage[name])usage[name]='write';
+ }
+ for(name in usage){if(Object.prototype.hasOwnProperty.call(usage,name))out.push({name:name,usage:usage[name],optional:optional[name]===true});}
  return out;
 }
 
@@ -883,31 +930,38 @@ function plLeadFieldsUsed_(){
  * 只读:只发一个 describe 请求,不写任何记录。
  */
 function plTestDescribeLead(){
- var data=ivReq_('sobjects/Lead/describe'),have={},i,f,list=(data&&data.fields)||[];
- for(i=0;i<list.length;i++){f=list[i];have[f.name]={createable:f.createable===true,updateable:f.updateable===true};}
- var used=plLeadFieldsUsed_(),missing=[],notCreateable=[],u,h;
+ // 走与运行期同一条缓存,避免多发一个 describe,也顺带验证那条路径本身能用。
+ plLeadFieldMap_.cache=null;
+ var have=plLeadFieldMap_(),names=[],i,u,out;
+ for(out in have){if(Object.prototype.hasOwnProperty.call(have,out))names.push(out);}
+ var used=plLeadFieldsUsed_(),missing=[],optionalMissing=[],notCreateable=[];
  for(i=0;i<used.length;i++){
-  u=used[i];h=have[u.name];
-  if(!h){missing.push(u.name+' ['+u.usage+']');continue;}
-  if(u.usage.indexOf('write')>=0&&!h.createable)notCreateable.push(u.name);
+  u=used[i];
+  if(!Object.prototype.hasOwnProperty.call(have,u.name)){
+   // [R12] 可选字段缺失是**预期内的降级**,不是错误 —— 分开报,别混进红色清单
+   if(u.optional)optionalMissing.push(u.name);else missing.push(u.name+' ['+u.usage+']');
+   continue;
+  }
+  if(u.usage.indexOf('write')>=0&&have[u.name]!==true)notCreateable.push(u.name);
  }
- console.log('[R11] Lead exposes '+list.length+' fields in this org; the code uses '+used.length+'.');
+ console.log('[R11] Lead exposes '+names.length+' fields in this org; the code uses '+used.length+'.');
  if(missing.length){
   console.log('[R11] ❌ MISSING — every one of these will fail the whole request: '+missing.join(', '));
  }else{
-  console.log('[R11] ✅ every field the code reads or writes exists in this org.');
+  console.log('[R11] ✅ every required field the code reads or writes exists in this org.');
  }
+ if(optionalMissing.length)console.log('[R11] ⓘ optional and absent — skipped at runtime, the request still succeeds: '+optionalMissing.join(', '));
  if(notCreateable.length)console.log('[R11] ⚠️ present but NOT createable (write will fail): '+notCreateable.join(', '));
 
  // 两处已知的条件字段,单独点名 —— 它们不在上面的 missing 列表里也值得确认
- console.log('[R11] address picklists: StateCode='+(have.StateCode?'present':'ABSENT')+
-             ', CountryCode='+(have.CountryCode?'present':'ABSENT')+
+ console.log('[R11] address picklists: StateCode='+(Object.prototype.hasOwnProperty.call(have,'StateCode')?'present':'ABSENT')+
+             ', CountryCode='+(Object.prototype.hasOwnProperty.call(have,'CountryCode')?'present':'ABSENT')+
              ' (both exist only when State & Country Picklists are enabled)');
- console.log('[R11] Plenti_Received_At__c: '+(have.Plenti_Received_At__c
-  ? 'PRESENT — re-enable the line in plLeadPayload_ so PLT001 can be measured (D-022)'
-  : 'ABSENT — PLT001 SLA cannot be measured from a dedicated field until it is created (spec 5.3)'));
+ console.log('[R11] Plenti_Received_At__c: '+(Object.prototype.hasOwnProperty.call(have,'Plenti_Received_At__c')
+  ? 'PRESENT — PLT001 timestamp is written from the message date (spec 5.3)'
+  : 'ABSENT — skipped at runtime; PLT001 cannot be measured from a dedicated field until it is created (spec 5.3)'));
 
- return {missing:missing,notCreateable:notCreateable,used:used.length,available:list.length};
+ return {missing:missing,optionalMissing:optionalMissing,notCreateable:notCreateable,used:used.length,available:names.length};
 }
 
 // ============================================================
@@ -965,12 +1019,15 @@ function plTestOverrideMessage_(message,sender){
 
 /** ⚠️ [R10 临时] 建完之后回读五个自定义字段,只打长度不打内容(其中两个是 40KB HTML)。 */
 function plTestVerifyLead_(recordId){
- // [R11] Plenti_Received_At__c 已从此列表移除 —— org 里没建,查它会整条报错(D-022)。
- var fields=['Plenti_Lead_ID__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c','Contact_Attempt_Count__c'];
+ // [R12] 可选字段存在才查 —— 查一个不存在的字段会让整条 SOQL 报错(D-022)。
+ var fields=['Plenti_Lead_ID__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c','Contact_Attempt_Count__c'],i;
+ for(i=0;i<PLENTI_OPTIONAL_LEAD_FIELDS.length;i++){
+  if(plLeadFieldExists_(PLENTI_OPTIONAL_LEAD_FIELDS[i]))fields.push(PLENTI_OPTIONAL_LEAD_FIELDS[i]);
+ }
  try{
   var row=ivQuery_("SELECT "+fields.join(',')+" FROM Lead WHERE Id='"+ivQuote_(recordId)+"'")[0];
   if(!row){console.log('[R10] verify: Lead '+recordId+' could not be read back');return;}
-  var i,v;
+  var v;
   for(i=0;i<fields.length;i++){
    v=row[fields[i]];
    console.log('[R10] verify '+fields[i]+': '+(v===null||v===undefined||v===''?'(EMPTY)':(String(v).length>120?String(v).length+' chars':String(v))));
