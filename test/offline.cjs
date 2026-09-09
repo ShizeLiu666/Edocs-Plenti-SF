@@ -155,6 +155,33 @@ for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTest
 }
 
 // ──────────────────────────────────────────────────────────────
+// 4b. [R11] 自定义字段白名单 —— 这一道是长期守卫,不随临时代码删除
+//
+// Salesforce 是全有全无:代码引用一个 org 里不存在的字段,整个请求就失败,
+// 表现是运行时 400,排查成本高。这里在测试期就把它挡住。
+//
+// 用运行时字段集(plLeadFieldsUsed_)而不是文本扫描 —— 它由 plLeadFields_
+// 和 plLeadPayload_ 实际推导出来,改了代码自动跟着变,不会漂移。
+// ──────────────────────────────────────────────────────────────
+{
+  // Sunterra sandbox 上确认存在的自定义字段,除此之外只能用标准字段。
+  const ALLOWED_CUSTOM_FIELDS = [
+    'Contact_Attempt_Count__c',
+    'Plenti_Browser_View_HTML__c',
+    'Plenti_Lead_ID__c',
+    'Plenti_Parsed_JSON__c',
+    'Plenti_Raw_Email__c'
+  ];
+  props.set('INTAKE_ADMIN_ID', '005000000000000AAA');
+  const used = context.plLeadFieldsUsed_().map((f) => f.name);
+  props.clear();
+  const custom = used.filter((n) => n.endsWith('__c')).sort();
+  assert.deepEqual([...custom], ALLOWED_CUSTOM_FIELDS,
+    `the code must only touch custom fields that exist in the org. Unexpected: ${custom.filter((n) => !ALLOWED_CUSTOM_FIELDS.includes(n)).join(', ') || '(none)'}`);
+  console.log(`PASS: custom-field allowlist — ${custom.length} custom fields, all confirmed to exist`);
+}
+
+// ──────────────────────────────────────────────────────────────
 // 5. 回归测试
 // ──────────────────────────────────────────────────────────────
 context.runOfflineRegressionTests();   // 模板基线(测的是 Legacy.gs + Code.gs 的原文函数)

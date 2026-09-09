@@ -948,6 +948,113 @@ grep -rn "R10 临时\|D-021\|PLENTI_TEST_SENDER_OVERRIDE\|plTestSenderOverride_\
 
 ---
 
+## D-022 清理模板遗留字段,并加一道长期字段守卫
+
+**日期** 2026-09-09 · **决定人** Jack · **阶段** R11,已实现
+
+### 触发
+
+R10 之后 browser view 抓取全线通过,但建 Lead 报错:
+
+```
+SF 400 INVALID_FIELD
+No such column 'Lead_Category__c' on entity 'Lead'
+```
+
+`Lead_Category__c` 是从 Lily 的 handoff 模板继承来的,**Sunterra 的 org 里
+从来没有这个字段**,却被硬编码进 `ivLeadFields_()` 的 SOQL。
+
+⚠️ **Salesforce 是全有全无:一个字段不存在,整个请求就失败。**
+所以这类问题不会只坏掉一个字段,而是整条路径全断。
+
+### Sunterra sandbox 上确认存在的自定义字段(Jack 提供)
+
+```
+Plenti_Lead_ID__c
+Plenti_Raw_Email__c
+Plenti_Browser_View_HTML__c
+Plenti_Parsed_JSON__c
+Contact_Attempt_Count__c
+```
+
+**除此之外只能用 Salesforce 标准字段。**
+
+### 审计结果:三处问题,不止 Jack 发现的那一处
+
+| 字段 | 位置 | 处置 |
+|---|---|---|
+| `Lead_Category__c` | `ivLeadFields_()` 的 SOQL | ✅ **已移除** |
+| `Plenti_Received_At__c` | `plLeadPayload_` 写入 + `plTestVerifyLead_` 回读 | ✅ **已移除**,见下方 🔴 |
+| `StateCode` / `CountryCode` | SOQL 与 payload 双向 | ⚠️ **保留**,理由见下 |
+
+`Legacy.gs` 里的 `ivRefreshReview_` / `ivProcess_` 也引用 `Lead_Category__c`,
+**未处理** —— 那是隔离的死代码,主干一次也不调用它(有静态守卫),
+而且本轮不允许改 Legacy.gs。
+
+### 🔴 `Plenti_Received_At__c` —— 这是权宜之计,不是最终方案
+
+字段没建出来,写它会让整个请求失败,所以从 payload 里摘掉了。
+**时间戳没有丢**:`parsed.receivedAt` 随 `Plenti_Parsed_JSON__c` 一起落库。
+
+**但这不能就这样上线。** 规格 §5.3 明确要求:
+
+- PLT001 SLA **必须**按该字段计算,**不用 `CreatedDate`** —— 轮询延迟
+  (10–15 分钟)加上"有 error 则 watermark 不前移"会放大偏差
+- SLA 未达标,**Plenti 可立即终止合同,没有补救期**
+
+JSON 里的时间戳能满足审计,但**不可用于报表查询**,做不了 SLA 统计。
+
+**我的建议:Jack 去建这个字段。** 规格里那条设计不是可选项,而是合同约束的
+直接落地。字段建好后 `plLeadPayload_` 里放开一行即可,`plTestDescribeLead`
+检测到字段存在时会主动提醒这件事。
+
+### ⚠️ `StateCode` / `CountryCode` 为什么保留
+
+这两个是**条件字段** —— 只有启用了 State & Country Picklists 的 org 才有。
+它们不在 Jack 给的白名单里,但它们是**标准字段**,不是自定义字段。
+
+保留的依据(是推断,不是验证):
+
+1. 本次报错点名的是 `Lead_Category__c`,而它在 SELECT 列表里排在
+   `StateCode` / `CountryCode` **之后**。SOQL 报的是第一个未知列 ——
+   若 `StateCode` 也不存在,应该先报它。
+2. handoff 的 `README_CN.md` 把"标准地址代码字段 `StateCode`、`CountryCode`
+   及相应 picklist 配置"列为 info 邮箱项目的既有 org 依赖,说明生产 org 启用了
+   该配置;沙箱是生产的刷新副本。
+
+**但这仍然是推断。** `plTestDescribeLead` 会给出确定答案,并单独点名这两个字段。
+**建议 Jack 重试之前先跑一次那个函数**,5 秒钟,把猜测彻底去掉。
+
+### 两道新守卫
+
+**① `plTestDescribeLead()` —— 长期开发工具,不随临时代码删除**
+
+取 Lead describe,和代码实际用到的字段比对,列出"代码要用但这个 org 里没有"
+的字段;另外单独报"存在但不可写"的字段。切生产时同样用得上 ——
+生产的字段和沙箱不一定一样。
+
+**故意不手工维护字段清单** —— 那种清单一定会和代码漂移,而漂移的后果正是
+这次的运行时 400。改为:
+
+- 读字段 ← 直接拆 `plLeadFields_()` 的返回值
+- 写字段 ← 用一个把所有可选字段都填满的探针跑一遍 `plLeadPayload_`,取 keys
+
+这样 `plLeadPayload_` 一改,自检自动跟着变,不会漏。当前覆盖 **28 个字段**。
+
+⚠️ 函数名**没有**下划线后缀。Apps Script 编辑器的 Run 下拉框不列出以 `_`
+结尾的函数,叫 `plTestDescribeLead_` 就点不着了 —— Jack 原话里的命名带下划线,
+这里有意偏离。
+
+**② 自定义字段白名单(`test/offline.cjs`)—— 长期守卫**
+
+断言代码触及的自定义字段集合**恰好等于**上面那五个。用运行时字段集
+(`plLeadFieldsUsed_()`)而不是文本扫描,所以不会漂移。
+
+有一条断言专门复现本轮这一发:把 `Lead_Category__c` 塞回字段列表,
+自检必须报出来 —— 证明这道守卫**本来就能在撞 Salesforce 之前拦住它**。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -1178,6 +1285,7 @@ watermark 的校验保持原样。
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
 | ~~Q6~~ | ✅ **已关闭**(2026-09-09)—— delivery token 落地为 `Plenti_Lead_ID__c`,`plFindReferral_` 已实现为真实查询,见 D-019。原文:**已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
+| Q16 | **`Plenti_Received_At__c` 要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |

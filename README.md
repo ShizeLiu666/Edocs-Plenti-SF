@@ -50,6 +50,10 @@ Salesforce 沙箱配置手册见 [docs/SANDBOX_SETUP.md](docs/SANDBOX_SETUP.md)(
   ⚠️ **开着那个属性时规格 §5.1 的可信验证整个是假的** —— 它是本项目安全性
   最关键的控制,进组之后必须单独补测,不能因为测试通过就认为它验证过了。
   两者都在 Phase 4 后删除。
+- **`Plenti_Received_At__c` 尚未建出来**(Q16)。收件时间暂存在
+  `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询,做不了
+  PLT001 SLA 统计**。规格 §5.3 要求按该字段计算而非 `CreatedDate`,
+  建议尽快建好并放开 `plLeadPayload_` 里那一行。
 - **任务 B upsert**(D-013)。当前是 `POST` + 事前 SOQL 查重,尚未切到
   `PATCH /sobjects/Lead/Plenti_Lead_ID__c/{token}`
 - **补充资料更新已有 Lead 的路径**。`kind==='supplement'` 目前只转 review
@@ -121,6 +125,24 @@ Google Groups 一定保留了 `X-Original-Sender` 和 `X-Original-Authentication
 
 本仓库**不提供**任何"验收通过后自动打开"的辅助函数。
 `enableIntakeV2AfterValidation()` 被有意实现为直接抛错。
+
+---
+
+## 字段自检 —— 改字段映射或切生产前先跑
+
+```
+plTestDescribeLead()
+```
+
+取 Salesforce 的 Lead describe,和代码实际用到的字段比对,列出「代码要用但
+这个 org 里没有」的字段。只读,不写任何记录。
+
+⚠️ **Salesforce 是全有全无:一个字段不存在,整个请求就失败。** 这类错误的
+表现是运行时 400,排查成本高 —— 切生产之前务必先跑一次,生产的字段和沙箱
+不一定一样(D-022)。
+
+离线测试里还有一道对应的守卫:代码触及的自定义字段必须**恰好等于**已确认
+存在的那五个,多一个就红。
 
 ---
 

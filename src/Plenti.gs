@@ -578,7 +578,9 @@ function plParseReason_(r){
  */
 function parsePlentiReferral_(message){
  var body=String(message.getPlainBody()||''),subject=String(message.getSubject()||'');
- var result={kind:'unknown',referralId:'',customer:{firstName:'',lastName:'',email:'',phone:'',street:'',city:'',state:'',postcode:''},confidence:'low',missing:[],ambiguous:[],reason:''};
+ // [R11] receivedAt 随解析结果一起落进 Plenti_Parsed_JSON__c —— 在
+ // Plenti_Received_At__c 建好之前,这是收件时间唯一的留存位置(D-022)。
+ var result={kind:'unknown',referralId:'',receivedAt:message.getDate().toISOString(),customer:{firstName:'',lastName:'',email:'',phone:'',street:'',city:'',state:'',postcode:''},confidence:'low',missing:[],ambiguous:[],reason:''};
  var fields={};
  result.kind=plMatchKind_(subject,body);
  Object.keys(PLENTI_PATTERNS).forEach(function(name){
@@ -633,7 +635,10 @@ function plForceCreate_(){return PropertiesService.getScriptProperties().getProp
  *     绝不能拿发件人地址来兜底,那正是规格 §5.2 禁止的事。
  */
 function plForcedParse_(message,parsed){
+ // receivedAt 必须带过来 —— 在 Plenti_Received_At__c 建好之前,它是收件时间
+ // 唯一的留存位置(D-022),强制模式下同样不能丢。
  var id=message.getId(),forced={kind:'referral',customer:{},confidence:'high',missing:[],ambiguous:[],
+  receivedAt:parsed.receivedAt||message.getDate().toISOString(),
   reason:'PLENTI_FORCE_CREATE bypassed the confidence gate; values below may be synthetic'};
  forced.referralId=parsed.referralId||('FORCED-'+id);
  Object.keys(parsed.customer).forEach(function(k){forced.customer[k]=parsed.customer[k];});
@@ -760,7 +765,12 @@ function plLeadPayload_(message,parsed,enrichment){
   LeadSource:'Plenti',
   Company:'Individual / Residential',
   Contact_Attempt_Count__c:0,
-  Plenti_Received_At__c:message.getDate().toISOString(),
+  // ⚠️ [R11] Plenti_Received_At__c **暂时不写** —— 该字段在 org 里没建出来,
+  // 写它会让整个请求报 INVALID_FIELD(DECISIONS D-022)。
+  // 时间戳没有丢:parsed.receivedAt 会随 Plenti_Parsed_JSON__c 一起落库。
+  // 🔴 但这只是权宜之计:规格 §5.3 明确要求 PLT001 SLA 按该字段计算、
+  // 不用 CreatedDate(轮询延迟 + watermark 冻结会放大偏差),而 SLA 未达标
+  // Plenti 可立即终止合同、没有补救期。**字段建好后必须放开这一行。**
   // D-014:审计留底存**原始 HTML**,不存 Gmail 转好的文本 —— 转换有损,
   // 留底若存派生物,将来发现解析漏字段就没有原文可回填了。
   Plenti_Raw_Email__c:plTruncateField_(message.getBody(),PLENTI_LONG_TEXT_LIMIT),
@@ -825,6 +835,82 @@ function plRefreshReview_(message){
 }
 
 // ============================================================
+// 字段自检 —— ⚠️ 这一节是**长期工具,不随 R3/R9/R10 删除**
+// ============================================================
+
+/**
+ * 列出代码实际会读/写的 Lead 字段。
+ *
+ * **故意不手工维护一份字段清单** —— 那种清单一定会和代码漂移,而漂移的
+ * 后果正是 R11 这次撞到的运行时 400。这里改为:
+ *   读字段 ← 直接拆 plLeadFields_() 的返回值
+ *   写字段 ← 拿一个把所有可选字段都填满的探针跑一遍 plLeadPayload_,取 keys
+ * 这样只要 plLeadPayload_ 改了,自检自动跟着变,不会漏。
+ */
+function plLeadFieldsUsed_(){
+ var probeMessage={
+  getId:function(){return 'describe-probe';},
+  getSubject:function(){return 'describe probe';},
+  getDate:function(){return new Date();},
+  getBody:function(){return '';},
+  getPlainBody:function(){return '';}
+ };
+ var probeParsed={kind:'referral',referralId:'PROBE',receivedAt:new Date().toISOString(),
+  customer:{firstName:'A',lastName:'B',email:'probe@example.invalid',phone:'0400000000',
+   street:'1 Probe St',city:'Probe',state:'sa',postcode:'5000'},
+  confidence:'high',missing:[],ambiguous:[],reason:'probe'};
+ var payload=plLeadPayload_(probeMessage,probeParsed,{html:'',meta:{found:[]}});
+ var usage={},read=plLeadFields_().split(','),write=Object.keys(payload),out=[],i,name;
+ for(i=0;i<read.length;i++){name=read[i].replace(/\s+/g,'');if(name)usage[name]='read';}
+ for(i=0;i<write.length;i++){name=write[i];usage[name]=usage[name]?'read+write':'write';}
+ for(name in usage){if(Object.prototype.hasOwnProperty.call(usage,name))out.push({name:name,usage:usage[name]});}
+ return out;
+}
+
+/**
+ * plTestDescribeLead() —— 开发期字段自检。
+ *
+ * 取 Salesforce 的 Lead describe,和代码实际用到的字段比对,列出
+ * **"代码要用但这个 org 里没有"** 的字段。
+ *
+ * 为什么需要:这类错误的表现是运行时 400(`INVALID_FIELD: No such column`),
+ * 排查成本高,而且 **Salesforce 是全有全无 —— 一个字段不存在整个请求就失败**。
+ * 切生产时也用得上:生产的字段和沙箱不一定一样。
+ *
+ * ⚠️ 函数名**没有**下划线后缀。Apps Script 编辑器的 Run 下拉框不会列出以
+ * `_` 结尾的函数,叫 `plTestDescribeLead_` 就点不着了。
+ *
+ * 只读:只发一个 describe 请求,不写任何记录。
+ */
+function plTestDescribeLead(){
+ var data=ivReq_('sobjects/Lead/describe'),have={},i,f,list=(data&&data.fields)||[];
+ for(i=0;i<list.length;i++){f=list[i];have[f.name]={createable:f.createable===true,updateable:f.updateable===true};}
+ var used=plLeadFieldsUsed_(),missing=[],notCreateable=[],u,h;
+ for(i=0;i<used.length;i++){
+  u=used[i];h=have[u.name];
+  if(!h){missing.push(u.name+' ['+u.usage+']');continue;}
+  if(u.usage.indexOf('write')>=0&&!h.createable)notCreateable.push(u.name);
+ }
+ console.log('[R11] Lead exposes '+list.length+' fields in this org; the code uses '+used.length+'.');
+ if(missing.length){
+  console.log('[R11] ❌ MISSING — every one of these will fail the whole request: '+missing.join(', '));
+ }else{
+  console.log('[R11] ✅ every field the code reads or writes exists in this org.');
+ }
+ if(notCreateable.length)console.log('[R11] ⚠️ present but NOT createable (write will fail): '+notCreateable.join(', '));
+
+ // 两处已知的条件字段,单独点名 —— 它们不在上面的 missing 列表里也值得确认
+ console.log('[R11] address picklists: StateCode='+(have.StateCode?'present':'ABSENT')+
+             ', CountryCode='+(have.CountryCode?'present':'ABSENT')+
+             ' (both exist only when State & Country Picklists are enabled)');
+ console.log('[R11] Plenti_Received_At__c: '+(have.Plenti_Received_At__c
+  ? 'PRESENT — re-enable the line in plLeadPayload_ so PLT001 can be measured (D-022)'
+  : 'ABSENT — PLT001 SLA cannot be measured from a dedicated field until it is created (spec 5.3)'));
+
+ return {missing:missing,notCreateable:notCreateable,used:used.length,available:list.length};
+}
+
+// ============================================================
 // R9 离线注入测试入口 + R10 发件人覆盖 —— ⚠️ Phase 4 后整节删除(与 R3 一起)
 // ============================================================
 
@@ -879,7 +965,8 @@ function plTestOverrideMessage_(message,sender){
 
 /** ⚠️ [R10 临时] 建完之后回读五个自定义字段,只打长度不打内容(其中两个是 40KB HTML)。 */
 function plTestVerifyLead_(recordId){
- var fields=['Plenti_Lead_ID__c','Plenti_Received_At__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c'];
+ // [R11] Plenti_Received_At__c 已从此列表移除 —— org 里没建,查它会整条报错(D-022)。
+ var fields=['Plenti_Lead_ID__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c','Contact_Attempt_Count__c'];
  try{
   var row=ivQuery_("SELECT "+fields.join(',')+" FROM Lead WHERE Id='"+ivQuote_(recordId)+"'")[0];
   if(!row){console.log('[R10] verify: Lead '+recordId+' could not be read back');return;}

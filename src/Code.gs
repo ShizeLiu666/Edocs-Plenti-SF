@@ -65,7 +65,12 @@ function ivKey_(id){return 'IV2_MSG_'+id;}
 function ivGet_(id){var s=PropertiesService.getScriptProperties().getProperty(ivKey_(id));return s?JSON.parse(s):null;}
 function ivSave_(id,s){s.at=new Date().toISOString();PropertiesService.getScriptProperties().setProperty(ivKey_(id),JSON.stringify(s));}
 function ivLabel_(th,name,add){var l=GmailApp.getUserLabelByName(name);if(!l&&add)l=GmailApp.createLabel(name);if(l){if(add)th.addLabel(l);else th.removeLabel(l);}}
-function ivLeadFields_(){return 'Id,Name,Email,Phone,MobilePhone,Street,City,State,StateCode,PostalCode,Country,CountryCode,OwnerId,Status,IsConverted,ConvertedOpportunityId,ConvertedContactId,ConvertedAccountId,Lead_Category__c,Description';}
+// [R11] 去掉 Lead_Category__c —— 模板遗留字段,Sunterra 的 org 里从来没建过。
+// 它被硬编码进 SOQL,导致查询报 INVALID_FIELD: No such column 'Lead_Category__c'。
+// Salesforce 是全有全无,一个字段不存在整个请求就失败(DECISIONS D-022)。
+// ⚠️ StateCode / CountryCode 是**条件字段**:只有启用 State & Country Picklists
+// 的 org 才有。先保留(推断存在,依据见 D-022),用 plTestDescribeLead 确认。
+function ivLeadFields_(){return 'Id,Name,Email,Phone,MobilePhone,Street,City,State,StateCode,PostalCode,Country,CountryCode,OwnerId,Status,IsConverted,ConvertedOpportunityId,ConvertedContactId,ConvertedAccountId,Description';}
 // [Phase 2] 原模板无条件上传 .eml 原件。现加 ATTACH_RAW_EMAIL 开关,
 // 默认关闭:代码路径写好但不启用(规格 §5.6)。返回值表示是否实际上传。
 // 文件标题由 'Info email ' 改为 'eDocs email ' —— 本项目不是 info 邮箱。

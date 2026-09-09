@@ -145,7 +145,7 @@ function plTestBrowserToken_(){return plFixtures_()['browser-view-sample'].token
 
 /** 一个通过解析的虚构转介,用于绕过骨架期的空正则测试下游逻辑。 */
 function plTestParsed_(){
- return {kind:'referral',referralId:'FIXTURE-0001',
+ return {kind:'referral',referralId:'FIXTURE-0001',receivedAt:'2026-09-07T02:15:00.000Z',
   customer:{firstName:'Dale',lastName:'Example',email:'dale.example@example.net',phone:'0400000001',street:'12 Fictional Street',city:'Sampletown',state:'sa',postcode:'5000'},
   confidence:'high',missing:[],ambiguous:[],reason:'Parsed as referral'};
 }
@@ -458,7 +458,9 @@ function testPlentiLeadPayload(){
  plAssertEq_(payload.Contact_Attempt_Count__c,0,'Contact_Attempt_Count__c starts at zero');
  plAssertEq_(payload.OwnerId,'005000000000000AAA','OwnerId comes from INTAKE_ADMIN_ID');
  plAssertEq_(payload.Status,'New','Status');
- plAssertEq_(payload.Plenti_Received_At__c,message.getDate().toISOString(),'Plenti_Received_At__c must equal the message date, not the creation time');
+ // [R11] Plenti_Received_At__c 暂时不写(org 里没建,D-022),但时间戳不能丢
+ plAssert_(!('Plenti_Received_At__c' in payload),'the field is omitted while it does not exist in the org — one missing field fails the whole request');
+ plAssertEq_(JSON.parse(payload.Plenti_Parsed_JSON__c).receivedAt,message.getDate().toISOString(),'the received timestamp is preserved in the parsed JSON instead');
  plAssert_(!('Lead_Category__c' in payload),'Lead_Category__c is deliberately not written (D-011)');
  plAssertEq_(payload.StateCode,'SA','state code is upper-cased');
  plAssertEq_(payload.CountryCode,'AU','country code accompanies an Australian address');
@@ -723,7 +725,7 @@ function testPlentiForceCreate(){
  plAssert_(posted.Email!=='referrals@plenti.example','the synthetic email must never fall back to the sender address');
  plAssert_(/Forced Test/.test(posted.LastName),'the synthetic name is obviously test data');
  plAssertEq_(posted.LeadSource,'Plenti','the real field mapping is still exercised — that is the point of the switch');
- plAssertEq_(posted.Plenti_Received_At__c,message.getDate().toISOString(),'the received timestamp is still the real message date');
+ plAssertEq_(JSON.parse(posted.Plenti_Parsed_JSON__c).receivedAt,message.getDate().toISOString(),'the received timestamp is still the real message date, now carried in the parsed JSON');
 
  // 解析器保持诚实:强制模式不改 parsePlentiReferral_ 的返回
  var honest=parsePlentiReferral_(message);
@@ -1182,10 +1184,89 @@ function testPlentiSenderOverride(){
 }
 
 // ============================================================
+// 21. R11 字段自检 —— 长期工具,不随临时代码删除
+// ============================================================
+
+function testPlentiFieldSelfCheck(){
+ plTestBaseline_();
+
+ // ---- 模板遗留字段必须已经清干净 ----
+ plAssert_(ivLeadFields_().indexOf('Lead_Category__c')<0,'Lead_Category__c must be gone from the SOQL field list — the org never had it');
+ plAssert_(plLeadFields_().indexOf('Lead_Category__c')<0,'and gone from the Plenti field list too');
+ plAssert_(plLeadFields_().indexOf('Plenti_Lead_ID__c')>=0,'the delivery-token field is still selected');
+
+ // ---- 自检的覆盖范围由代码推导,不是手工清单 ----
+ var used=plLeadFieldsUsed_(),names=[],i;
+ for(i=0;i<used.length;i++)names.push(used[i].name);
+ plAssert_(names.length>20,'the probe should cover the whole payload plus the read list');
+ plAssert_(names.indexOf('Plenti_Browser_View_HTML__c')>=0,'write-only fields are covered');
+ plAssert_(names.indexOf('IsConverted')>=0,'read-only fields are covered');
+ plAssert_(names.indexOf('Plenti_Received_At__c')<0,'a field the org lacks must not be referenced at all (D-022)');
+ plAssert_(names.indexOf('Lead_Category__c')<0,'nor the template leftover');
+
+ // 用法标注要正确 —— write-only 与 read+write 要分得开
+ function usageOf(n){var j;for(j=0;j<used.length;j++)if(used[j].name===n)return used[j].usage;return '';}
+ plAssertEq_(usageOf('LastName'),'write','LastName is written but not selected back');
+ plAssertEq_(usageOf('IsConverted'),'read','IsConverted is only read');
+ plAssertEq_(usageOf('Description'),'read+write','Description is both');
+
+ // ---- describe 比对:能把缺失字段找出来 ----
+ var realReq=ivReq_;
+ function withDescribe(fieldNames,fn){
+  ivReq_=function(path){
+   if(path!=='sobjects/Lead/describe')throw new Error('unexpected request: '+path);
+   var out=[],k;
+   for(k=0;k<fieldNames.length;k++)out.push({name:fieldNames[k],createable:true,updateable:true});
+   return {fields:out};
+  };
+  try{return fn();}finally{ivReq_=realReq;}
+ }
+
+ // org 里什么都有 → 零缺失
+ var complete=withDescribe(names,function(){return plTestDescribeLead();});
+ plAssertEq_(complete.missing.length,0,'a complete org reports nothing missing');
+ plAssertEq_(complete.used,names.length,'the report counts every field the code uses');
+
+ // 拿掉一个自定义字段 → 必须被点名
+ var without=[],skipped='Plenti_Browser_View_HTML__c';
+ for(i=0;i<names.length;i++)if(names[i]!==skipped)without.push(names[i]);
+ var gap=withDescribe(without,function(){return plTestDescribeLead();});
+ plAssertEq_(gap.missing.length,1,'a missing field is reported');
+ plAssert_(gap.missing[0].indexOf(skipped)===0,'and named exactly');
+ plAssert_(gap.missing[0].indexOf('write')>=0,'together with how the code uses it');
+
+ // 这正是本轮撞到的那一发:Lead_Category__c 若还在,自检应当报出来
+ var withCategory=withDescribe(names,function(){
+  var saved=plLeadFields_;
+  plLeadFields_=function(){return saved()+',Lead_Category__c';};
+  try{return plTestDescribeLead();}finally{plLeadFields_=saved;}
+ });
+ plAssertEq_(withCategory.missing.length,1,'the self-check would have caught the Lead_Category__c regression before it hit Salesforce');
+ plAssert_(/Lead_Category__c/.test(withCategory.missing[0]),'named explicitly');
+
+ // 字段存在但不可写 → 单独报
+ var readOnly=withDescribe(names,function(){
+  var saved=ivReq_;
+  ivReq_=function(){
+   var out=[],k;
+   for(k=0;k<names.length;k++)out.push({name:names[k],createable:names[k]!=='LeadSource',updateable:true});
+   return {fields:out};
+  };
+  try{return plTestDescribeLead();}finally{ivReq_=saved;}
+ });
+ plAssertEq_(readOnly.notCreateable.length,1,'a present-but-not-createable field is reported separately');
+ plAssertEq_(readOnly.notCreateable[0],'LeadSource','named exactly');
+
+ plTestBaseline_();
+ console.log('PASS: 20 field self-check cases (would have caught this round\'s 400 before it happened)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiFieldSelfCheck();
  testPlentiSenderOverride();
  testPlentiTestEntryPoint();
  testPlentiBrowserView();
