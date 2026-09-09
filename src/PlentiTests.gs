@@ -114,6 +114,31 @@ function plTestWithFetch_(handler,fn){
  try{return fn(fetched);}finally{UrlFetchApp.fetch=real;}
 }
 
+/**
+ * [R9] 用假的 GmailApp 跑一段逻辑。messages 是 {id: messageMock} 映射。
+ * 默认的 GmailApp 桩是抛错的,这里只在用例内临时替换。
+ */
+function plTestWithGmail_(messages,fn){
+ var realGet=GmailApp.getMessageById,realLabel=GmailApp.getUserLabelByName,labels=[];
+ GmailApp.getMessageById=function(id){return messages[id]||null;};
+ GmailApp.getUserLabelByName=function(name){return {name:name,addLabel:null};};
+ try{return fn(labels);}finally{GmailApp.getMessageById=realGet;GmailApp.getUserLabelByName=realLabel;}
+}
+
+/** [R9] 捕获写进 Sheet 的行。 */
+function plTestWithSheet_(fn){
+ var real=SpreadsheetApp.openById,summary=[],messages=[],msgTab=null;
+ function tab(rows){return {getLastRow:function(){return rows.length;},
+  appendRow:function(r){rows.push(r);},
+  getRange:function(){return {setValues:function(values){values.forEach(function(v){rows.push(v);});}};}};}
+ SpreadsheetApp.openById=function(){return {
+  getSheets:function(){return [tab(summary)];},
+  getNumSheets:function(){return msgTab?2:1;},
+  getSheetByName:function(n){return n==='Messages'?msgTab:null;},
+  insertSheet:function(){msgTab=tab(messages);return msgTab;}};};
+ try{return fn({summary:summary,messages:messages});}finally{SpreadsheetApp.openById=real;}
+}
+
 /** 合成页面 fixture 的 HTML。 */
 function plTestBrowserHtml_(){return plFixtures_()['browser-view-sample'].html;}
 function plTestBrowserToken_(){return plFixtures_()['browser-view-sample'].token;}
@@ -931,10 +956,153 @@ function testPlentiBrowserView(){
 }
 
 // ============================================================
+// 19. R9 离线注入测试入口 —— ⚠️ Phase 4 后连同被测代码一起删除
+// ============================================================
+
+function testPlentiTestEntryPoint(){
+ plTestBaseline_();
+ var linked=plTestMessage_('trusted-referral-with-link'),id=linked.getId();
+ var token=plTestBrowserToken_();
+ // fixture 的 To 头是 edocs@example.org,在基线白名单里
+ var inbox={};inbox[id]=linked;
+
+ // ---- 1. 两道安全开关照常生效,这个入口不绕过 ----
+ plTestSetProps_({INTAKE_V2_ENABLED:null,EDOCS_ADAPTATION_VALIDATED:null});
+ plTestWithGmail_(inbox,function(){
+  plAssertEq_(plTestFromMessageId(id),null,'the test entry point respects INTAKE_V2_ENABLED');
+ });
+ plTestSetProps_({INTAKE_V2_ENABLED:'true'});
+ plTestWithGmail_(inbox,function(){
+  plAssertThrows_(function(){plTestFromMessageId(id);},/has not been validated/,'the second safety switch still applies');
+ });
+ plTestSetProps_({EDOCS_ADAPTATION_VALIDATED:'true'});
+
+ // ---- 2. 白名单未命中 → 什么都不做,不写状态 ----
+ plTestClearState_();
+ var outsider=plTestMessageFrom_({id:'r9-outsider',subject:'x',date:'2026-09-09T03:00:00.000Z',
+  headers:{'To':'someone@elsewhere.example'},body:'x'});
+ var box2={};box2['r9-outsider']=outsider;
+ plTestWithGmail_(box2,function(){
+  plAssertEq_(plTestFromMessageId('r9-outsider'),null,'an out-of-scope message is not processed');
+ });
+ plAssert_(!PropertiesService.getScriptProperties().getProperty('IV2_MSG_r9-outsider'),'no state is written for an out-of-scope message');
+
+ // ---- 3. 未知消息 ID → 明确报错,不静默 ----
+ plTestWithGmail_({},function(){
+  plAssertThrows_(function(){plTestFromMessageId('does-not-exist');},/No Gmail message found/,'an unknown id fails loudly');
+  plAssertThrows_(function(){plTestFromMessageId('');},/needs a Gmail message id/,'an empty id fails loudly');
+ });
+
+ // ---- 4. 完整链路:抓取成功 → 建 Lead → 写两张 Sheet ----
+ plTestClearState_();
+ plTestSetProps_({INTAKE_LOG_SHEET_ID:'fixture-sheet'});
+ plTestWithGmail_(inbox,function(){
+  plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+   plTestWithSheet_(function(sheets){
+    plTestWithFakeApi_(function(calls){
+     ivQuery_=function(q){calls.push({kind:'query',query:q});
+      if(/WHERE Id='/.test(q))return [{Id:'00Qr9000000001AAA'}];
+      return [];};
+     var state=plTestFromMessageId(id);
+     plAssertEq_(state.created,true,'the full pipeline creates a Lead');
+     var posts=plTestPosts_(calls);
+     plAssertEq_(posts.length,1,'exactly one Lead POST');
+     plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'the delivery token reached Salesforce');
+     plAssertEq_(posts[0].data.LastName,'Fixture Example','customer data came from the browser view');
+     // Sheet:汇总页表头+一行,Messages 页表头+一行
+     plAssertEq_(sheets.summary.length,2,'the run-summary tab got a header and one row');
+     plAssertEq_(sheets.messages.length,2,'the Messages tab got a header and one row');
+     plAssertEq_(sheets.summary[1][2],1,'one message processed');
+     plAssertEq_(sheets.summary[1][3],1,'one Lead created');
+     plAssertEq_(sheets.messages[1][2],id,'the message row records the Gmail id');
+     plAssertEq_(sheets.messages[1][6],'created','final state is recorded as created');
+    });
+   });
+  });
+ });
+
+ // ---- 5. 幂等:重跑不会建第二个 Lead ----
+ plTestWithGmail_(inbox,function(){
+  plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+   plTestWithFakeApi_(function(calls){
+    ivQuery_=function(q){calls.push({kind:'query',query:q});
+     if(/Plenti_Lead_ID__c/.test(q))return [{Id:'00Qr9000000001AAA',Description:'',IsConverted:false,Status:'New'}];
+     if(/WHERE Id='/.test(q))return [{Id:'00Qr9000000001AAA'}];
+     return [];};
+    var again=plTestFromMessageId(id,true);
+    plAssert_(!again.created,'a forced re-run resolves to the existing Lead instead of creating a second one');
+    plAssertEq_(plTestPosts_(calls).length,0,'no second POST');
+   });
+  });
+ });
+
+ // ---- 6. ⚠️ Jack 要确认的:链接提取失败时会怎样 ----
+ plTestClearState_();
+ // 6a. 有链接但抓取失败 → **降级建 Lead**,标记 BROWSER VIEW UNAVAILABLE
+ plTestWithGmail_(inbox,function(){
+  plTestWithFetch_(function(){return {code:500,text:'boom'};},function(){
+   plTestWithFakeApi_(function(calls){
+    ivQuery_=function(q){calls.push({kind:'query',query:q});
+     if(/WHERE Id='/.test(q))return [{Id:'00Qr9000000002AAA'}];
+     return [];};
+    var state=plTestFromMessageId(id,true);
+    plAssertEq_(state.created,true,'a failed fetch must still create the Lead — the SLA clock is running');
+    var posts=plTestPosts_(calls);
+    plAssert_(/BROWSER VIEW UNAVAILABLE/.test(posts[0].data.Description),'Description tells the reviewer to open the link');
+    plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'identity survives the failed fetch');
+   });
+  });
+ });
+
+ // 6b. **完全没有链接** → 不建 Lead,转 review。这是 D-019 的设计,不是缺陷:
+ //     没有 delivery token 就没有稳定标识,建了 Lead 之后重发会建出第二个。
+ plTestClearState_();
+ // 可信发件人 + 命中白名单,但正文里**没有** browser-view 链接
+ var noLink=plTestMessageFrom_({id:'r9-no-link',subject:'Action required: New lead',
+  date:'2026-09-09T03:10:00.000Z',
+  headers:{'To':'eDocs <edocs@example.org>',
+   'X-Original-Sender':'referrals@plenti.example',
+   'X-Original-Authentication-Results':'mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=plenti.example'},
+  body:'Hi Sunterra,\n\nA new customer lead is available in your Plenti Portal.\n'});
+ var box3={};box3[noLink.getId()]=noLink;
+ plTestWithGmail_(box3,function(){
+  plTestWithFakeApi_(function(calls){
+   var state=plTestFromMessageId(noLink.getId());
+   plAssertEq_(state.state,'review','no link means no stable identifier, so no Lead');
+   plAssertEq_(plTestPosts_(calls).length,0,'nothing is written without an identifier');
+   plAssert_(/Not identifiable as a Plenti referral/.test(state.reason),'the reason says why');
+  });
+ });
+
+ // 6c. 没有链接但打开 PLENTI_FORCE_CREATE → 用合成 token 建出降级 Lead。
+ //     这是 Jack 想要的"链接丢了也能建"的口子,已由 R3 覆盖,不需要新开关。
+ plTestClearState_();
+ plTestSetProps_({PLENTI_FORCE_CREATE:'true'});
+ plTestWithGmail_(box3,function(){
+  plTestWithFakeApi_(function(calls){
+   ivQuery_=function(q){calls.push({kind:'query',query:q});
+    if(/WHERE Id='/.test(q))return [{Id:'00Qr9000000003AAA'}];
+    return [];};
+   var state=plTestFromMessageId(noLink.getId());
+   plAssertEq_(state.created,true,'PLENTI_FORCE_CREATE lets a link-less message through for testing');
+   plAssertEq_(state.forced,true,'and the state records that it was forced');
+   var posts=plTestPosts_(calls);
+   plAssert_(/^FORCED-/.test(posts[0].data.Plenti_Lead_ID__c),'the synthetic token is obviously test data');
+  });
+ });
+ plTestSetProps_({PLENTI_FORCE_CREATE:null,INTAKE_LOG_SHEET_ID:null});
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 26 test-entry-point cases (safety switches, allowlist, full pipeline, idempotency, degradation)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiTestEntryPoint();
  testPlentiBrowserView();
  testPlentiMessageBody();
  testPlentiForceCreate();

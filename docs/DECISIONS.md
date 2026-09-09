@@ -794,6 +794,78 @@ R8 第 4、5 点要求写 `Plenti_Lead_ID__c` 和留底字段,没有 D-013 的�
 
 ---
 
+## D-020 ⚠️ 离线注入测试入口 —— Phase 4 结束后必须删除
+
+**日期** 2026-09-09 · **决定人** Jack · **阶段** R9 · **状态:🔴 临时代码**
+
+### 为什么需要
+
+eDocs 组还没建好,进组遥遥无期。目前唯一的真实样本是 Lily 转发到 Jack 收件箱
+的那封 "Fwd: Action required: New lead"。**转发件没有 `List-ID` 头**,主流程的
+`list:<组地址>` 查询搜不到它。
+
+### 为什么不改主流程查询
+
+Jack 的判断,我完全同意并原样记录:
+
+> 我不想为了测试去改主流程的查询条件 —— 那会引入一个上线前必须记得改回来的
+> 临时状态,风险太大。
+
+`src/Code.gs` 本轮**一个字节都没动**,有 `git diff` 为证。
+
+### 覆盖与不覆盖
+
+| | |
+|---|---|
+| **绕过** | `list:` 查询、watermark 逻辑 —— 只有这两件 |
+| **覆盖** | 两道安全开关 → script lock → 白名单检查 → 解析 → browser view 抓取 → 建 Lead → 标签同步 → 两张 Sheet 日志 |
+| **不覆盖** | **组投递识别**(`list:` 查询本身)。等组建好后单独补测这一环 |
+
+⚠️ **两道安全开关照常生效,这个入口不绕过它们**(规格 §3 禁止 #3),有断言。
+⚠️ 照常持有 script lock,避免与定时触发器打架。
+
+### `force` 参数
+
+`plTestFromMessageId(msgId, true)` 可重跑已处理过的邮件。**不会**清除
+`IV2_CREATE_` 防重锁,所以重跑不会重复建 Lead —— 它会按 delivery token 找到
+既有 Lead 并返回。这本身就是一条值得跑的幂等性验证,有断言。
+
+### 配套的 `plTestFindMessages(query)`
+
+只读,列出匹配 Gmail 查询的消息 ID。
+
+**为什么需要**:Gmail 网页地址栏最后那段(形如 `FMfcgzQb...`)是新版**会话**
+ID,与 `GmailApp.getMessageById()` 需要的十六进制**消息** ID 不是同一个东西,
+直接抄地址栏多半取不到邮件。
+
+### ⚠️ 澄清一处预期偏差:链接丢失 ≠ 降级建 Lead
+
+Jack 的原话是"如果链接提取失败,R8 的降级路径应该生效(只建 Lead、标记
+BROWSER VIEW UNAVAILABLE)"。**这里把两种情况混在了一起**,D-019 的实际语义是:
+
+| 情况 | 行为 | 理由 |
+|---|---|---|
+| **有链接,抓取失败** | ✅ 降级建 Lead,标 `[BROWSER VIEW UNAVAILABLE]` | token 拿到了 = 身份确定,SLA 时钟不等人 |
+| **完全没有链接** | ❌ 转 review,**不建** | 没有 delivery token 就没有稳定标识。建了之后同一转介重发会建出第二个 Lead(§7 验收表明确禁止) |
+
+**想在没有链接时也建 Lead,用已有的 `PLENTI_FORCE_CREATE`(D-017)即可**,
+它会合成 `FORCED-<msgId>` 作为 token。不需要为此新开口子。三种情况都有断言。
+
+### 🔴 删除清单(与 D-017 一起执行)
+
+```bash
+grep -rn "R9 临时\|R9 离线注入\|D-020\|plTestFromMessageId\|plTestFindMessages" src/
+```
+
+| 文件 | 删什么 |
+|---|---|
+| `src/Plenti.gs` | 整节 "R9 离线注入测试入口"(`plTestFromMessageId` + `plTestFindMessages`) |
+| `src/PlentiTests.gs` | 整个 `testPlentiTestEntryPoint` 及入口里的调用;助手 `plTestWithGmail_` / `plTestWithSheet_` |
+
+删完 `node test/offline.cjs` 应回到 35 项全绿。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,

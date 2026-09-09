@@ -825,6 +825,107 @@ function plRefreshReview_(message){
 }
 
 // ============================================================
+// R9 离线注入测试入口 —— ⚠️ Phase 4 结束后必须整节删除(与 R3 一起)
+// ============================================================
+
+/**
+ * ⚠️⚠️ 临时代码,DECISIONS D-020。Phase 4 验收结束后**整节删掉**,
+ * 与 R3(plForceCreate_ / plForcedParse_)一起清理。
+ *
+ * 存在理由:eDocs 组还没建好,进组遥遥无期。目前唯一的真实样本是 Lily
+ * 转发到 Jack 收件箱的那封邮件,而**转发件没有 List-ID 头**,主流程的
+ * `list:<组地址>` 查询搜不到它。
+ *
+ * **主流程的查询条件一个字都没改。** 为了测试去动 runIntakeV2 的查询会
+ * 引入一个"上线前必须记得改回来"的临时状态,风险比多一个测试入口大得多。
+ * 这个入口绕过的只有 `list:` 查询和 watermark 两件事,其余全部走真实路径。
+ *
+ * 覆盖:白名单检查 → 解析 → browser view 抓取 → 建 Lead → 标签 → Sheet 日志
+ * 不覆盖:**组投递识别**(`list:` 查询本身)。等组建好后单独补测这一环。
+ *
+ * ⚠️ 两道安全开关照常生效 —— 这个入口不绕过它们(规格 §3 禁止 #3)。
+ * ⚠️ 照常持有 script lock,避免与定时触发器打架。
+ *
+ * @param messageId Gmail 消息 ID(取法见 plTestFindMessages)
+ * @param force     true 时重跑已处理过的邮件。**不会**清除 IV2_CREATE_ 防重锁,
+ *                  所以重跑不会重复建 Lead —— 它会按 delivery token 找到既有
+ *                  Lead 并返回,这本身就是一条值得跑的幂等性验证。
+ * @return plProcess_ 的 state,或 null(开关关闭 / 白名单未命中)
+ */
+function plTestFromMessageId(messageId,force){
+ var p=PropertiesService.getScriptProperties();
+ if(p.getProperty('INTAKE_V2_ENABLED')!=='true'){console.log('[R9] Intake v2 held pending validation — nothing was processed.');return null;}
+ if(p.getProperty('EDOCS_ADAPTATION_VALIDATED')!=='true')throw new Error('Plenti adaptation has not been validated. Read handoff instructions.');
+ var lock=LockService.getScriptLock();
+ if(!lock.tryLock(1000)){console.log('[R9] Another intake execution is running.');return null;}
+ try{
+  var began=Date.now(),id=String(messageId||'').trim();
+  if(!id)throw new Error('plTestFromMessageId needs a Gmail message id; run plTestFindMessages() to find one');
+  var message=GmailApp.getMessageById(id);
+  if(!message)throw new Error('No Gmail message found with id '+id);
+  console.log('[R9] ⚠️ TEST ENTRY POINT — bypassing the list: query and watermark. Main-flow query is unchanged.');
+  console.log('[R9] message '+id+' | '+message.getDate().toISOString()+' | '+message.getSubject());
+
+  var recipient=plMatchedRecipient_(message,plRecipientAllowlist_());
+  if(!recipient){
+   console.log('[R9] STOP: no recipient matched INTAKE_RECIPIENT_ALLOWLIST. Checked headers: '+PLENTI_RECIPIENT_HEADERS.join(', '));
+   console.log('[R9] Add the delivery address to INTAKE_RECIPIENT_ALLOWLIST and retry.');
+   return null;
+  }
+  console.log('[R9] allowlist matched: '+recipient);
+
+  // 抓取前先把链接情况打出来 —— 转发件的 View in Browser 链接可能被重写或丢失,
+  // 这是本轮最需要先看清的一件事。
+  var url=plBrowserViewUrl_(message);
+  console.log('[R9] browser-view link: '+(url||'(NOT FOUND — see the note below)'));
+  if(!url)console.log('[R9] No link means no stable identifier, so no Lead will be created (by design, D-019). To exercise the degraded-create path anyway, set PLENTI_FORCE_CREATE=true.');
+
+  var detail={},state=plProcess_(message,force===true,detail);
+  var view=(detail.parsed&&detail.parsed.browserView)||{};
+  console.log('[R9] result: state='+state.state+' kind='+state.kind+' created='+(state.created===true)+' record='+(state.record||'(none)'));
+  console.log('[R9] browser view: ok='+(view.ok===true)+' status='+(view.status||0)+' degraded='+(view.degraded===true)+' fields='+((view.found||[]).join(',')||'(none)')+(view.error?' error='+view.error:''));
+  console.log('[R9] reason: '+state.reason);
+
+  try{ivSyncLabels_(message.getThread());}catch(e){console.log('[R9] label sync failed (not fatal): '+String(e.message||e).slice(0,200));}
+
+  var stats={threads:1,skipped:0,processed:1,
+   created:(state.created&&state.record)?1:0,
+   failed:state.state==='error'?1:0,
+   errors:state.state==='error'?[id+': '+String(state.reason||'').slice(0,200)]:[],
+   forced:plForceCreate_()};
+  ivLogRun_(began,stats);
+  ivLogMessages_([ivMessageLogRow_(message,recipient,state,detail)]);
+  return state;
+ }finally{lock.releaseLock();}
+}
+
+/**
+ * ⚠️ 临时代码,随 plTestFromMessageId 一起删。
+ *
+ * 列出匹配某个 Gmail 查询的消息 ID。**只读,不处理、不写任何状态。**
+ *
+ * 为什么需要它:Gmail 网页地址栏最后那段(形如 `FMfcgzQb...`)是新版
+ * **会话** ID,与 `GmailApp.getMessageById()` 需要的十六进制**消息** ID
+ * 不是同一个东西,直接抄地址栏多半取不到邮件。用这个函数取才可靠。
+ *
+ * 用法示例(在 Apps Script 编辑器里改参数后运行):
+ *   plTestFindMessages('subject:"Action required: New lead" newer_than:7d')
+ */
+function plTestFindMessages(query){
+ var q=String(query||'newer_than:7d'),threads=GmailApp.search(q,0,20),i,j,msgs,m,rows=0;
+ console.log('[R9] query: '+q+' → '+threads.length+' thread(s)');
+ for(i=0;i<threads.length;i++){
+  msgs=threads[i].getMessages();
+  for(j=0;j<msgs.length;j++){
+   m=msgs[j];rows++;
+   console.log('[R9] id='+m.getId()+' | '+m.getDate().toISOString()+' | from='+m.getFrom()+' | '+m.getSubject());
+  }
+ }
+ if(!rows)console.log('[R9] No messages matched. Widen the query, e.g. plTestFindMessages("newer_than:2d").');
+ return rows;
+}
+
+// ============================================================
 // 主流程
 // ============================================================
 

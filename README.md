@@ -42,6 +42,9 @@ Salesforce 沙箱配置手册见 [docs/SANDBOX_SETUP.md](docs/SANDBOX_SETUP.md)(
 
 **尚未完成**:
 
+- **组投递识别尚未验证**。eDocs 组还没建好,`list:<组地址>` 那一环没有真实
+  样本可测。其余环节靠 `plTestFromMessageId` 这个**临时**测试入口验证
+  (D-020,Phase 4 后删除)。
 - **任务 B upsert**(D-013)。当前是 `POST` + 事前 SOQL 查重,尚未切到
   `PATCH /sobjects/Lead/Plenti_Lead_ID__c/{token}`
 - **补充资料更新已有 Lead 的路径**。`kind==='supplement'` 目前只转 review
