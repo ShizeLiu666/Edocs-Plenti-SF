@@ -1098,10 +1098,95 @@ function testPlentiTestEntryPoint(){
 }
 
 // ============================================================
+// 20. R10 测试用发件人覆盖 —— ⚠️ Phase 4 后连同被测代码一起删除
+// ============================================================
+
+function testPlentiSenderOverride(){
+ plTestBaseline_();
+ // 测试入口照常受两道安全开关约束,用例里要显式打开(见 testPlentiTestEntryPoint)
+ plTestSetProps_({INTAKE_V2_ENABLED:'true',EDOCS_ADAPTATION_VALIDATED:'true'});
+ // 转发件的写照:有 browser-view 链接、命中白名单,但**两个身份头都没有**
+ var forwarded=plTestMessageFrom_({id:'r10-forwarded',
+  subject:'Fwd: Action required: New lead',date:'2026-09-09T04:00:00.000Z',
+  headers:{'To':'eDocs <edocs@example.org>'},
+  body:'---------- Forwarded message ----------\nView in Browser: https://e.customeriomail.com/deliveries/'+plTestBrowserToken_()+'\n'});
+ var box={};box['r10-forwarded']=forwarded;
+
+ // ---- 1. 未设置属性 → 覆盖不存在,行为与之前完全一致 ----
+ plAssertEq_(plTestSenderOverride_(),'','no property means no override');
+ plTestWithGmail_(box,function(){
+  plTestWithFakeApi_(function(calls){
+   var state=plTestFromMessageId('r10-forwarded');
+   plAssertEq_(state.state,'review','a forwarded message still fails identity without the override');
+   plAssert_(/Sender could not be determined/.test(state.reason),'and says exactly why');
+   plAssertEq_(plTestPosts_(calls).length,0,'nothing is written');
+  });
+ });
+
+ // ---- 2. ⚠️ 主流程绝不受影响(行为检查,与 offline.cjs 的静态检查互为双保险)----
+ plTestSetProps_({PLENTI_TEST_SENDER_OVERRIDE:'referrals@plenti.example'});
+ plTestClearState_();
+ plTestWithFakeApi_(function(calls){
+  // plProcess_ 是主流程的核心,直接喂给它同一封邮件
+  var state=plProcess_(forwarded,false);
+  plAssertEq_(state.state,'review','plProcess_ must not read the test override property');
+  plAssert_(/Sender could not be determined/.test(state.reason),'the main flow verdict is byte-identical with the override set');
+  plAssertEq_(plTestPosts_(calls).length,0,'the main flow still writes nothing');
+ });
+
+ // ---- 3. 通过测试入口 → 覆盖生效,整条链路跑通 ----
+ plTestClearState_();
+ plTestWithGmail_(box,function(){
+  plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+   plTestWithFakeApi_(function(calls){
+    ivQuery_=function(q){calls.push({kind:'query',query:q});
+     if(/WHERE Id='/.test(q))return [{Id:'00Qr10000000001AAA',Plenti_Lead_ID__c:plTestBrowserToken_()}];
+     return [];};
+    var state=plTestFromMessageId('r10-forwarded');
+    plAssertEq_(state.created,true,'the override lets the forwarded message through the identity gate');
+    var posts=plTestPosts_(calls);
+    plAssertEq_(posts.length,1,'exactly one Lead');
+    plAssertEq_(posts[0].data.LastName,'Fixture Example','customer data came from the browser view');
+    plAssertEq_(posts[0].data.Plenti_Lead_ID__c,plTestBrowserToken_(),'the real delivery token is used, not a synthetic one');
+   });
+  });
+ });
+
+ // ---- 4. 包装层只补缺失的头,不覆盖真实的认证结果 ----
+ var withRealAuth=plTestMessageFrom_({id:'r10-real-auth',subject:'s',headers:{
+  'X-Original-Sender':'someone@elsewhere.example',
+  'X-Original-Authentication-Results':'mx.example.org; dmarc=fail header.from=elsewhere.example'},body:'x'});
+ var wrapped=plTestOverrideMessage_(withRealAuth,'referrals@plenti.example');
+ plAssertEq_(wrapped.getHeader('X-Original-Sender'),'referrals@plenti.example','the sender is replaced');
+ plAssert_(/dmarc=fail/.test(wrapped.getHeader('X-Original-Authentication-Results')),'a real authentication result is passed through untouched, never overwritten');
+ var bare=plTestOverrideMessage_(forwarded,'referrals@plenti.example');
+ plAssert_(/dmarc=pass/.test(bare.getHeader('X-Original-Authentication-Results')),'a missing authentication result is synthesised so the rest of the pipeline can be tested');
+ plAssertEq_(bare.getHeader('To'),'eDocs <edocs@example.org>','all other headers delegate to the real message');
+ plAssertEq_(bare.getId(),forwarded.getId(),'identity and body delegate unchanged');
+ plAssertEq_(bare.getPlainBody(),forwarded.getPlainBody(),'body delegates unchanged');
+
+ // ---- 5. 配置错误要快速失败,并给出可操作的提示 ----
+ plTestSetProps_({PLENTI_TEST_SENDER_OVERRIDE:'not-an-address'});
+ plTestWithGmail_(box,function(){
+  plAssertThrows_(function(){plTestFromMessageId('r10-forwarded');},/must be an email address/,'a malformed override fails fast');
+ });
+ plTestSetProps_({PLENTI_TEST_SENDER_OVERRIDE:'jack@example.org'});
+ plTestWithGmail_(box,function(){
+  plAssertThrows_(function(){plTestFromMessageId('r10-forwarded');},/INTERNAL_DOMAIN/,'an internal-domain override would be silently classified internal, so it is refused up front');
+ });
+
+ plTestSetProps_({PLENTI_TEST_SENDER_OVERRIDE:null,INTAKE_V2_ENABLED:null,EDOCS_ADAPTATION_VALIDATED:null});
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 18 sender-override cases (main flow provably unaffected)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiSenderOverride();
  testPlentiTestEntryPoint();
  testPlentiBrowserView();
  testPlentiMessageBody();

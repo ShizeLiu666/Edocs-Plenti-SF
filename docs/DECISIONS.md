@@ -866,6 +866,88 @@ grep -rn "R9 临时\|R9 离线注入\|D-020\|plTestFromMessageId\|plTestFindMess
 
 ---
 
+## D-021 ⚠️ 测试用发件人覆盖 —— Phase 4 结束后必须删除
+
+**日期** 2026-09-09 · **决定人** Jack · **阶段** R10 · **状态:🔴 临时代码**
+
+### 为什么需要
+
+R9 跑通到了身份验证这一步就卡住:
+
+```
+[R9] browser-view link: https://e.customeriomail.com/deliveries/...   ← 转发件保住了链接
+[R9] allowlist matched: jack.liu@sunterra.com.au                       ← 白名单也过了
+[R9] reason: Sender could not be determined from X-Original-Sender     ← 卡在这
+```
+
+`X-Original-Sender` 只有 Google Groups 投递时才加,转发件没有。组还没建好,
+拿不到真正经过组投递的邮件,但**除身份验证外的所有环节今天都能验证完**。
+
+`PLENTI_FORCE_CREATE` 帮不上忙 —— 它按设计不绕过这道门(D-019 的
+"认不出来转人工没有松动")。Jack 认同这个设计,不改。
+
+### ⚠️ 它伪造的比"发件人"多
+
+Jack 的要求是"把它当作 X-Original-Sender 的替代"。**光这样不够**:
+`isPlentiSource_` 是四步串联的,转发件同样没有
+`X-Original-Authentication-Results`,只覆盖发件人会在第 3 步再卡一次。
+
+所以这层包装在**真实头缺失时**补一个 `dmarc=pass`;真实头存在时原样透传,
+**绝不覆盖真值**(有断言)。
+
+**结论:开着这个属性时,规格 §5.1 的可信验证整个是假的,不只是发件人那一步。**
+它只用来在组建好之前把后续环节跑通。**进组之后必须单独补测身份验证这一环** ——
+这是本项目安全性最关键的控制,不能因为测试通过就认为它验证过了。
+
+### 实现方式:包一层 message,不在主流程里加分支
+
+`plTestOverrideMessage_(message, sender)` 返回一个代理对象,只改
+`getHeader` 对两个身份头的响应,其余全部委托给真实邮件。
+
+**`plProcess_` 及其下游一个字节都没改** —— 它们只是收到一个 `getHeader`
+行为不同的对象。`src/Code.gs` 本轮零改动。
+
+### 主流程不受影响 —— 两道锁
+
+| 锁 | 内容 |
+|---|---|
+| **静态**(`test/offline.cjs`) | `PLENTI_TEST_SENDER_OVERRIDE` 在 `Code.gs` 中出现次数必须为 **0**;在 `Plenti.gs` 中只允许出现在 R10 块内;`plTestSenderOverride_` 只允许被定义一次、调用一次 |
+| **行为**(`PlentiTests.gs`) | 属性设上之后,直接对同一封转发件调 `plProcess_`,判定结果必须与未设置时**逐字相同**,且不写任何东西 |
+
+### 两处快速失败
+
+| 配置错误 | 行为 |
+|---|---|
+| 值不含 `@` | 抛错 `must be an email address` |
+| 值的域名 == `INTERNAL_DOMAIN` | 抛错并说明:该邮件会被判为 internal 静默跳过,应改用真实 Plenti 发件地址 |
+
+另有一条只提示不拦截:值不在 `PLENTI_TRUSTED_SENDERS` 里时打日志说明
+"验证仍会在第 2 步失败",避免又白跑一轮。
+
+### 配套:建完回读五个自定义字段
+
+`plTestVerifyLead_(recordId)` 在建 Lead 之后回读并打印
+`Plenti_Lead_ID__c` / `Plenti_Received_At__c` / `Plenti_Raw_Email__c` /
+`Plenti_Browser_View_HTML__c` / `Plenti_Parsed_JSON__c`,**只打长度不打内容**
+(其中两个是 40KB HTML)。字段不存在时捕获异常并提示,不中断。
+
+### 🔴 删除清单(与 D-017 / D-020 一起执行)
+
+```bash
+grep -rn "R10 临时\|D-021\|PLENTI_TEST_SENDER_OVERRIDE\|plTestSenderOverride_\|plTestOverrideMessage_\|plTestVerifyLead_" src/ test/
+```
+
+| 文件 | 删什么 |
+|---|---|
+| `src/Plenti.gs` | `plTestSenderOverride_` / `plTestOverrideMessage_` / `plTestVerifyLead_`;`plTestFromMessageId` 里的 override 块与回读调用 |
+| `src/PlentiTests.gs` | 整个 `testPlentiSenderOverride` 及入口调用 |
+| `test/offline.cjs` | R10 静态守卫那一段 |
+| Script Properties | 删掉 `PLENTI_TEST_SENDER_OVERRIDE` 键本身 |
+
+删完 `node test/offline.cjs` 应回到 36 项全绿。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -1073,6 +1155,7 @@ watermark 的校验保持原样。
 | `INTAKE_RECIPIENT_ALLOWLIST` | 收件人白名单(D-015)。格式同 `PLENTI_TRUSTED_SENDERS`:逗号分隔,`user@domain` 或 `@domain` | **抛错停止** |
 | `INTAKE_LOG_SHEET_ID` | 运行日志 Google Sheet 的 ID(D-016 汇总页 / D-018 Messages 页)。⚠️ **该表含 PII,分享设置必须限制为指定人员**;ID 不入仓库 | **跳过,不报错** |
 | `PLENTI_FORCE_CREATE` | 🔴 **临时**(D-017)。`'true'` 时绕过置信度判定直接建 Lead。**Phase 4 结束后连同代码一起删** | 视为 `false`,不报错 |
+| `PLENTI_TEST_SENDER_OVERRIDE` | 🔴 **临时**(D-021)。**只有 R9 测试入口读它,主流程读不到**(两道锁)。设为一个邮箱地址后,该入口会伪造 §5.1 的两个身份头 —— **伪造的是整条可信验证链,不只是发件人**。进组后必须单独补测身份验证。**Phase 4 结束后连同代码一起删** | 视为未设置,不报错 |
 
 ### 运行时写入(不要手工设置,不要清空)
 

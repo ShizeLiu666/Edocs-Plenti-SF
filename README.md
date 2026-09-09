@@ -42,9 +42,14 @@ Salesforce 沙箱配置手册见 [docs/SANDBOX_SETUP.md](docs/SANDBOX_SETUP.md)(
 
 **尚未完成**:
 
-- **组投递识别尚未验证**。eDocs 组还没建好,`list:<组地址>` 那一环没有真实
-  样本可测。其余环节靠 `plTestFromMessageId` 这个**临时**测试入口验证
-  (D-020,Phase 4 后删除)。
+- **组投递识别与发件人可信验证尚未验证**。eDocs 组还没建好,拿不到经过组投递
+  的邮件:`list:<组地址>` 查询、`X-Original-Sender` 与
+  `X-Original-Authentication-Results` 这三样都没有真实样本可测。
+  其余环节靠 `plTestFromMessageId` 这个**临时**测试入口验证(D-020),
+  配合 `PLENTI_TEST_SENDER_OVERRIDE` 伪造身份头(D-021)。
+  ⚠️ **开着那个属性时规格 §5.1 的可信验证整个是假的** —— 它是本项目安全性
+  最关键的控制,进组之后必须单独补测,不能因为测试通过就认为它验证过了。
+  两者都在 Phase 4 后删除。
 - **任务 B upsert**(D-013)。当前是 `POST` + 事前 SOQL 查重,尚未切到
   `PATCH /sobjects/Lead/Plenti_Lead_ID__c/{token}`
 - **补充资料更新已有 Lead 的路径**。`kind==='supplement'` 目前只转 review

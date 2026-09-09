@@ -825,8 +825,73 @@ function plRefreshReview_(message){
 }
 
 // ============================================================
-// R9 离线注入测试入口 —— ⚠️ Phase 4 结束后必须整节删除(与 R3 一起)
+// R9 离线注入测试入口 + R10 发件人覆盖 —— ⚠️ Phase 4 后整节删除(与 R3 一起)
 // ============================================================
+
+/**
+ * ⚠️⚠️ [R10 临时] 测试用发件人覆盖。DECISIONS D-021,与 R3 / R9 一起删。
+ *
+ * **只有 plTestFromMessageId 读这个属性。主流程 runIntakeV2 / plProcess_
+ * 完全不读**,由两道断言锁住:一道静态检查(Code.gs 里不得出现这个属性名),
+ * 一道行为检查(属性设上之后 plProcess_ 的判定结果一个字都不变)。
+ *
+ * 实现方式是**包一层 message**,而不是在主流程里加分支 —— plProcess_ 及其
+ * 下游一个字节都没改,它们只是收到一个 getHeader 行为不同的对象。
+ */
+function plTestSenderOverride_(){
+ return String(PropertiesService.getScriptProperties().getProperty('PLENTI_TEST_SENDER_OVERRIDE')||'').trim().toLowerCase();
+}
+
+/**
+ * ⚠️⚠️ [R10 临时] 把邮件包一层,伪造 §5.1 需要的两个头。
+ *
+ * **这不只是覆盖发件人,它伪造了整条发件人可信验证链。** 光给
+ * X-Original-Sender 不够:转发件同样没有 X-Original-Authentication-Results,
+ * isPlentiSource_ 会卡在第 3 步。所以这里在**真实头缺失时**补一个
+ * dmarc=pass —— 真实头存在时原样透传,不覆盖真值。
+ *
+ * 换句话说:开着这个属性时,规格 §5.1 的可信验证**整个是假的**。
+ * 它只用来在组建好之前把后续环节跑通,进组之后必须单独补测这一环。
+ * 属性没设时这层包装根本不存在,主流程行为与之前完全一致。
+ */
+function plTestOverrideMessage_(message,sender){
+ var domain=plDomain_(sender);
+ return {
+  getId:function(){return message.getId();},
+  getSubject:function(){return message.getSubject();},
+  getFrom:function(){return message.getFrom();},
+  getDate:function(){return message.getDate();},
+  getPlainBody:function(){return message.getPlainBody();},
+  getBody:function(){return message.getBody();},
+  getRawContent:function(){return message.getRawContent();},
+  getThread:function(){return message.getThread();},
+  getHeader:function(name){
+   var key=String(name||'');
+   if(key==='X-Original-Sender')return sender;
+   if(key==='X-Original-Authentication-Results'){
+    var real=String(message.getHeader(key)||'');
+    return real||('test-override; dmarc=pass header.from='+domain);
+   }
+   return message.getHeader(key);
+  }
+ };
+}
+
+/** ⚠️ [R10 临时] 建完之后回读五个自定义字段,只打长度不打内容(其中两个是 40KB HTML)。 */
+function plTestVerifyLead_(recordId){
+ var fields=['Plenti_Lead_ID__c','Plenti_Received_At__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c'];
+ try{
+  var row=ivQuery_("SELECT "+fields.join(',')+" FROM Lead WHERE Id='"+ivQuote_(recordId)+"'")[0];
+  if(!row){console.log('[R10] verify: Lead '+recordId+' could not be read back');return;}
+  var i,v;
+  for(i=0;i<fields.length;i++){
+   v=row[fields[i]];
+   console.log('[R10] verify '+fields[i]+': '+(v===null||v===undefined||v===''?'(EMPTY)':(String(v).length>120?String(v).length+' chars':String(v))));
+  }
+ }catch(e){
+  console.log('[R10] verify failed (field may not exist in this org): '+String(e.message||e).slice(0,300));
+ }
+}
 
 /**
  * ⚠️⚠️ 临时代码,DECISIONS D-020。Phase 4 验收结束后**整节删掉**,
@@ -866,6 +931,17 @@ function plTestFromMessageId(messageId,force){
   console.log('[R9] ⚠️ TEST ENTRY POINT — bypassing the list: query and watermark. Main-flow query is unchanged.');
   console.log('[R9] message '+id+' | '+message.getDate().toISOString()+' | '+message.getSubject());
 
+  // ⚠️⚠️ [R10 临时] 发件人覆盖。只在这个入口里生效。
+  var override=plTestSenderOverride_();
+  if(override){
+   if(override.indexOf('@')<0)throw new Error('PLENTI_TEST_SENDER_OVERRIDE must be an email address, got: '+override);
+   if(plDomain_(override)===ivInternalDomain_())throw new Error('PLENTI_TEST_SENDER_OVERRIDE is set to an address on INTERNAL_DOMAIN ('+ivInternalDomain_()+'). The message would be classified internal and skipped. Use the real Plenti sender address instead.');
+   console.log('[R10] ⚠️⚠️ 发件人被测试覆盖为 '+override+' — 原 X-Original-Sender: '+(plHeader_(message,'X-Original-Sender')||'(absent)'));
+   console.log('[R10] ⚠️⚠️ This FAKES THE WHOLE OF §5.1 sender verification, not just the sender. X-Original-Authentication-Results is synthesised when absent. Sender trust must still be tested separately once the group exists.');
+   if(!plSenderTrusted_(override,plTrustedSenders_()))console.log('[R10] ⚠️ heads-up: '+override+' is NOT in PLENTI_TRUSTED_SENDERS — verification will still fail at step 2.');
+   message=plTestOverrideMessage_(message,override);
+  }
+
   var recipient=plMatchedRecipient_(message,plRecipientAllowlist_());
   if(!recipient){
    console.log('[R9] STOP: no recipient matched INTAKE_RECIPIENT_ALLOWLIST. Checked headers: '+PLENTI_RECIPIENT_HEADERS.join(', '));
@@ -895,6 +971,8 @@ function plTestFromMessageId(messageId,force){
    forced:plForceCreate_()};
   ivLogRun_(began,stats);
   ivLogMessages_([ivMessageLogRow_(message,recipient,state,detail)]);
+  // ⚠️ [R10 临时] 回读五个自定义字段,方便肉眼核对写入结果。
+  if(state.record)plTestVerifyLead_(state.record);
   return state;
  }finally{lock.releaseLock();}
 }

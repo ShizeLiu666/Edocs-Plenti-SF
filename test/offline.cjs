@@ -61,6 +61,22 @@ for (const file of ['Code.gs', 'Plenti.gs']) {
 }
 console.log(`PASS: static guard — ${legacyNames.length} Legacy functions, zero references from Code.gs/Plenti.gs`);
 
+// [R10] 测试用发件人覆盖属性:主流程绝不能读它。
+// 这道检查连同下面 PlentiTests 里的行为检查一起,构成"主流程不受影响"的双保险。
+{
+  const prop = 'PLENTI_TEST_SENDER_OVERRIDE';
+  const codeHits = (stripComments(read(SRC, 'Code.gs')).match(new RegExp(prop, 'g')) || []).length;
+  assert.equal(codeHits, 0,
+    `${prop} must never appear in Code.gs — runIntakeV2 must not be able to read a test-only override`);
+  const plenti = stripComments(read(SRC, 'Plenti.gs'));
+  assert.equal((plenti.match(new RegExp(prop, 'g')) || []).length, 3,
+    `${prop} is expected only inside the R10 temporary block (one getProperty plus two guard messages)`);
+  // 读取器只能被测试入口调用,不能渗进主流程
+  const readers = (plenti.match(/plTestSenderOverride_/g) || []).length;
+  assert.equal(readers, 2, 'plTestSenderOverride_ must be defined once and called exactly once (from the test entry point)');
+  console.log('PASS: R10 sender override is confined to the test entry point');
+}
+
 // ──────────────────────────────────────────────────────────────
 // 2. Legacy.gs 必须是 handoff 模板的原文,一个字都没改
 // ──────────────────────────────────────────────────────────────
