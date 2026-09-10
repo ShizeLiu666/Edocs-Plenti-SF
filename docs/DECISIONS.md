@@ -1493,6 +1493,124 @@ reason 里也明写了 From can be forged, so this wording is a hint, not a verd
 
 ---
 
+## D-028 `status=0` 不是超时;以及降级 Lead 永不重试这个缺口
+
+**日期** 2026-09-10 · **阶段** R16
+
+### ① `status=0` 的真相:那一轮**根本没跑**
+
+现象:同一封邮件连跑两次,不带 force 时 `ok=false status=0`,带 force 时
+`ok=true status=200`。agent 猜是 customer.io 偶发超时。
+
+**不是超时。** `plProcess_` 开头就短路了:
+
+```javascript
+if(prior&&!force&&prior.state!=='error')return prior;
+```
+
+短路时 `detail` 出参从未被填,R9 的诊断行读的是
+`(detail.parsed&&detail.parsed.browserView)||{}` —— 一个空对象。
+于是 `ok` 是 `undefined`→打成 false,`view.status||0`→打成 0,
+`view.found` 不存在→打成 `(none)`。
+
+**"字段值仍然正确写入"也解释得通**:那些值是**上一轮**写的。
+`plTestVerifyLead_` 回读的是 Salesforce 里既有的 Lead,和这一轮做没做事无关。
+
+#### 三种情况的判别式(已在模拟中逐一复现)
+
+| 情况 | 日志特征 |
+|---|---|
+| 抓取成功 | `ok=true status=200 degraded=false fields=name,address,systems` |
+| **短路(没跑)** | `degraded=false` **且没有 `error=`** |
+| **真正的网络失败** | `degraded=true` **且带 `error=connection timed out`** |
+
+**关键判别位是 `degraded` 和有没有 `error=`,不是 `status`。**
+真失败一定会把 `degraded` 置为 true 并记下原因;短路两者都没有。
+
+#### 诊断已修正
+
+R9 的输出以前把两者印成同一行,把人引向了错误结论。现在短路时明说:
+
+```
+[R9] ⏭️ NOT RE-PROCESSED — this message already has a stored state,
+     so plProcess_ returned it unchanged.
+[R9] ⏭️ Nothing was parsed and no page was fetched this run.
+     The values below come from the earlier run. Pass force=true to actually re-run.
+```
+
+**顺带修掉一个记账错误**:`createdNow` 是**持久化**在状态里的,短路后照样读得到。
+R9 入口原先直接拿它算 `stats.created` 写进 Sheet —— 同一条 Lead 会被重复记进
+月度对账(和 D-026 拆分 `created`/`createdNow` 是同一类坑)。现在短路时
+`processed` 和 `created` 都记 0,有断言。
+
+`runIntakeV2` 的主循环**没有**这个问题:它的 `if(!old||old.state==='error')`
+守卫让短路的消息根本到不了计数那一步。
+
+### ② 生产上的偶发抓取失败:Lead 照建,但**永远不会补齐**
+
+**建 Lead 有保证。** delivery token 取自 URL 本身、不依赖抓取结果,所以
+`kind='referral'` 和 `referralId` 在抓取失败时仍然成立,判定门照过
+(D-019 的"身份与数据分开对待")。已有断言:
+
+> `a failed fetch must NOT stop the Lead from being created — the SLA clock is running`
+
+模拟里也验证过:注入 `connection timed out`,Lead 照样建出来,
+Description 带 `[BROWSER VIEW UNAVAILABLE]`。**网络抖动不会漏单。**
+
+#### ⚠️ 但有一个缺口:降级的 Lead 不会被自动补齐
+
+抓取失败建出的 Lead 没有客户姓名(用 `Plenti referral <token>` 兜底)、
+没有地址、没有 systems。而**下一轮扫描不会再试**:
+
+- `plProcess_` 见 `prior.state==='review'` 就短路
+- `ivRefreshOutstanding_` 确实每轮都会访问这条状态,但只调 `plRefreshReview_`,
+  而它只查联系方式,不重新抓取
+
+**结果:一次一秒钟的网络抖动 = 这条 Lead 永久缺姓名和地址**,除非有人手动
+force 重跑。页面一分钟后就恢复可用了,我们却不会再去看一眼。
+
+#### 影响评估
+
+按 D-024,每条 Plenti 线索本来就必须有人去 Portal 取联系方式,那时姓名也能
+一并看到 —— 所以**不影响 SLA,不漏单**,是数据质量问题。
+
+但 `Plenti_Browser_View_HTML__c` 会是空的,那是**审计留底**(D-014);
+`Plenti_Systems__c` 也会缺,而它是 Schedule 3 季度报告可能要按之切分的字段。
+
+#### 建议的修法(未实施,等 Jack 决定)
+
+钩子是现成的:`ivRefreshOutstanding_` 每轮已经在访问这些状态了。
+让 `plRefreshReview_` 在发现 `state.browserView.degraded===true` 时重试一次
+抓取,成功就补写字段并清掉降级标记。
+
+成本:每轮对降级状态多一次 fetch(数量应该很少)。
+需要加退避,避免页面永久失效(链接过期)时每轮都白抓 —— 例如记重试次数,
+超过若干次就停并把 reason 改成"需要人工打开链接"。
+
+### ③ `src/script.gs` 纳入仓库
+
+`describeIt()` / `runIt()` 两个无参包装函数。Apps Script 编辑器的 Run 下拉框
+只列**无参数**的顶层函数,`plTestFromMessageId` 需要一个消息 ID,直接点不了。
+
+以前它只存在于线上、不在仓库里,所以每次 `clasp push` 都被覆盖掉,
+agent 重建了三次。纳入 `src/` 之后 push 会带上它。
+
+⚠️ 里面写死了一个测试邮件的 Gmail 消息 ID —— 这是临时测试脚手架,不是主流程
+配置;主流程的环境值仍然一律走 Script Properties。
+
+离线测试现在也加载 `script.gs` 并纳入静态守卫与 ES5 检查,
+**语法错误会在推上去之前就被抓到**。
+
+### 🔴 删除清单补充(与 D-017 / D-020 / D-021 一起执行)
+
+| 文件 | 删什么 |
+|---|---|
+| **`src/script.gs`** | **整个文件删除** |
+| `test/offline.cjs` | 加载列表、静态守卫文件列表里的 `'script.gs'` |
+| `src/PlentiTests.gs` | `testPlentiTestEntryPoint` 里"不带 force 重跑"那一段 |
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,

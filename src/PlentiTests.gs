@@ -1149,6 +1149,23 @@ function testPlentiTestEntryPoint(){
   });
  });
 
+ // ---- 4b. 不带 force 重跑 → 短路,本轮什么都没做,不能重复记账 ----
+ //      以前这里会把上一轮持久化的 createdNow 再记一次进 Sheet,月度对账会多算。
+ plTestWithGmail_(inbox,function(){
+  plTestWithFetch_(function(){throw new Error('must not fetch when short-circuiting');},function(fetched){
+   plTestWithSheet_(function(sheets){
+    plTestWithFakeApi_(function(calls){
+     var again=plTestFromMessageId(id);
+     plAssertEq_(again.record,'00Qr9000000001AAA','the stored state is returned unchanged');
+     plAssertEq_(fetched.length,0,'a short-circuited run must not fetch the browser view');
+     plAssertEq_(plTestPosts_(calls).length,0,'and must not write to Salesforce');
+     plAssertEq_(sheets.summary[1][2],0,'processed is logged as 0 — nothing was processed this run');
+     plAssertEq_(sheets.summary[1][3],0,'and created as 0, even though the stored state still carries createdNow');
+    });
+   });
+  });
+ });
+
  // ---- 5. 幂等:重跑不会建第二个 Lead ----
  plTestWithGmail_(inbox,function(){
   plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){

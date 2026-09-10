@@ -55,11 +55,11 @@ assert.deepEqual(
 
 const legacyNames = definedFunctions(read(SRC, 'Legacy.gs'));
 assert.ok(legacyNames.length > 0, 'Legacy.gs must define functions, otherwise the guard is vacuous');
-for (const file of ['Code.gs', 'Plenti.gs']) {
+for (const file of ['Code.gs', 'Plenti.gs', 'script.gs']) {
   const hits = findReferences(legacyNames, read(SRC, file));
   assert.deepEqual(hits, [], `${file} must not reference Legacy.gs functions: ${hits.join(', ')}`);
 }
-console.log(`PASS: static guard — ${legacyNames.length} Legacy functions, zero references from Code.gs/Plenti.gs`);
+console.log(`PASS: static guard — ${legacyNames.length} Legacy functions, zero references from Code.gs/Plenti.gs/script.gs`);
 
 // [R10] 测试用发件人覆盖属性:主流程绝不能读它。
 // 这道检查连同下面 PlentiTests 里的行为检查一起,构成"主流程不受影响"的双保险。
@@ -150,7 +150,7 @@ const context = vm.createContext({
 });
 
 // Legacy.gs 在 Code.gs 之后加载:主流程不依赖它,顺序只影响可读性。
-for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTests.gs']) {
+for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTests.gs', 'script.gs']) {
   new vm.Script(read(SRC, file), { filename: `src/${file}` }).runInContext(context);
 }
 

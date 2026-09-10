@@ -1234,15 +1234,28 @@ function plTestFromMessageId(messageId,force){
   if(!url)console.log('[R9] No link means no stable identifier, so no Lead will be created (by design, D-019). To exercise the degraded-create path anyway, set PLENTI_FORCE_CREATE=true.');
 
   var detail={},state=plProcess_(message,force===true,detail);
-  var view=(detail.parsed&&detail.parsed.browserView)||{};
-  console.log('[R9] result: state='+state.state+' kind='+state.kind+' createdNow='+(state.createdNow===true)+' createdByThisMessage='+(state.created===true)+' record='+(state.record||'(none)'));
-  console.log('[R9] browser view: ok='+(view.ok===true)+' status='+(view.status||0)+' degraded='+(view.degraded===true)+' fields='+((view.found||[]).join(',')||'(none)')+(view.error?' error='+view.error:''));
+  // [R9] detail 为空 ⇒ plProcess_ 在开头就短路了(已处理过且不是 error 状态),
+  // 这一轮**根本没跑解析、也没发起抓取**。以前这里会打成 "ok=false status=0",
+  // 看起来像抓取失败 —— 那是误导,D-028。
+  var reprocessed=!!detail.parsed;
+  console.log('[R9] result: state='+state.state+' kind='+state.kind+' record='+(state.record||'(none)'));
+  if(!reprocessed){
+   console.log('[R9] ⏭️ NOT RE-PROCESSED — this message already has a stored state, so plProcess_ returned it unchanged.');
+   console.log('[R9] ⏭️ Nothing was parsed and no page was fetched this run. The values below come from the earlier run. Pass force=true to actually re-run.');
+  }else{
+   var view=detail.parsed.browserView||{};
+   console.log('[R9] createdNow='+(state.createdNow===true)+' createdByThisMessage='+(state.created===true));
+   console.log('[R9] browser view: ok='+(view.ok===true)+' status='+(view.status||0)+' degraded='+(view.degraded===true)+' fields='+((view.found||[]).join(',')||'(none)')+(view.error?' error='+view.error:''));
+  }
   console.log('[R9] reason: '+state.reason);
 
   try{ivSyncLabels_(message.getThread());}catch(e){console.log('[R9] label sync failed (not fatal): '+String(e.message||e).slice(0,200));}
 
-  var stats={threads:1,skipped:0,processed:1,
-   created:(state.createdNow&&state.record)?1:0,
+  // [R9] 短路时本轮什么都没做:processed 记 0,created 记 0。
+  // createdNow 是**持久化**在状态里的,短路后照样读得到 —— 直接拿它计数会让
+  // 同一条 Lead 被重复记进月度对账(D-026 拆分 created/createdNow 的同一类坑)。
+  var stats={threads:1,skipped:0,processed:reprocessed?1:0,
+   created:(reprocessed&&state.createdNow&&state.record)?1:0,
    failed:state.state==='error'?1:0,
    errors:state.state==='error'?[id+': '+String(state.reason||'').slice(0,200)]:[],
    forced:plForceCreate_()};

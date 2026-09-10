@@ -275,6 +275,9 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **跨邮箱去重在 Plenti 路径上实际失效**(Q15)。规格 §5.5 那一层靠客户邮箱
   查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能
   自动拦截,只能靠人工审核兜住。
+- **抓取失败建出的降级 Lead 不会被自动补齐**(D-028)。一次网络抖动就会让这条
+  Lead 永久缺姓名、地址、systems 和审计留底 HTML —— 下一轮扫描不会重试,
+  除非有人手动 force 重跑。**不影响 SLA、不漏单**(Lead 照建),是数据质量问题。
 - **browser view 链接可能有有效期。** 抓取时间戳记在 `Plenti_Parsed_JSON__c`
   的 `browserView.fetchedAt`;抓取失败时 Lead 照建并标记 `[DEGRADED]`,
   人工可以自己点邮件里的链接查看。
