@@ -246,7 +246,9 @@ function runIntakeV2(){
   if(!old||old.state==='error'){
    var detail={},result=plProcess_(msgs[j],false,detail);count++;stats.processed++;
    messageRows.push(ivMessageLogRow_(msgs[j],recipient,result,detail));
-   if(result&&result.created&&result.record)stats.created++;
+   // [R14] 用 createdNow 而不是 created —— created 现在是持久语义(这封邮件建过),
+   // 用它计数会让 error 重试把同一条 Lead 重复算进月度对账。
+   if(result&&result.createdNow&&result.record)stats.created++;
    // 摘要带上消息 ID:L-01 触发后要删的键是 IV2_CREATE_<消息 ID>,
    // Sheet 是长期留底,不带 ID 的话事后无从下手(console.log 保留期短)。
    if(result&&result.state==='error'){stats.failed++;if(stats.errors.length<5)stats.errors.push(msgs[j].getId()+': '+String(result.reason||'').slice(0,200));}

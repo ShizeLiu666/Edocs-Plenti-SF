@@ -1327,6 +1327,93 @@ Lightning 里是复合字段,布局怎么摆、子字段怎么渲染,和记录�
 
 ---
 
+## D-026 `created` 是持久语义;Lead_ID 字段属性由 describe 说了算
+
+**日期** 2026-09-10 · **决定人** Jack · **阶段** R14,已实现
+
+### ① SF-Lead-Created 会被摘掉 —— 是我引入的回退,不是设计
+
+**Jack 的推断基本正确,有一处要修正。**
+
+`ivSyncLabels_` 每轮按持久状态重算三个标签,`false` 意味着**主动删除**
+(`ivLabel_` 的 `add=false` 走 `removeLabel`)。所以 `created` 一旦丢,
+标签就被摘。
+
+但**普通轮询不会重算** —— `plProcess_` 开头 `if(prior&&!force&&prior.state!=='error')return prior;`
+直接短路。只有两种情况会:**`force=true` 重跑**(即 `plTestFromMessageId(id,true)`)
+和 **error 状态重试**。恰好都是测试与故障恢复时最常走的路径。
+
+复现:
+
+```
+第 1 轮(新建)      created=true       → add SF-Lead-Created
+第 2 轮(force 重跑) created=undefined  → remove SF-Lead-Created   ← 摘掉了
+```
+
+**根因**:模板的 `ivResolve_`(Legacy.gs:81)在按 marker 认出"这封邮件就是这条
+Lead 的来源"时会**重新断言 `created:true`**,正是为了让标签跨重跑稳定。
+我移植时把这个机制丢了。
+
+### ⚠️ 但"只给 marker 分支加"是个空操作
+
+Jack 选的方案是"只给 marker 匹配加 `created:true`,token 匹配不加"。
+**照字面做等于什么都没做** —— 那条分支在 Plenti 路径上不可达:
+
+1. token 查询在它**之前**就返回了
+2. 它本身还被 `if(parsed.customer.email)` 挡着,而 **Plenti 从不提供客户邮箱**
+
+**真正的判据不是"走了哪条分支",而是"命中的 Lead 的 Description 里有没有本邮件
+的 marker"。** 这恰好精确实现了 Jack 想要的区分:
+
+| token 命中的情形 | Description 带本邮件 marker | `created` |
+|---|---|---|
+| 同一封邮件重跑 | ✅ | `true` —— 这封邮件建的,标签保住 |
+| 同一转介重发成新邮件 | ❌ | `false` —— 那封确实没建过,只亮 Review 让人看是不是重复 |
+
+Jack 的工作流理由原样成立,只是实现位置换了。
+
+### `created` 与 `createdNow` 必须分开
+
+`created` 变成持久语义之后,不能再拿它计数:
+
+| 字段 | 含义 | 用途 |
+|---|---|---|
+| `created` | **这封邮件建过这条 Lead**(持久) | `SF-Lead-Created` 标签 |
+| `createdNow` | **本轮真的发了 POST** | 运行日志计数、reason 文案 |
+
+混用会让 **error 重试把同一条 Lead 重复算进月度对账**。
+`runIntakeV2` 的 `stats.created` 和 R9 入口的统计都已切到 `createdNow`
+(Code.gs 本轮只改了这一处)。
+
+### ② `Plenti_Lead_ID__c` 的三个属性由 describe 报出
+
+agent 建字段的报告写的是 `Text(255) (External ID) (Unique Case Sensitive)`,
+但那是人肉核对的。`plTestDescribeLead()` 现在直接报:
+
+```
+[R11] Plenti_Lead_ID__c: type=string(255) unique=true caseSensitive=true externalId=true
+```
+
+三条按情况告警:
+
+| 情况 | 告警 |
+|---|---|
+| `unique=false` | ⚠️⚠️ **规格 §5.4 第三层去重失去数据库兜底。** 查询与创建之间存在竞态窗口,而跨项目又无法原子去重(§5.5) |
+| `unique` 但 `caseSensitive=false` | ⚠️ delivery token 是 base64,**只差大小写的两个 token 会被当成同一个**,第二条转介被静默跳过 |
+| `externalId=false` | ⓘ 任务 B 的 upsert 无法使用 |
+
+为此 `plLeadFieldMap_` 的缓存从"字段名 → 是否可写"的布尔表改成存完整属性对象
+(`createable` / `unique` / `caseSensitive` / `externalId` / `type` / `length`)。
+运行期的存在性判断仍然只看 `createable`,行为不变,有断言。
+
+### L-01 自动放行:上线前不改,Phase 4 一起做
+
+Jack 认同四个限定条件,并特别认同第 ① 条 —— 锁里存了 `{state, id}`,
+现在代码只看键存不存在。`state==='created'` 时应该**用记录下的 id 去取 Lead**,
+而不是重建。留到 Phase 4 清理临时开关时一起做。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,

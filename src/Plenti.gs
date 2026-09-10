@@ -706,13 +706,26 @@ function plResolve_(message,parsed,forced){
  // ⚠️ [R3 临时] 强制模式跳过,因为它的 token 是合成的 FORCED-<msgId>,
  // 查 Salesforce 没有意义。D-017,Phase 4 后删。
  var byReferral=forced?null:plFindReferral_(parsed.referralId);
- if(byReferral)return {lead:byReferral};
+ // [R14] created 表示"**这封邮件**建了这条 Lead",是持久语义,不是"这一轮建了"。
+ // SF-Lead-Created 标签靠它,而 ivSyncLabels_ 每轮按持久状态重算 —— 标志丢了
+ // 标签就会被主动摘掉(ivLabel_ 的 add=false 走 removeLabel)。
+ //
+ // ⚠️ 判据是 **Description 里有没有本邮件的 marker**,不是"走了哪条分支"。
+ // 模板在 marker 分支上重新断言 created:true(Legacy.gs:81),但那条分支在
+ // Plenti 路径上**不可达**:token 查询在它之前返回,而它本身还被
+ // `if(parsed.customer.email)` 挡着,Plenti 从不提供客户邮箱。
+ //
+ // token 命中分两种,必须分开:
+ //   同一封邮件重跑     → 命中的 Lead 的 Description 带本邮件 marker → created
+ //   同一转介重发的新邮件 → 不带 → 保持 false,只亮 Review,让人看一眼是不是重复
+ if(byReferral)return {lead:byReferral,created:String(byReferral.Description||'').indexOf(marker)>=0};
  // 第 1 层 邮件级:Description 里的 [Intake: msgId] 标记。token 查询已经覆盖
  // 绝大多数情况,这一层是 Plenti_Lead_ID__c 尚未建好时的退路(D-013)。
  if(parsed.customer.email){
   var leads=ivQuery_("SELECT "+ivLeadFields_()+" FROM Lead WHERE Email='"+ivQuote_(String(parsed.customer.email).toLowerCase())+"'");
   var sourced=leads.filter(function(l){return String(l.Description||'').indexOf(marker)>=0;});
-  if(sourced.length===1)return {lead:sourced[0]};
+  // 同上:marker 命中就说明这封邮件是这条 Lead 的来源(模板 Legacy.gs:81 同款)
+  if(sourced.length===1)return {lead:sourced[0],created:true};
   if(sourced.length>1)return {review:'Multiple Leads carry this message marker; manual review required'};
   // 第 3 层 跨邮箱缓解(规格 §5.5):仅在有客户邮箱时可用。Plenti 路径通常没有,
   // 这是一处**已知的能力退化**,记在 DECISIONS D-019。
@@ -771,8 +784,13 @@ function plLeadFieldMap_(){
  if(plLeadFieldMap_.cache)return plLeadFieldMap_.cache;
  var map={};
  try{
-  var data=ivReq_('sobjects/Lead/describe'),list=(data&&data.fields)||[],i;
-  for(i=0;i<list.length;i++)map[list[i].name]=list[i].createable===true;
+  var data=ivReq_('sobjects/Lead/describe'),list=(data&&data.fields)||[],i,f;
+  for(i=0;i<list.length;i++){
+   f=list[i];
+   map[f.name]={createable:f.createable===true,unique:f.unique===true,
+    caseSensitive:f.caseSensitive===true,externalId:f.externalId===true,
+    type:f.type||'',length:f.length||0};
+  }
  }catch(e){
   console.log('Lead describe failed; optional fields are skipped for this run: '+String(e.message||e).slice(0,200));
  }
@@ -780,7 +798,7 @@ function plLeadFieldMap_(){
  return map;
 }
 
-function plLeadFieldExists_(name){return plLeadFieldMap_()[name]===true;}
+function plLeadFieldExists_(name){var f=plLeadFieldMap_()[name];return !!f&&f.createable===true;}
 
 var PLENTI_LONG_TEXT_LIMIT=131072;
 var PLENTI_JSON_LIMIT=32768;
@@ -997,7 +1015,7 @@ function plTestDescribeLead(){
    if(u.optional)optionalMissing.push(u.name);else missing.push(u.name+' ['+u.usage+']');
    continue;
   }
-  if(u.usage.indexOf('write')>=0&&have[u.name]!==true)notCreateable.push(u.name);
+  if(u.usage.indexOf('write')>=0&&have[u.name].createable!==true)notCreateable.push(u.name);
  }
  console.log('[R11] Lead exposes '+names.length+' fields in this org; the code uses '+used.length+'.');
  if(missing.length){
@@ -1015,6 +1033,20 @@ function plTestDescribeLead(){
  console.log('[R11] Plenti_Received_At__c: '+(Object.prototype.hasOwnProperty.call(have,'Plenti_Received_At__c')
   ? 'PRESENT — PLT001 timestamp is written from the message date (spec 5.3)'
   : 'ABSENT — skipped at runtime; PLT001 cannot be measured from a dedicated field until it is created (spec 5.3)'));
+
+ // [R14] Plenti_Lead_ID__c 的三个属性 —— 人肉核对不算数,让 describe 说话。
+ // Unique 是规格 §5.4 第三层去重的**数据库层兜底**:查询与创建之间存在竞态
+ // 窗口,跨项目又无法原子去重(§5.5),没有这条约束这一层就只剩"先查再建"。
+ var key=have.Plenti_Lead_ID__c;
+ if(!key){
+  console.log('[R11] ❌ Plenti_Lead_ID__c is ABSENT — business-level deduplication cannot work at all (spec 5.4)');
+ }else{
+  console.log('[R11] Plenti_Lead_ID__c: type='+key.type+'('+key.length+') unique='+key.unique+
+              ' caseSensitive='+key.caseSensitive+' externalId='+key.externalId);
+  if(!key.unique)console.log('[R11] ⚠️⚠️ Plenti_Lead_ID__c is NOT unique — spec 5.4 layer 3 has no database backstop. The query-then-create window can produce duplicate Leads, and cross-project deduplication is impossible anyway (spec 5.5).');
+  if(key.unique&&!key.caseSensitive)console.log('[R11] ⚠️ unique but NOT case sensitive — delivery tokens are base64, so two distinct tokens differing only in case would collide and the second referral would be silently skipped.');
+  if(!key.externalId)console.log('[R11] ⓘ not an External ID — upsert by external id (task B) is unavailable until it is.');
+ }
 
  return {missing:missing,optionalMissing:optionalMissing,notCreateable:notCreateable,used:used.length,available:names.length};
 }
@@ -1159,14 +1191,14 @@ function plTestFromMessageId(messageId,force){
 
   var detail={},state=plProcess_(message,force===true,detail);
   var view=(detail.parsed&&detail.parsed.browserView)||{};
-  console.log('[R9] result: state='+state.state+' kind='+state.kind+' created='+(state.created===true)+' record='+(state.record||'(none)'));
+  console.log('[R9] result: state='+state.state+' kind='+state.kind+' createdNow='+(state.createdNow===true)+' createdByThisMessage='+(state.created===true)+' record='+(state.record||'(none)'));
   console.log('[R9] browser view: ok='+(view.ok===true)+' status='+(view.status||0)+' degraded='+(view.degraded===true)+' fields='+((view.found||[]).join(',')||'(none)')+(view.error?' error='+view.error:''));
   console.log('[R9] reason: '+state.reason);
 
   try{ivSyncLabels_(message.getThread());}catch(e){console.log('[R9] label sync failed (not fatal): '+String(e.message||e).slice(0,200));}
 
   var stats={threads:1,skipped:0,processed:1,
-   created:(state.created&&state.record)?1:0,
+   created:(state.createdNow&&state.record)?1:0,
    failed:state.state==='error'?1:0,
    errors:state.state==='error'?[id+': '+String(state.reason||'').slice(0,200)]:[],
    forced:plForceCreate_()};
@@ -1313,13 +1345,17 @@ function plProcess_(message,force,detail){
   if(!lead){
    ivSave_(id,{state:'error',reason:'Lead creation in progress',date:state.date,leadCandidate:true});
    lead=plCreateLead_(message,parsed,enrichment);
-   state.created=true;
+   resolved.created=true;
+   // [R14] createdNow 只表示"**本轮**真的发了 POST",给运行日志的计数和
+   // reason 文案用。和持久的 created 分开 —— 混用会让月度对账多算 Lead。
+   state.createdNow=true;
   }
   state.record=lead.Id;
+  state.created=resolved.created===true;
   state.attached=ivAttachSource_(message,{id:lead.Id});
   state.state='review';
   state.leadCandidate=true;
-  state.reason=(forced?'[FORCED] ':'')+(parsed.confidence!=='high'?'[DEGRADED] ':'')+(state.created?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by delivery token or message marker');
+  state.reason=(forced?'[FORCED] ':'')+(parsed.confidence!=='high'?'[DEGRADED] ':'')+(state.createdNow?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by delivery token or message marker');
   ivSave_(id,state);
   return state;
  }catch(e){

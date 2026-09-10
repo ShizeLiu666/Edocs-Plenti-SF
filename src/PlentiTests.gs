@@ -1123,12 +1123,14 @@ function testPlentiTestEntryPoint(){
  plTestWithGmail_(inbox,function(){
   plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
    plTestWithFakeApi_(function(calls){
+    // Description 带本邮件 marker —— 这才是"同一封邮件重跑"的真实形态
     ivQuery_=function(q){calls.push({kind:'query',query:q});
-     if(/Plenti_Lead_ID__c/.test(q))return [{Id:'00Qr9000000001AAA',Description:'',IsConverted:false,Status:'New'}];
+     if(/Plenti_Lead_ID__c/.test(q))return [{Id:'00Qr9000000001AAA',Description:'[Intake: '+id+'] ...',IsConverted:false,Status:'New'}];
      if(/WHERE Id='/.test(q))return [{Id:'00Qr9000000001AAA'}];
      return [];};
     var again=plTestFromMessageId(id,true);
-    plAssert_(!again.created,'a forced re-run resolves to the existing Lead instead of creating a second one');
+    plAssert_(!again.createdNow,'a forced re-run resolves to the existing Lead instead of creating a second one');
+    plAssertEq_(again.created,true,'but the durable flag survives, so SF-Lead-Created is not removed (R14)');
     plAssertEq_(plTestPosts_(calls).length,0,'no second POST');
    });
   });
@@ -1561,10 +1563,111 @@ function testPlentiSystemsVisible(){
 }
 
 // ============================================================
+// 25. R14 created 的持久语义与 Lead_ID 字段属性
+// ============================================================
+
+function testPlentiCreatedDurability(){
+ plTestBaseline_();
+ var message=plTestMessage_('trusted-referral'),parsed=plTestParsed_();
+ var marker='[Intake: '+message.getId()+']';
+
+ // ---- 1. token 命中 + Description 带本邮件 marker → 这封邮件建的 ----
+ plTestWithFakeApi_(function(calls){
+  ivQuery_=function(q){calls.push({kind:'query',query:q});
+   return [{Id:'00Qdur00000001AAA',Description:marker+' Plenti referral received ...',IsConverted:false,Status:'New'}];};
+  var r=plResolve_(message,parsed);
+  plAssertEq_(r.created,true,'a token hit whose Description carries THIS message marker means this message created it');
+ });
+
+ // ---- 2. token 命中但 marker 是别的邮件 → 重发件,不算它建的 ----
+ plTestWithFakeApi_(function(calls){
+  ivQuery_=function(q){calls.push({kind:'query',query:q});
+   return [{Id:'00Qdur00000001AAA',Description:'[Intake: some-other-message] ...',IsConverted:false,Status:'New'}];};
+  var r=plResolve_(message,parsed);
+  plAssertEq_(r.created,false,'a resent referral did not create the Lead — it should only raise Review so a human checks for a duplicate');
+ });
+
+ // ---- 3. ⚠️ 回归复现:两轮跑之后 SF-Lead-Created 不能熄 ----
+ //     第一轮新建,第二轮 force 重跑走去重路径。修复前第二轮会把标签摘掉。
+ plTestClearState_();
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+  var linked=plTestMessage_('trusted-referral-with-link'),lead=null;
+  var realReq=ivReq_,realQuery=ivQuery_;
+  plLeadFieldMap_.cache=null;
+  ivReq_=function(path,method,data){
+   if(path==='sobjects/Lead/describe')return {fields:[]};
+   if(method==='post'){lead={Id:'00Qdur00000002AAA',Description:data.Description,IsConverted:false,Status:'New'};return {id:lead.Id};}
+   return {};
+  };
+  ivQuery_=function(){return lead?[lead]:[];};
+  try{
+   var first=plProcess_(linked,false);
+   plAssertEq_(first.created,true,'run 1: the message created the Lead');
+   plAssertEq_(first.createdNow,true,'run 1: and it happened in this run');
+   plAssertEq_(ivLeadLabelFlags_([first]).created,true,'run 1: SF-Lead-Created lights');
+
+   var second=plProcess_(linked,true);
+   plAssertEq_(second.created,true,'run 2: the durable flag survives a forced re-run — this is the regression');
+   plAssert_(!second.createdNow,'run 2: but nothing was created this time');
+   plAssertEq_(ivLeadLabelFlags_([second]).created,true,'run 2: SF-Lead-Created must STAY lit, not be removed');
+   plAssertEq_(ivLeadLabelFlags_([second]).review,true,'run 2: Review is still on — still 待补联系方式');
+   plAssert_(/Existing Lead matched/.test(second.reason),'run 2: the reason says it matched, not that it created');
+  }finally{ivReq_=realReq;ivQuery_=realQuery;plLeadFieldMap_.cache=null;}
+ });
+
+ // ---- 4. 运行日志的计数必须用 createdNow,不能用 created ----
+ //     否则 force 重跑和 error 重试会让月度对账多算 Lead。
+ plAssertEq_(ivLeadLabelFlags_([{kind:'referral',state:'review',created:true,record:'00Q1',leadCandidate:true}]).created,true,
+  'the label reads the durable flag');
+ var reRun={kind:'referral',state:'review',created:true,record:'00Q1',leadCandidate:true};
+ plAssert_(!reRun.createdNow,'a re-run state has no createdNow, so the run log counts zero Leads created');
+
+ // ---- 5. 字段属性报告:unique / caseSensitive / externalId ----
+ var names=[],used=plLeadFieldsUsed_(),i;
+ for(i=0;i<used.length;i++)names.push(used[i].name);
+ function describeWith(keyAttrs){
+  var real=ivReq_;plLeadFieldMap_.cache=null;
+  ivReq_=function(){
+   var out=[],j;
+   for(j=0;j<names.length;j++){
+    if(names[j]==='Plenti_Lead_ID__c')out.push({name:names[j],createable:true,type:'string',length:255,
+     unique:keyAttrs.unique,caseSensitive:keyAttrs.caseSensitive,externalId:keyAttrs.externalId});
+    else out.push({name:names[j],createable:true});
+   }
+   return {fields:out};
+  };
+  // 快照要在 finally 清缓存之前取
+  try{
+   var report=plTestDescribeLead();
+   return {report:report,map:plLeadFieldMap_(),exists:plLeadFieldExists_('Plenti_Lead_ID__c'),
+    absent:plLeadFieldExists_('No_Such_Field__c')};
+  }finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ }
+ var good=describeWith({unique:true,caseSensitive:true,externalId:true});
+ plAssertEq_(good.report.missing.length,0,'a fully configured org reports nothing missing');
+ plAssertEq_(good.exists,true,'existence check still works on the richer map');
+ plAssertEq_(good.absent,false,'and an absent field is still absent');
+ plAssertEq_(good.map.Plenti_Lead_ID__c.unique,true,'unique is read from describe');
+
+ // 属性确实进了缓存,而不是被压扁成一个 createable 布尔值
+ var bad=describeWith({unique:false,caseSensitive:false,externalId:false});
+ plAssert_(bad.map.Plenti_Lead_ID__c,'the field map keeps the full attribute object');
+ plAssertEq_(bad.map.Plenti_Lead_ID__c.unique,false,'unique is read from describe, not assumed');
+ plAssertEq_(bad.map.Plenti_Lead_ID__c.caseSensitive,false,'caseSensitive is read from describe');
+ plAssertEq_(bad.map.Plenti_Lead_ID__c.externalId,false,'externalId is read from describe');
+ plAssertEq_(bad.exists,true,'a non-unique field still exists and is still written — the warning is advisory');
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 20 created-durability and field-attribute cases');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiCreatedDurability();
  testPlentiSystemsVisible();
  testPlentiReceivedAt();
  testPlentiFieldSelfCheck();
