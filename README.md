@@ -258,9 +258,13 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
   可能是人填的。
 - 并非每条 review 都对应一条 Salesforce 记录 —— `SF-Lead-Review` 标签既
   可能是已创建的待审核 Lead,也可能是尚未唯一匹配的邮件。
-- **不可信邮件一律转 review。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂
-  `SF-Lead-Review` 标签。这是规格 §5.1 的要求(验证不通过 → review),
-  代价是审核噪音。是否放宽等 Q10 拿到真实流量数据再定。
+- **`SF-Lead-Review` 标签只留给带 Plenti browser-view 链接的邮件**(D-027)。
+  没有链接的普通业务邮件仍会落 review 状态、在 Messages 表里留一整行(含完整
+  正文和原因),但**不占标签** —— 否则进组当天真正的 lead 会被业务邮件淹掉。
+  可见面从 Gmail 标签移到 Messages 表,可见性本身没有降低。
+- **手动转发的 Plenti 邮件会被单独标为 `forwarded`**,不会被当成疑似伪造。
+  判据是 `From` 在内部域上 —— ⚠️ `From` 可伪造,所以它**只影响 reason 措辞,
+  不影响是否打标签**。
 - **`SF-Lead-Updated` 在 Plenti 路径上永远不亮**(D-024)。它唯一的触发条件
   `verifiedFields` 只有 `Legacy.gs` 里的回复补录逻辑会写,而主干不调用它。
 - **Plenti 不提供任何联系方式**,电话和邮箱只在 Plenti Portal 里,而 Portal

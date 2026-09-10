@@ -266,30 +266,55 @@ function testPlentiExclusions(){
 
 function testPlentiEmptySenderNeverInternal(){
  plTestBaseline_();
+ // 这条硬要求没有松动:空发件人**绝不判 internal、绝不静默丢弃**。
+ // Q10 收窄(D-027)改的只是"打不打标签",由有没有 Plenti 链接决定。
  var direct=plExclude_('New customer referral','');
  plAssert_(direct,'empty sender must produce an exclusion result, not null');
  plAssertEq_(direct.kind,'review','empty sender must be review');
- plAssert_(direct.kind!=='internal','empty sender must never be classified internal');
- plAssertEq_(direct.leadCandidate,true,'empty sender must be flagged leadCandidate so a label is applied');
+ plAssert_(direct.kind!=='internal','empty sender must NEVER be classified internal');
+ plAssertEq_(direct.unverified,true,'and it is tagged for the shared visibility decision');
  plAssert_(/Sender could not be determined/.test(direct.reason),'empty sender reason');
 
- // 走完整流程:X-Original-Sender 头缺失的真实场景
- var state=plTestWithFakeApi_(function(calls){
-  var s=plProcess_(plTestMessage_('original-sender-missing'),false);
-  plAssertEq_(plTestPosts_(calls).length,0,'missing sender must not write anything to Salesforce');
+ function run(fixture){
+  plTestClearState_();
+  return plTestWithFakeApi_(function(calls){
+   var s=plProcess_(plTestMessage_(fixture),false);
+   plAssertEq_(plTestPosts_(calls).length,0,fixture+': nothing is written to Salesforce');
+   return s;
+  });
+ }
+
+ // ---- 无 Plenti 链接:落 review、进 Messages 表,但不占标签 ----
+ var plain=run('original-sender-missing');
+ plAssertEq_(plain.state,'review','missing X-Original-Sender still lands in review — never dropped');
+ plAssertEq_(plain.kind,'review','and never kind internal');
+ plAssertEq_(plain.leadCandidate,false,'but with no Plenti link it does not occupy the Review label (D-027)');
+ plAssertEq_(plain.scope,'out-of-scope','and is categorised as ordinary mailbox traffic');
+ plAssertEq_(ivLeadLabelFlags_([plain]).review,false,'no label');
+ plAssert_(PropertiesService.getScriptProperties().getProperty('IV2_MSG_'+plTestMessage_('original-sender-missing').getId()),
+  'the state IS persisted — visibility moves to the Messages log, it is not a silent drop');
+
+ // ---- 有 Plenti 链接:必须打标签 ----
+ //     这正是原来那条规则要保护的情形,现在被精确地保住了。
+ plTestClearState_();
+ var linked=plTestMessageFrom_({id:'empty-sender-with-link',subject:'Action required: New lead',
+  date:'2026-09-10T01:00:00.000Z',headers:{'To':'eDocs <edocs@example.org>'},
+  from:'Someone <someone@elsewhere.example>',
+  body:'View in Browser: https://e.customeriomail.com/deliveries/'+plTestBrowserToken_()+'\n'});
+ var withLink=plTestWithFakeApi_(function(calls){
+  var s=plProcess_(linked,false);
+  plAssertEq_(plTestPosts_(calls).length,0,'still nothing written — it is not verified');
   return s;
  });
- plAssertEq_(state.state,'review','missing X-Original-Sender must land in review');
- plAssertEq_(state.kind,'review','missing X-Original-Sender must not be kind internal');
- plAssertEq_(state.leadCandidate,true,'missing X-Original-Sender must be visible via the Review label');
- plAssert_(/Sender could not be determined/.test(state.reason),'missing sender reason surfaces to the reviewer');
+ plAssertEq_(withLink.leadCandidate,true,'a Plenti link with no verifiable sender MUST be labelled');
+ plAssertEq_(withLink.scope,'unverified-with-link','and flagged as needing a human');
+ plAssert_(/NEEDS A HUMAN/.test(withLink.reason),'the reason says so loudly');
+ plAssertEq_(ivLeadLabelFlags_([withLink]).review,true,'SF-Lead-Review lights');
+ plAssertEq_(ivLeadLabelFlags_([withLink]).created,false,'no Lead was created');
 
- // 标签汇总确认它确实会亮 Review
- var flags=ivLeadLabelFlags_([state]);
- plAssertEq_(flags.review,true,'missing sender must raise the SF-Lead-Review label');
- plAssertEq_(flags.created,false,'no Lead was created');
-
- console.log('PASS: empty sender is reviewed and labelled, never silently dropped as internal');
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: empty sender is never internal, never dropped; the label is reserved for messages that carry a Plenti link');
 }
 
 // ============================================================
@@ -572,18 +597,23 @@ function testPlentiRequiredProperties(){
 
 function testPlentiProcessFlow(){
  plTestBaseline_();
+ // [D-027] 第三列是 leadCandidate(要不要占 SF-Lead-Review 标签)。
+ // 下面这些 fixture 正文里都**没有** Plenti browser-view 链接,所以一律
+ // 落 review 状态但不打标签 —— 带链接的那一类在 testPlentiScopeNarrowing 里测。
+ // 可信但解析不出的三条(trusted-*)是另一回事:它们通过了发件人验证,
+ // 走的是判定门那条路,不受 Q10 收窄影响。
  var cases=[
   ['trusted-referral','review',true,/Not identifiable as a Plenti referral/],
   ['trusted-noreply','review',true,/Not identifiable as a Plenti referral/],
   ['trusted-with-promo-footer','review',true,/Not identifiable as a Plenti referral/],
-  ['spoofed-plenti','review',true,/not a verified Plenti sender/],
-  ['unlisted-sender-dmarc-pass','review',true,/not a verified Plenti sender/],
-  ['auth-header-missing','review',true,/not a verified Plenti sender/],
-  ['lookalike-domain','review',true,/not a verified Plenti sender/],
-  ['suffix-domain','review',true,/not a verified Plenti sender/],
-  ['subdomain-sender','review',true,/not a verified Plenti sender/],
-  ['header-from-mismatch','review',true,/not a verified Plenti sender/],
-  ['original-sender-missing','review',true,/Sender could not be determined/]
+  ['spoofed-plenti','review',false,/not a verified Plenti sender/],
+  ['unlisted-sender-dmarc-pass','review',false,/not a verified Plenti sender/],
+  ['auth-header-missing','review',false,/not a verified Plenti sender/],
+  ['lookalike-domain','review',false,/not a verified Plenti sender/],
+  ['suffix-domain','review',false,/not a verified Plenti sender/],
+  ['subdomain-sender','review',false,/not a verified Plenti sender/],
+  ['header-from-mismatch','review',false,/not a verified Plenti sender/],
+  ['original-sender-missing','review',false,/Sender could not be determined/]
  ];
  plTestWithFakeApi_(function(calls){
   cases.forEach(function(c){
@@ -1663,10 +1693,107 @@ function testPlentiCreatedDurability(){
 }
 
 // ============================================================
+// 26. D-027 Q10 收窄:标签只留给带 Plenti 链接的邮件
+// ============================================================
+
+function testPlentiScopeNarrowing(){
+ plTestBaseline_();
+ var token=plTestBrowserToken_(),link='https://e.customeriomail.com/deliveries/'+token;
+
+ function make(o){
+  return plTestMessageFrom_({id:o.id,subject:o.subject||'Something',
+   date:'2026-09-10T02:00:00.000Z',from:o.from||'Someone <someone@elsewhere.example>',
+   headers:o.headers||{'To':'eDocs <edocs@example.org>'},
+   body:o.body||'Just an ordinary business email.\n'});
+ }
+ function run(message){
+  plTestClearState_();
+  return plTestWithFakeApi_(function(calls){
+   var st=plProcess_(message,false);
+   plAssertEq_(plTestPosts_(calls).length,0,'unverified mail never writes to Salesforce');
+   return st;
+  });
+ }
+
+ // ---- 1. 不可信 + 无链接 → 不打标签,但状态照常留存 ----
+ var noise=run(make({id:'scope-noise',subject:'Invoice for August',
+  headers:{'To':'eDocs <edocs@example.org>','X-Original-Sender':'accounts@supplier.example',
+   'X-Original-Authentication-Results':'mx; dmarc=pass header.from=supplier.example'}}));
+ plAssertEq_(noise.state,'review','ordinary traffic still lands in review state');
+ plAssertEq_(noise.leadCandidate,false,'but does not occupy the Review label');
+ plAssertEq_(noise.scope,'out-of-scope','categorised as out of scope');
+ plAssertEq_(ivLeadLabelFlags_([noise]).review,false,'no Gmail label');
+ plAssert_(PropertiesService.getScriptProperties().getProperty('IV2_MSG_scope-noise'),
+  'the state is persisted — this is a narrower label, not a silent drop');
+
+ // ---- 2. 不可信 + 有链接 + 外部发件人 → 打标签,而且显眼 ----
+ var suspicious=run(make({id:'scope-suspicious',subject:'Action required: New lead',
+  from:'"Plenti" <referrals@attacker.example>',
+  headers:{'To':'eDocs <edocs@example.org>','X-Original-Sender':'referrals@attacker.example',
+   'X-Original-Authentication-Results':'mx; dmarc=fail header.from=attacker.example'},
+  body:'View in Browser: '+link+'\n'}));
+ plAssertEq_(suspicious.leadCandidate,true,'a Plenti link with an unverifiable sender must be labelled');
+ plAssertEq_(suspicious.scope,'unverified-with-link','and categorised as needing a human');
+ plAssert_(/NEEDS A HUMAN/.test(suspicious.reason),'the reason is loud');
+ plAssertEq_(ivLeadLabelFlags_([suspicious]).review,true,'SF-Lead-Review lights');
+
+ // ---- 3. 同事手动转发 → 也打标签,但 reason 区分得出来 ----
+ //     这正是我们测的那封:没有 X-Original-Sender,但链接完整保留。
+ var forwarded=run(make({id:'scope-forwarded',subject:'Fwd: Action required: New lead',
+  from:'Lily <lily@example.org>',
+  headers:{'To':'Jack <jack@example.org>'},
+  body:'---------- Forwarded message ----------\nView in Browser: '+link+'\n'}));
+ plAssertEq_(forwarded.leadCandidate,true,'a forwarded referral is still labelled');
+ plAssertEq_(forwarded.scope,'forwarded','but categorised separately');
+ plAssert_(/FORWARDED BY A COLLEAGUE/.test(forwarded.reason),'the reason names the category');
+ plAssert_(/lily@example\.org/.test(forwarded.reason),'and names who forwarded it');
+ plAssert_(/From can be forged/.test(forwarded.reason),
+  'and warns that From is attacker-controllable — this wording is a hint, never a verdict');
+ plAssert_(!/NEEDS A HUMAN/.test(forwarded.reason),'it is not presented as a suspected spoof');
+
+ // ⚠️ 安全性:伪造 From 只能改措辞,**不能**降低可见性
+ var spoofedFrom=run(make({id:'scope-spoofed-from',subject:'Fwd: Action required: New lead',
+  from:'Lily <lily@example.org>',
+  headers:{'To':'Jack <jack@example.org>','X-Original-Sender':'attacker@evil.example',
+   'X-Original-Authentication-Results':'mx; dmarc=fail header.from=evil.example'},
+  body:'View in Browser: '+link+'\n'}));
+ plAssertEq_(spoofedFrom.leadCandidate,true,'forging From must NOT suppress the label');
+ plAssertEq_(ivLeadLabelFlags_([spoofedFrom]).review,true,'the label still lights');
+
+ // ---- 4. 判据只看链接存在,绝不发起抓取 ----
+ plTestClearState_();
+ plTestWithFetch_(function(){throw new Error('must not fetch a page for unverified mail');},function(fetched){
+  plTestWithFakeApi_(function(){
+   plProcess_(make({id:'scope-nofetch',from:'X <x@elsewhere.example>',
+    headers:{'To':'eDocs <edocs@example.org>'},body:'View in Browser: '+link+'\n'}),false);
+  });
+  plAssertEq_(fetched.length,0,'presence check only — never fetch a URL from an unverified message');
+ });
+
+ // ---- 5. 单元级:plUnverifiedReview_ 三个分支 ----
+ var base='base reason';
+ var a=plUnverifiedReview_(make({id:'u1'}),base);
+ plAssertEq_(a.leadCandidate,false,'no link → no label');
+ plAssert_(a.reason.indexOf(base)>=0,'the underlying reason is preserved, not replaced');
+ var b=plUnverifiedReview_(make({id:'u2',body:'x '+link}),base);
+ plAssertEq_(b.leadCandidate,true,'link → label');
+ var cInternal=plUnverifiedReview_(make({id:'u3',from:'Someone <someone@example.org>',body:'x '+link}),base);
+ plAssertEq_(cInternal.scope,'forwarded','internal From → forwarded category');
+ // 域名边界:近似域名不算内部
+ var lookalike=plUnverifiedReview_(make({id:'u4',from:'X <x@notexample.org>',body:'x '+link}),base);
+ plAssertEq_(lookalike.scope,'unverified-with-link','a look-alike domain is not treated as an internal forward');
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 22 scope-narrowing cases (label reserved for Plenti-linked mail; forwards distinguished)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiScopeNarrowing();
  testPlentiCreatedDurability();
  testPlentiSystemsVisible();
  testPlentiReceivedAt();

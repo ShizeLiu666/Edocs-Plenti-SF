@@ -283,7 +283,11 @@ function isPlentiSource_(message){
  */
 function plExclude_(subject,sender){
  var sub=String(subject||''),from=String(sender||'').toLowerCase();
- if(!from)return {kind:'review',reason:'Sender could not be determined from X-Original-Sender',leadCandidate:true};
+ // [R15] unverified 标记交给 plProcess_ 统一处理可见性 —— 转发件正是走这一条
+ // (转发件没有 X-Original-Sender)。这里**仍然绝不判 internal、仍然落 review**,
+ // Jack 当初立的那条硬要求没有松动;变的只是"打不打标签",由有没有 Plenti
+ // 链接决定,见 plUnverifiedReview_。
+ if(!from)return {kind:'review',reason:'Sender could not be determined from X-Original-Sender',leadCandidate:true,unverified:true};
  if(plDomain_(from)===ivInternalDomain_())return {kind:'internal',reason:'Internal sender'};
  if(/(?:^|\.)(?:salesforce\.com|sfcustomeremail\.com)$/i.test(plDomain_(from))&&/(?:a lead has been assigned|please follow up your unconverted lead)/i.test(sub))return {kind:'ignore',reason:'Salesforce automatic lead notification'};
  if(/(?:salesforce could not create this lead)/i.test(sub))return {kind:'review',reason:'Web-to-Lead failure requires administrator review'};
@@ -523,6 +527,46 @@ function plEnrichFromBrowserView_(message,parsed){
   parsed.reason='Browser view fetched but the customer name could not be parsed; template may have changed';
  }
  return {html:fetched.html,meta:meta};
+}
+
+/**
+ * plUnverifiedReview_(message, baseReason) → {leadCandidate, scope, reason}
+ *
+ * **Q10 收窄(D-027)。** 决定一封"没能确认为可信 Plenti 发件人"的邮件要不要
+ * 占用 SF-Lead-Review 标签。
+ *
+ * 判据是**邮件里有没有 Plenti browser-view 链接** —— 一个结构事实,
+ * 与噪音量无关,所以不需要先跑几天看数据。
+ *
+ *   无链接 → 普通业务邮件。落 review 状态、进 Messages 表,**不打标签**。
+ *   有链接 → 要么是认证头丢了的真转介(漏单),要么是伪造。**必须打标签。**
+ *
+ * ⚠️ 不违反"绝不静默丢弃":状态照常存进 Script Properties,消息照常在
+ * Messages 表里留一整行(含完整正文),人看得见 —— 只是不占 Gmail 标签。
+ * 设计里本来就有先例:plExclude_ 判出的测试邮件、Web-to-Lead 失败同样是
+ * "review 状态但无标签"。
+ *
+ * ### 有链接时再分两类,只影响 reason 措辞
+ *
+ * 同事手动转发的 Plenti 邮件会落进"有链接"这一类 —— 它既不是漏单也不是伪造。
+ * 判据是 From 在 INTERNAL_DOMAIN 上。
+ *
+ * ⚠️⚠️ **From 是发信人可控的,能伪造。** 所以这个区分**只用来改 reason 的措辞,
+ * 绝不用来降低可见性** —— 两类的 leadCandidate 都是 true,标签照打。
+ * reason 里也明说了 From 可伪造,提醒人别把它当结论。
+ */
+function plUnverifiedReview_(message,baseReason){
+ if(!plBrowserViewUrl_(message)){
+  return {leadCandidate:false,scope:'out-of-scope',
+   reason:'Out of scope: no Plenti browser-view link in this message, so it is ordinary mailbox traffic rather than a referral. State and full body are recorded in the Messages log; no Gmail label applied. ('+baseReason+')'};
+ }
+ var from=plAddress_(message.getFrom()),internal=from!==''&&plDomain_(from)===ivInternalDomain_();
+ if(internal){
+  return {leadCandidate:true,scope:'forwarded',
+   reason:'FORWARDED BY A COLLEAGUE ('+from+'): carries a Plenti browser-view link, and the Google Groups headers are missing because it was forwarded rather than delivered through the group — not a missed referral and not a spoof. NOTE: From can be forged, so this wording is a hint, not a verdict. ('+baseReason+')'};
+ }
+ return {leadCandidate:true,scope:'unverified-with-link',
+  reason:'⚠️ NEEDS A HUMAN: carries a Plenti browser-view link but the sender could not be verified — either a genuine referral whose authentication headers were lost in transit, or an impersonation attempt. ('+baseReason+')'};
 }
 
 // ============================================================
@@ -1261,7 +1305,7 @@ function plProcess_(message,force,detail){
  try{
   var sender=plAddress_(plHeader_(message,'X-Original-Sender'));
   var excluded=plExclude_(message.getSubject(),sender);
-  if(excluded){
+  if(excluded&&!excluded.unverified){
    state.kind=excluded.kind;
    state.reason=excluded.reason;
    state.leadCandidate=!!excluded.leadCandidate;
@@ -1269,15 +1313,29 @@ function plProcess_(message,force,detail){
    ivSave_(id,state);
    return state;
   }
-  var source=isPlentiSource_(message);
-  detail.sender=source.sender;
-  detail.trusted=source.trusted;
-  if(!source.trusted){
-   var refined=plUntrustedReason_(message.getSubject(),message.getPlainBody());
+  // [R15] "没能确认为可信 Plenti 发件人"有两个入口:发件人头缺失(转发件走这条)
+  // 和可信验证不通过。两者的可见性判定完全相同,合成一处,见 D-027。
+  var unverified='';
+  if(excluded&&excluded.unverified){
+   detail.sender='';
+   detail.trusted=false;
+   unverified=excluded.reason;
+  }else{
+   var source=isPlentiSource_(message);
+   detail.sender=source.sender;
+   detail.trusted=source.trusted;
+   if(!source.trusted){
+    var refined=plUntrustedReason_(message.getSubject(),message.getPlainBody());
+    unverified=(refined?refined+' — ':'')+'not a verified Plenti sender: '+source.reason;
+   }
+  }
+  if(unverified){
+   var visibility=plUnverifiedReview_(message,unverified);
    state.kind='review';
    state.state='review';
-   state.leadCandidate=true;
-   state.reason=(refined?refined+' — ':'')+'not a verified Plenti sender: '+source.reason;
+   state.leadCandidate=visibility.leadCandidate;
+   state.scope=visibility.scope;
+   state.reason=visibility.reason;
    ivSave_(id,state);
    return state;
   }

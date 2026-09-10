@@ -152,8 +152,10 @@ function ivMessageLogRow_(message,recipient,state,detail){
  if(!sender){sender=String(message.getFrom()||'')+' [From fallback: X-Original-Sender missing]';}
  if(cell.truncatedFrom)notes.push('[BODY TRUNCATED from '+cell.truncatedFrom+' chars]');
  if(body.isHtml)notes.push('[BODY IS RAW HTML: getPlainBody() was empty]');
- if(state.state==='error')notes.push(String(state.reason||''));
- else if(state.forced)notes.push('[FORCED]');
+ // [R15] review 也要带 reason:Q10 收窄之后,不打标签的邮件只能靠这张表被看见,
+ // 备注列不写原因等于让人对着一行"review"猜。
+ if(state.state==='error'||state.state==='review')notes.push(String(state.reason||''));
+ if(state.forced)notes.push('[FORCED]');
  var parsed=detail.parsed||null;
  return [
   new Date().toISOString(),
