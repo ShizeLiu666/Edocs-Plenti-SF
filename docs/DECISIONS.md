@@ -1130,6 +1130,98 @@ skipped at runtime, the request still succeeds`,不混进红色的 MISSING 清�
 
 ---
 
+## D-024 review 状态的自动解除:信号是"联系方式出现了"
+
+**日期** 2026-09-10 · **决定人** Jack · **阶段** 已实现,**Q9 关闭**
+
+### 先纠正一个前提
+
+Jack 观察到"Plenti 路径下 `SF-Lead-Created` 好像永远不会亮"。**实测不成立** ——
+`ivLeadLabelFlags_` 里 `created` 和 `review` 是两个独立判断,不互斥:
+
+| 状态 | Created | Review | Updated |
+|---|:--:|:--:|:--:|
+| 新建 Plenti Lead | ✅ | ✅ | — |
+| 降级建出的 Lead | ✅ | ✅ | — |
+| 已存在、未新建 | — | ✅ | — |
+| 不可信 → review | — | ✅ | — |
+
+handoff 的 `README_CN.md` 明写了这是设计:「标签按整个会话汇总,因此 Created
+和 Review 可以同时存在」。
+
+**Plenti 路径上真正的死标签是 `SF-Lead-Updated`** —— 它唯一的触发条件是
+`verifiedFields` 非空,而那只有 `ivRecordReply_` 会写,那个函数在 `Legacy.gs`
+里、主干一次也不调用(有静态守卫)。这是 D-007 定位调整的必然结果,不是缺陷。
+
+### 为什么"已补全"程序判断得了
+
+Jack 原本认为这个状态程序判断不了。**能判断**,而且信号异常干净。
+
+Portal 那边的事实(Jack 2026-09-10 查清):
+
+1. **联系方式只在 Plenti Portal 里有。** 邮件正文和 browser view 页面都没有 ——
+   43KB HTML 全文搜过,电话和邮箱 0 处命中
+2. **Portal 登录要双重验证,每次都要收验证码,账号还是发给老板个人的** ——
+   自动化不现实
+3. Portal 的 Referrals 页面有 Export to Excel,六列
+   Customer / Email / Date created / Phone / Systems / Status,**没有 referral ID**
+
+所以 **`Email` / `Phone` / `MobilePhone` 里任何一个变成非空,只可能是人填的**。
+这就是解除信号。
+
+**「待补联系方式」是每一条 Plenti 线索的必经状态,不是边缘情况。**
+
+### 实现
+
+`plRefreshReview_` 从空操作桩换成实现。管道本来就铺好了 ——
+`runIntakeV2` 的消息循环和 `ivRefreshOutstanding_` 每轮都调用它。
+
+解除条件三选一(后两条沿用模板 `ivRefreshReview_` 的意图):
+
+| 条件 | 含义 |
+|---|---|
+| `Email` / `Phone` / `MobilePhone` 任一非空 | 有人补了联系方式 |
+| `IsConverted` | 线索已转换 |
+| `Status === 'Unqualified'` | 有人判定不合格 |
+
+### 三处刻意的设计
+
+**① 成本守卫:没有 Lead 记录的 review 一次查询都不发。**
+
+前三行守卫决定了只有"已建出 Lead 且仍在 review"的消息才会发 SOQL。
+进组之后所有非 Plenti 噪音邮件的 review 状态都没有 `record`,
+**不会为它们查一次 Salesforce**(Q10)。有断言。
+
+**② 字段列表写死成最小集,不用 `ivLeadFields_()`。**
+查得更便宜,也避开 `StateCode` 那类条件字段的坑(D-022)。
+
+**③ 查询失败绝不抛出去。**
+`runIntakeV2` 的主循环调用这里时**没有包 try/catch**,抛出去整轮就死了。
+状态刷新失败只是标签晚点摘;建 Lead 和 SLA 时钟才是要紧的。记日志后返回。
+
+### 由此得到的两态工作流 —— 不需要新标签
+
+| 标签组合 | 含义 |
+|---|---|
+| `Created` + `Review` | **待补联系方式** |
+| `Created`(Review 熄灭) | **已补全** |
+
+Jack 想要的两个状态,现有标签对就能表达。**不改名,不加新标签。** 有断言验证
+这个转换,并确认 `created` 标志在状态变 `done` 之后仍然保留。
+
+### 尚未覆盖的一处
+
+review 解除**不会回写 Messages 表**(D-018)—— 那张表是处理时的诊断记录,
+不是实时状态板。想在表里看到状态流转,需要另做,本轮不做。
+
+### 将来可能的方向(Jack 提出,不在本轮)
+
+人每天从 Portal 导出一次 Excel,程序读文件**按姓名匹配**补全联系方式。
+⚠️ 注意导出里**没有 referral ID**,只能按 Customer 姓名匹配,重名会有歧义 ——
+真要做的时候这是首先要解决的问题。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -1364,8 +1456,8 @@ watermark 的校验保持原样。
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |
 | Q8 | Business Hours 修正(当前是 Los Angeles + 24/7,须改 Adelaide + 南澳公共假期)。本项目之外的 Salesforce 配置任务,但在修好前任何"工作日"计算都是错的 | SLA 计算 | §4 |
-| Q9 | **review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
-| Q10 | **不可信邮件全部转 review 的审核噪音。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂 Review 标签。按规格实现,不放宽;Jack 去问 eDocs 日均邮件量,**决策依据是真实流量数据,不是"感觉太吵"** | 上线前评估 | §5.1 / D-010 |
+| ~~Q9~~ | ✅ **已关闭**(2026-09-10)—— 信号是 `Email`/`Phone`/`MobilePhone` 任一非空。Plenti 一条联系方式都不给(只在 Portal 里,双重验证无法自动化),所以非空**只可能是人填的**。见 D-024。原不再阻塞于 Q1。原文:**review 状态如何自动解除?** 不复用 `Lead_Category__c`(D-011)后 Phase 2 没有替代信号,`plRefreshReview_` 是空操作桩,`SF-Lead-Review` 标签需人工处理。真正的信号大概率是"Lead 被指派给跟进人" | **阻塞于 Q1**,不是待样本 | D-011 |
+| Q10 | **不可信邮件全部转 review 的审核噪音。** ➡️ 2026-09-10 更新:现在有了一个**与噪音量无关**的判据 —— 邮件里有没有 Plenti browser-view 链接。"不可信 + 无链接"是普通业务邮件,可以只落状态不打标签;"不可信 + **有**链接"才是危险情形(真转介认证头丢了,或伪造),必须打标签。这个判断不需要等流量数据,见 D-024 后的说明 | 待 Jack 决定是否实施 | §5.1 / D-010 / D-024 |
 | ~~Q11~~ | ~~`INTAKE_V2_START` 的两个 fail-open 缺口~~ **已关闭** —— Phase 2 当期修复,见 TODO-3 | 无 | —— |
 | Q12 | **外部发件人能否直接投递到 eDocs 组?** moderation 那一层 Lily 已确认通了,但投递权限本身还没确认。若外部发件人被拦、或投递路径与预期不同,**Google Groups 写入的 `X-Original-Sender` / `X-Original-Authentication-Results` 可能根本不存在** —— 那样 `isPlentiSource_` 的全部前提要重想 | **Phase 3**(先于样本解析) | §5.1 |
 | Q13 | **沙箱的 Run As 用户若用 `jack.liu`,权限最小集就没被验证过。** 管理员身份下测试必然通过,到生产换成受限集成用户时才会集中暴露。若沙箱这样做了,生产上线前必须补测 | 上线前 | SANDBOX_SETUP §2.5 |

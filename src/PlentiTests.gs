@@ -619,20 +619,104 @@ function testPlentiProcessFlow(){
 }
 
 // ============================================================
-// 14. review 解除桩不改动任何状态
+// 14. review 状态的自动解除(Q9 关闭)
 // ============================================================
 
-function testPlentiRefreshReviewStub(){
+function testPlentiReviewRelease(){
  plTestBaseline_();
- var message=plTestMessage_('trusted-referral');
- plTestWithFakeApi_(function(calls){
-  plProcess_(message,false);
-  var before=JSON.stringify(ivGet_(message.getId()));
-  plRefreshReview_(message);
-  plAssertEq_(JSON.stringify(ivGet_(message.getId())),before,'the Phase 2 stub must not change any state');
-  plAssertEq_(plTestPosts_(calls).length,0,'the stub must not write to Salesforce');
+ var message=plTestMessage_('trusted-referral'),id=message.getId();
+
+ /** 造一条"已建 Lead、仍在 review"的状态,并让查询返回指定的 Lead。 */
+ function withLead(lead,fn){
+  plTestClearState_();
+  ivSave_(id,{state:'review',kind:'referral',created:true,record:'00Qreview0001AAA',
+   leadCandidate:true,reason:'New Plenti Lead awaiting administrator approval',date:'2026-09-07T02:15:00.000Z'});
+  return plTestWithFakeApi_(function(calls){
+   ivQuery_=function(q){calls.push({kind:'query',query:q});return lead?[lead]:[];};
+   return fn(calls);
+  });
+ }
+
+ // ---- 1. 联系方式仍然为空 → 保持 review ----
+ withLead({Id:'00Qreview0001AAA',Email:null,Phone:null,MobilePhone:null,Status:'New',IsConverted:false},function(calls){
+  plAssertEq_(plRefreshReview_(message),false,'no contact details means the review stays open');
+  plAssertEq_(ivGet_(id).state,'review','state unchanged');
+  plAssertEq_(calls.length,1,'exactly one lookup');
+  plAssert_(/SELECT Id,Email,Phone,MobilePhone,Status,IsConverted/.test(calls[0].query),'a minimal field list is queried, not ivLeadFields_ — cheaper, and it avoids conditional fields like StateCode');
  });
- console.log('PASS: review-refresh stub is a genuine no-op');
+
+ // ---- 2. 三种联系方式各自都能解除 ----
+ [['Phone','0400000001'],['Email','customer@example.net'],['MobilePhone','0400000002']].forEach(function(c){
+  var lead={Id:'00Qreview0001AAA',Email:null,Phone:null,MobilePhone:null,Status:'New',IsConverted:false};
+  lead[c[0]]=c[1];
+  withLead(lead,function(){
+   plAssertEq_(plRefreshReview_(message),true,c[0]+' clears the review');
+   var after=ivGet_(id);
+   plAssertEq_(after.state,'done',c[0]+': state becomes done');
+   plAssert_(/Contact details have been filled in/.test(after.reason),c[0]+': the reason says why');
+   plAssertEq_(after.created,true,c[0]+': the created flag survives, so SF-Lead-Created stays lit');
+   plAssertEq_(after.record,'00Qreview0001AAA',c[0]+': the record id survives');
+  });
+ });
+
+ // ---- 3. 被转换 / 被判 Unqualified 也算处理过了 ----
+ withLead({Id:'00Qreview0001AAA',Status:'New',IsConverted:true},function(){
+  plAssertEq_(plRefreshReview_(message),true,'a converted Lead clears');
+  plAssert_(/converted/.test(ivGet_(id).reason),'named');
+ });
+ withLead({Id:'00Qreview0001AAA',Status:'Unqualified',IsConverted:false},function(){
+  plAssertEq_(plRefreshReview_(message),true,'an Unqualified Lead clears');
+  plAssert_(/Unqualified/.test(ivGet_(id).reason),'named');
+ });
+
+ // ---- 4. ⚠️ 成本守卫:没有 Lead 记录的 review 一次查询都不能发 ----
+ //     进组之后所有非 Plenti 噪音邮件都会是这种状态(Q10),不能为它们查 Salesforce。
+ plTestClearState_();
+ ivSave_(id,{state:'review',kind:'review',leadCandidate:true,reason:'not a verified Plenti sender'});
+ plTestWithFakeApi_(function(calls){
+  plAssertEq_(plRefreshReview_(message),false,'a review with no Lead record does nothing');
+  plAssertEq_(calls.length,0,'and issues NO Salesforce query — untrusted noise must not cost API calls');
+ });
+ plTestClearState_();
+ ivSave_(id,{state:'done',created:true,record:'00Qreview0001AAA'});
+ plTestWithFakeApi_(function(calls){
+  plAssertEq_(plRefreshReview_(message),false,'an already-cleared state is not re-checked');
+  plAssertEq_(calls.length,0,'idempotent, and free');
+ });
+ plTestClearState_();
+ plTestWithFakeApi_(function(calls){
+  plAssertEq_(plRefreshReview_(message),false,'an unprocessed message does nothing');
+  plAssertEq_(calls.length,0,'no query');
+ });
+
+ // ---- 5. 查询失败绝不中断主流程 ----
+ //     runIntakeV2 的主循环调用这里时没有包 try/catch,抛出去整轮就死了。
+ plTestClearState_();
+ ivSave_(id,{state:'review',created:true,record:'00Qreview0001AAA',leadCandidate:true,reason:'awaiting'});
+ plTestWithFakeApi_(function(){
+  ivQuery_=function(){throw new Error('SIMULATED SOQL FAILURE');};
+  var threw=false;
+  try{plRefreshReview_(message);}catch(e){threw=true;}
+  plAssertEq_(threw,false,'a lookup failure must not propagate — it would kill the whole intake run');
+  plAssertEq_(ivGet_(id).state,'review','and the state is left untouched');
+ });
+ withLead(null,function(){
+  plAssertEq_(plRefreshReview_(message),false,'a missing Lead leaves the review open');
+  plAssertEq_(ivGet_(id).state,'review','state untouched');
+ });
+
+ // ---- 6. 标签转换:Created+Review → 只剩 Created ----
+ var before=ivLeadLabelFlags_([{kind:'referral',state:'review',created:true,record:'00Qreview0001AAA',leadCandidate:true}]);
+ plAssertEq_(before.created,true,'before: SF-Lead-Created is lit');
+ plAssertEq_(before.review,true,'before: SF-Lead-Review is lit — 待补联系方式');
+ var after=ivLeadLabelFlags_([{kind:'referral',state:'done',created:true,record:'00Qreview0001AAA',leadCandidate:true}]);
+ plAssertEq_(after.created,true,'after: SF-Lead-Created stays lit');
+ plAssertEq_(after.review,false,'after: SF-Lead-Review goes out — 已补全');
+ plAssertEq_(after.updated,false,'SF-Lead-Updated stays dark on the Plenti path (no reply-supplement flow)');
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 24 review-release cases (Q9 closed; no API cost for untrusted noise)');
 }
 
 // ============================================================
@@ -1410,5 +1494,5 @@ function runPlentiRegressionTests(){
  testPlentiRawEmailDefaultOff();
  testPlentiRequiredProperties();
  testPlentiProcessFlow();
- testPlentiRefreshReviewStub();
+ testPlentiReviewRelease();
 }

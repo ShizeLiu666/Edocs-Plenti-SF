@@ -855,23 +855,71 @@ function plCreateLead_(message,parsed,enrichment){
 // ============================================================
 
 /**
- * [Phase 2 空操作桩] 不改任何状态,直接返回。
+ * review 状态的解除条件 —— 返回解除理由,或空串表示还不能解除。
  *
- * 模板用 Lead_Category__c 从 Other 改成 New Sales Enquiry 作为"管理员已
- * 审核"的信号,来自动清除 review 状态和 Gmail 标签。**Plenti 不复用该
- * 字段**(DECISIONS D-011):语义不符(Plenti 转介按定义就是销售线索)、
- * 那是 Lily 为 info 模型建的字段(两个邮箱写不同语义会污染两边报表)、
- * 且 LeadSource='Plenti' 已足够区分来源。
+ * **主信号:Lead 上出现了任何一种联系方式。**
  *
- * 连带后果:review 状态在 Phase 2 **没有自动解除机制**,Gmail 的
- * SF-Lead-Review 标签需要人工处理。真正的解除信号大概率应该是
- * "Lead 被指派给跟进人",但那阻塞在 Q1(谁跟进 Plenti 线索)。
+ * 这个信号之所以干净,是因为 **Plenti 一条联系方式都不给**(D-024):邮件正文、
+ * browser view 页面全文搜索过,电话和邮箱 0 处命中。联系方式只存在于 Plenti
+ * Portal,而 Portal 每次登录都要双重验证、账号还是发给老板个人的,自动化不现实。
+ * 所以 `Email` / `Phone` / `MobilePhone` 里任何一个变成非空,**只可能是人填的**。
  *
- * [TODO Q9] 阻塞项 Q1。本函数保持空操作,使 Code.gs 的
- * ivRefreshOutstanding_ 在改调它之后仍能正常工作。
+ * 另外两个条件沿用模板 ivRefreshReview_ 的意图:线索被转换、或被判定为
+ * Unqualified,都说明有人处理过了,再挂着 review 只是噪音。
+ */
+function plReviewClearedReason_(lead){
+ if(lead.IsConverted===true)return 'Lead has been converted';
+ if(lead.Status==='Unqualified')return 'Lead marked Unqualified';
+ if(lead.Email||lead.Phone||lead.MobilePhone)return 'Contact details have been filled in (Plenti supplies none, so this can only have come from a person)';
+ return '';
+}
+
+/**
+ * plRefreshReview_(message) —— review 状态的自动解除(关闭 Q9)。
+ *
+ * 由 runIntakeV2 的消息循环和 ivRefreshOutstanding_ 每轮调用,管道本来就铺好了,
+ * 这里只是把空桩换成实现。
+ *
+ * ### 它带来的两态工作流
+ *
+ * 不需要新标签,现有标签对就能表达 Jack 要的两个状态:
+ *
+ *   Created + Review   →  待补联系方式(每条 Plenti 线索的必经状态)
+ *   Created(Review 消失)→  已补全
+ *
+ * ### 成本:只查真正需要轮询的那些
+ *
+ * 前三行守卫决定了**只有"已建出 Lead 且仍在 review"的消息才会发 SOQL**。
+ * 不可信噪音邮件的 review 状态没有 record,一次查询都不会发 —— 这一点在
+ * 进组之后尤其要紧(Q10)。
+ *
+ * 字段列表刻意写死成最小集,不用 ivLeadFields_():查得更便宜,也避开
+ * StateCode 那类条件字段的坑(D-022)。
+ *
+ * ### 查询失败绝不中断主流程
+ *
+ * runIntakeV2 的主循环调用这里时**没有包 try/catch**,抛出去会让整轮死掉。
+ * 状态刷新失败只是标签晚点摘,建 Lead 和 SLA 时钟才是要紧的 —— 记日志后返回。
  */
 function plRefreshReview_(message){
- return;
+ var id=message.getId(),state=ivGet_(id);
+ if(!state||state.state!=='review')return false;
+ if(!state.record||!/^00Q/.test(state.record))return false;
+ var lead;
+ try{
+  lead=ivQuery_("SELECT Id,Email,Phone,MobilePhone,Status,IsConverted FROM Lead WHERE Id='"+ivQuote_(state.record)+"'")[0];
+ }catch(e){
+  console.log('Review refresh could not read Lead '+state.record+': '+String(e.message||e).slice(0,200));
+  return false;
+ }
+ if(!lead)return false;
+ var reason=plReviewClearedReason_(lead);
+ if(!reason)return false;
+ state.state='done';
+ state.reason=reason;
+ ivSave_(id,state);
+ console.log('Review cleared for message '+id+' (Lead '+state.record+'): '+reason);
+ return true;
 }
 
 // ============================================================

@@ -252,12 +252,20 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **Lead Description 上限 32,000 字符**,超出报错。
 - **本脚本不发送首次回应邮件。** Salesforce 既有的自动回复、分配和其他
   Flow 可能被创建动作触发,需单独验证。
+- 标签的两态含义(D-024):`SF-Lead-Created` + `SF-Lead-Review` = **待补联系
+  方式**;Review 熄灭、只剩 Created = **已补全**。解除信号是 Lead 上出现了
+  `Email` / `Phone` / `MobilePhone` 任一项 —— Plenti 一条都不给,所以非空只
+  可能是人填的。
 - 并非每条 review 都对应一条 Salesforce 记录 —— `SF-Lead-Review` 标签既
   可能是已创建的待审核 Lead,也可能是尚未唯一匹配的邮件。
 - **不可信邮件一律转 review。** 进入 eDocs 群组的所有非 Plenti 邮件都会挂
   `SF-Lead-Review` 标签。这是规格 §5.1 的要求(验证不通过 → review),
   代价是审核噪音。是否放宽等 Q10 拿到真实流量数据再定。
-- **review 状态目前没有自动解除机制**(Q9)。标签需要人工处理。
+- **`SF-Lead-Updated` 在 Plenti 路径上永远不亮**(D-024)。它唯一的触发条件
+  `verifiedFields` 只有 `Legacy.gs` 里的回复补录逻辑会写,而主干不调用它。
+- **Plenti 不提供任何联系方式**,电话和邮箱只在 Plenti Portal 里,而 Portal
+  每次登录都要双重验证、账号是个人账号,无法自动化。因此**每一条 Plenti 线索
+  都必须有人去 Portal 取联系方式**,这是必经状态而非边缘情况(D-024)。
 - `INTAKE_V2_START` 必须配置且可解析,否则 `runIntakeV2` 直接抛错停止 ——
   脚本**不会**在缺配置时回扫历史邮件(DECISIONS TODO-3 修复了模板的这个缺口)。
 - **跨邮箱去重在 Plenti 路径上实际失效**(Q15)。规格 §5.5 那一层靠客户邮箱
