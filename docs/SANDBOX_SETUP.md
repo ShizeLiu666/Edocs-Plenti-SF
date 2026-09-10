@@ -698,6 +698,49 @@ Lead 多两个长文本字段。`Plenti_Raw_Email__c` 存的是**原始 HTML**,
 
 ---
 
+## 10. 🟢 `Plenti_Systems__c`(D-025)
+
+browser view 抓到的三个字段里,name 和 address 都进了标准字段,
+**systems 没有落脚点** —— 跟进的人在 Lead 页面上看不到客户想装什么。
+
+**操作**
+Setup → Object Manager → Lead → Fields & Relationships → New:
+
+| 项 | 值 |
+|---|---|
+| Data Type | **Text** |
+| Length | **255** |
+| Field Label | `Plenti Systems` |
+| Field Name | `Plenti_Systems` → `Plenti_Systems__c` |
+| Required | 否 |
+| Unique / External ID | **都不勾** |
+| Description | `客户在 Plenti 转介里选择的可再生能源系统,取自 browser view 页面的 Renewable systems 字段。逗号分隔,例如 "Battery, Solar"。` |
+
+FLS:对集成用的 Permission Set 可见且可编辑;对跟进人可见。
+⚠️ **必须加到 Lead 页面布局上** —— 这个字段存在的全部意义就是让人看见。
+
+**改了什么**
+Lead 多一个可报表、可筛选的文本字段。Schedule 3 季度报告和 PLT002 转化率
+分析都可能要按系统类型切分,而 Description 是自由文本、做不了 group by。
+
+⚠️ **为什么是 Text 而不是多选 Picklist**:多选 Picklist 报表更好用,但
+**写入一个不在选项列表里的值会让整个请求失败**(R11 那一类事故)。目前只见过
+`Battery, Solar` 一种取值,值域还不清楚。先用 Text 兜住,积累若干真实转介、
+看清完整值域之后再评估迁移。
+
+**怎么验证**
+1. `plTestDescribeLead()` 里该字段从 `ⓘ optional and absent` 消失
+2. 重跑 `plTestFromMessageId(msgId)`,`[R10] verify` 里能看到它的值
+3. 打开 Lead 页面,肉眼确认字段显示出来了
+
+⚠️ **建之前也不影响运行** —— 按 D-023 的探测机制,字段不存在时自动跳过,
+systems 仍会出现在 Description 摘要里(`; systems: Battery, Solar`)。
+
+**生产环境的差异**
+同样要建,FLS 和布局要按生产的角色重新确认。
+
+---
+
 # 完成后要记录什么
 
 配置完把下列值记下来,Phase 4 建 Apps Script 项目时填进 Script Properties。

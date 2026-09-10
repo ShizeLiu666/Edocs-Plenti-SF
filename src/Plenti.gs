@@ -756,7 +756,7 @@ function plResolve_(message,parsed,forced){
  * PLT001 的计时字段静默为空,而这是合同 SLA 的计算依据;默认开 → 切生产
  * 当天直接被 INVALID_FIELD 卡死。探测则两边都自洽,且不需要任何人记得做什么。
  */
-var PLENTI_OPTIONAL_LEAD_FIELDS=['Plenti_Received_At__c'];
+var PLENTI_OPTIONAL_LEAD_FIELDS=['Plenti_Received_At__c','Plenti_Systems__c'];
 
 /**
  * Lead 字段表 {字段名: 是否可写},**按执行缓存**(与模板 ivReq_.token 同一手法)。
@@ -808,8 +808,15 @@ function plLeadPayload_(message,parsed,enrichment){
   Plenti_Browser_View_HTML__c:plTruncateField_((enrichment&&enrichment.html)||'',PLENTI_LONG_TEXT_LIMIT),
   Plenti_Parsed_JSON__c:plTruncateField_(JSON.stringify(parsed),PLENTI_JSON_LIMIT),
   // D-013:一行摘要,不复制原文。marker 是承重结构,不能删。
-  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(meta.degraded?' [BROWSER VIEW UNAVAILABLE — open the link in the raw email for customer details]':''),PLENTI_DESCRIPTION_LIMIT)
+  // [R13] 摘要里带上 systems —— 跟进的人一眼要看到客户想装什么。
+  // 这不违反 D-012:那条禁的是 referralId 之外的**内部标识符**,而 systems 是
+  // 客户需求本身,正是 D-012 允许的"销售必要信息"。
+  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(parsed.systems?'; systems: '+parsed.systems:'')+(meta.degraded?' [BROWSER VIEW UNAVAILABLE — open the link in the raw email for customer details]':''),PLENTI_DESCRIPTION_LIMIT)
  };
+ // [R13] 专用字段:Description 是自由文本,分组和筛选都做不了。Schedule 3 季度
+ // 报告和 PLT002 的转化率分析都可能要按系统类型切分,所以另建一个可报表字段。
+ // 字段还没建时按 D-023 自动跳过,Description 里的那份保证信息不会不可见。
+ if(parsed.systems&&plLeadFieldExists_('Plenti_Systems__c'))payload.Plenti_Systems__c=plTruncateField_(parsed.systems,255);
  // [R12] PLT001 SLA 的计时起点(规格 §5.3)。
  // ⚠️ 值**必须**取自 message.getDate() —— 邮件的接收时间,**不是脚本运行时间**。
  // 取错了整个 SLA 统计都是错的,而且事后无法从记录里还原。这里刻意直接取
@@ -1068,7 +1075,9 @@ function plTestOverrideMessage_(message,sender){
 /** ⚠️ [R10 临时] 建完之后回读五个自定义字段,只打长度不打内容(其中两个是 40KB HTML)。 */
 function plTestVerifyLead_(recordId){
  // [R12] 可选字段存在才查 —— 查一个不存在的字段会让整条 SOQL 报错(D-022)。
- var fields=['Plenti_Lead_ID__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c','Contact_Attempt_Count__c'],i;
+ // [R13] 带上 Name/FirstName/LastName —— Lead 页面上的 Name 是复合字段,
+ // 布局怎么显示不代表记录里是什么。回读一次才是权威答案。
+ var fields=['Name','FirstName','LastName','Plenti_Lead_ID__c','Plenti_Raw_Email__c','Plenti_Browser_View_HTML__c','Plenti_Parsed_JSON__c','Contact_Attempt_Count__c'],i;
  for(i=0;i<PLENTI_OPTIONAL_LEAD_FIELDS.length;i++){
   if(plLeadFieldExists_(PLENTI_OPTIONAL_LEAD_FIELDS[i]))fields.push(PLENTI_OPTIONAL_LEAD_FIELDS[i]);
  }

@@ -486,6 +486,16 @@ function testPlentiLeadPayload(){
  plAssert_(payload.Description.indexOf('[Intake: '+message.getId()+']')===0,'Description starts with the message marker');
  plAssert_(payload.Description.indexOf('3 fields parsed')>=0,'Description records how many fields were parsed');
  plAssert_(payload.Description.split('\n').length===1,'Description is a single line');
+
+ // [R13] ② 姓名写入位置。这里的 parsed 是测试助手造的、first/last 都有值;
+ // 真正的 Plenti 路径只会填 lastName(整串不拆),那一条在
+ // testPlentiSystemsVisible 的端到端用例里验证。
+ plAssertEq_(payload.LastName,'Example','LastName carries the customer surname field verbatim');
+ plAssertEq_(payload.FirstName,'Dale','FirstName is sent only when parsing actually produced one');
+ var noFirst=plTestParsed_();noFirst.customer.firstName='';noFirst.customer.lastName='Gabby TEST';
+ var whole=plLeadPayload_(message,noFirst,enrichment);
+ plAssertEq_(whole.LastName,'Gabby TEST','the whole name goes into LastName, unsplit — no guessing where the surname starts');
+ plAssert_(!('FirstName' in whole),'and FirstName is omitted entirely rather than written empty');
  plAssert_(payload.Description.length<=32000,'Description stays within the standard-field limit');
  plAssert_(payload.Description.indexOf('12 Fictional Street')<0,'the email body is not copied into Description (D-012)');
 
@@ -1469,10 +1479,93 @@ function testPlentiReceivedAt(){
 }
 
 // ============================================================
+// 24. R13 systems 必须落到人看得见的地方
+// ============================================================
+
+function testPlentiSystemsVisible(){
+ plTestBaseline_();
+ var message=plTestMessage_('trusted-referral');
+
+ function payloadWith(systems,fieldsPresent){
+  var parsed=plTestParsed_();
+  if(systems)parsed.systems=systems;
+  var real=ivReq_;
+  plLeadFieldMap_.cache=null;
+  ivReq_=function(path){
+   if(path!=='sobjects/Lead/describe')throw new Error('unexpected request: '+path);
+   var out=[],i;
+   for(i=0;i<fieldsPresent.length;i++)out.push({name:fieldsPresent[i],createable:true,updateable:true});
+   return {fields:out};
+  };
+  try{return plLeadPayload_(message,parsed,{html:'',meta:{found:['name','address','systems']}});}
+  finally{ivReq_=real;plLeadFieldMap_.cache=null;}
+ }
+
+ // ---- 1. 字段已建 → 写进专用字段,**同时**留在 Description ----
+ var withField=payloadWith('Battery, Solar',['Plenti_Systems__c']);
+ plAssertEq_(withField.Plenti_Systems__c,'Battery, Solar','systems lands in its own reportable field');
+ plAssert_(/; systems: Battery, Solar/.test(withField.Description),'and stays in the Description summary so it is visible at a glance');
+
+ // ---- 2. 字段没建 → 跳过字段,但 Description 里仍然看得到 ----
+ //     这是关键:没有这份备份,systems 在字段建好之前就只存在于 JSON 里。
+ var withoutField=payloadWith('Battery, Solar',['Id']);
+ plAssert_(!('Plenti_Systems__c' in withoutField),'an absent field is skipped, never written — one bad field fails the whole request');
+ plAssert_(/; systems: Battery, Solar/.test(withoutField.Description),'the Description copy keeps it visible while the field does not exist yet');
+
+ // ---- 3. 没解析到 systems → 两处都不出现,不写空值 ----
+ var none=payloadWith('',['Plenti_Systems__c']);
+ plAssert_(!('Plenti_Systems__c' in none),'no systems means the field is omitted, not written empty');
+ plAssert_(none.Description.indexOf('systems:')<0,'and the summary does not carry an empty label');
+
+ // ---- 4. Description 仍然是一行,仍在上限内,仍不含正文 ----
+ plAssertEq_(withField.Description.split('\n').length,1,'Description stays a single line');
+ plAssert_(withField.Description.length<=32000,'and within the standard-field limit');
+ plAssert_(withField.Description.indexOf('[Intake: '+message.getId()+']')===0,'the load-bearing marker is still first (D-013)');
+
+ // ---- 5. 降级标记与 systems 可以并存 ----
+ var degraded=(function(){
+  var parsed=plTestParsed_();parsed.systems='Solar';
+  return plLeadPayload_(message,parsed,{html:'',meta:{found:[],degraded:true}});
+ })();
+ plAssert_(/; systems: Solar/.test(degraded.Description),'systems still shown when the browser view degraded');
+ plAssert_(/BROWSER VIEW UNAVAILABLE/.test(degraded.Description),'and the degraded warning is still there');
+
+ // ---- 6. 超长 systems 截断,不能撑破字段 ----
+ var huge=payloadWith(new Array(400).join('x'),['Plenti_Systems__c']);
+ plAssert_(huge.Plenti_Systems__c.length<=255,'systems is truncated to the Text(255) limit');
+ plAssert_(/\[TRUNCATED\]$/.test(huge.Plenti_Systems__c),'and marked, with the marker counted inside the limit');
+
+ // ---- 7. 端到端:真的进 POST ----
+ plTestClearState_();
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+  var linked=plTestMessage_('trusted-referral-with-link'),posts=[],real=ivReq_,realQuery=ivQuery_;
+  plLeadFieldMap_.cache=null;
+  ivReq_=function(path,method,data){
+   if(path==='sobjects/Lead/describe')return {fields:[{name:'Plenti_Systems__c',createable:true}]};
+   if(method==='post')posts.push(data);
+   return {id:'00Qr13000000001AAA'};
+  };
+  ivQuery_=function(q){if(/WHERE Id='/.test(q))return [{Id:'00Qr13000000001AAA'}];return [];};
+  try{
+   plProcess_(linked,false);
+   plAssertEq_(posts.length,1,'one Lead created');
+   plAssertEq_(posts[0].Plenti_Systems__c,'Battery, Solar','the parsed systems reach Salesforce as a field');
+   plAssert_(/; systems: Battery, Solar/.test(posts[0].Description),'and in the summary');
+   plAssertEq_(posts[0].LastName,'Fixture Example','the whole name is in LastName, unsplit');
+  }finally{ivReq_=real;ivQuery_=realQuery;plLeadFieldMap_.cache=null;}
+ });
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 16 systems-visibility cases (dedicated field plus Description fallback)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiSystemsVisible();
  testPlentiReceivedAt();
  testPlentiFieldSelfCheck();
  testPlentiSenderOverride();

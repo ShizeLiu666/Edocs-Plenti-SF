@@ -1222,6 +1222,111 @@ review 解除**不会回写 Messages 表**(D-018)—— 那张表是处理时的
 
 ---
 
+## D-025 systems 落到可见处;姓名写入方式的确认
+
+**日期** 2026-09-10 · **决定人** Jack(方式由我判断) · **阶段** R13,已实现
+
+### ① systems:专用字段 + Description 备份,两处都写
+
+**问题**:browser view 抓到 name / address / systems 三项,前两项进了标准字段,
+**systems 只落在 `Plenti_Parsed_JSON__c` 里** —— 跟进的人在 Lead 页面上看不到
+客户想装什么,总不能让他去读 JSON。
+
+**决定:新建 `Plenti_Systems__c`,同时在 Description 摘要里带一份。**
+
+为什么要专用字段而不是只塞 Description:
+
+1. **可报表、可筛选。** Description 是自由文本,分组和筛选都做不了。
+   规格 §1 要求每季度末后 10 个工作日内提交 Schedule 3 报告,PLT002 的
+   线索→报价转化率也可能要按系统类型切分 —— 这两件事都需要一个能 group by
+   的字段。
+2. **列表视图能显示。** 跟进的人在列表里就能看到,不用点进每条记录。
+3. 从 Description 里把值反解析出来是脆的,而我们已经在 R11 上吃过
+   "字段名硬编码在字符串里"的亏。
+
+为什么**还要**在 Description 里留一份:
+
+字段现在**还没建**。按 D-023 的探测机制,字段不存在时运行期会自动跳过 ——
+如果只写字段,那么在 Jack 建好之前 systems 依旧只存在于 JSON 里,问题没解决。
+Description 那份保证**立刻可见**,而且字段建好之后它也不多余:摘要一行里
+同时有收件时间、解析字段数和系统类型,一眼就够。
+
+⚠️ **这不违反 D-012。** 那条禁的是"referralId 之外的**内部标识符**"
+(application ID、broker ID、客户编号)。systems 是**客户需求本身**,
+正是 D-012 明确允许的"销售必要信息"。
+
+Description 现在长这样:
+
+```
+[Intake: <msgId>] Plenti referral received <ISO8601>; 3 fields parsed; systems: Battery, Solar
+```
+
+仍然是一行,marker 仍在最前(D-013 的承重结构),仍不含邮件正文。
+
+#### 字段规格(交给 agent 建)
+
+| 项 | 值 |
+|---|---|
+| Object | **Lead** |
+| Data Type | **Text** |
+| Length | **255** |
+| Field Label | `Plenti Systems` |
+| Field Name | `Plenti_Systems` → API 名 `Plenti_Systems__c` |
+| Required | 否 |
+| Unique / External ID | **都不勾** |
+| Description | `客户在 Plenti 转介里选择的可再生能源系统,取自 browser view 页面的 Renewable systems 字段。逗号分隔,例如 "Battery, Solar"。超长截断并标注 [TRUNCATED]。` |
+| FLS | 对集成用的 Permission Set 可见且可编辑;对跟进人可见 |
+| Page Layout | **加到 Lead 布局上** —— 这个字段存在的全部意义就是让人看见 |
+
+⚠️ **为什么是 Text 而不是多选 Picklist**:多选 Picklist 报表更好用,但
+**写入一个不在选项列表里的值会让整个请求失败** —— 正是 R11 那一类事故。
+目前只见过 `Battery, Solar` 一种取值,值域还不知道。先用 Text 兜住,
+等积累若干真实转介、看清完整值域之后再评估要不要迁到多选 Picklist。
+
+### ② 姓名:代码是对的,问题在页面布局
+
+Jack 观察到 Lead 页面上 Name 显示 `Gabby TEST`,但 First Name / Last Name
+两格都是空的。
+
+**实跑确认代码正确**:
+
+```
+payload 里与姓名相关的键:
+  LastName = "Gabby TEST"
+  FirstName 存在吗? false
+```
+
+整串写进 `LastName`,`FirstName` **根本不发送**(不是发空串)。所以记录里
+Last Name 就是 `Gabby TEST`,Name 作为复合字段显示同一个值,两者一致。
+
+**页面上 Last Name 显示为空是布局层面的事,不是数据问题。** Lead 的 Name 在
+Lightning 里是复合字段,布局怎么摆、子字段怎么渲染,和记录里存了什么是两回事。
+
+**不改代码。** 但为了以后不用靠肉眼判断,`plTestVerifyLead_` 的回读列表加上了
+`Name` / `FirstName` / `LastName` —— **回读一次才是权威答案**,页面显示不是。
+
+姓名不拆分的原因见 D-019:页面只给一个 "Customer name",拆 first/last 是猜,
+而且会切错复合姓氏。Salesforce 的 Name 显示效果完全一样。
+
+### 顺带:两道守卫的调整
+
+**① 自定义字段白名单拆成"必需 / 可选"两类。**
+原来一份清单叫"确认存在的字段",但 `Plenti_Received_At__c`(生产未建)和
+`Plenti_Systems__c`(尚未建)都是探测门控的可选字段 —— 它们**允许暂时不存在**。
+混在一起会让守卫的断言语义不成立。现在:
+
+- **必需**(5 个):无条件写入,缺一个整个请求就失败
+- **可选**(2 个):org 里没有就自动跳过;但**必须显式列出**,
+  否则等于没人审过就混进了写入路径
+
+**② 新增:孤儿测试用例守卫。**
+定义了却没接进 `runPlentiRegressionTests` 的用例是**静默失效**的 ——
+套件照常全绿,但那部分根本没跑。本轮我就漏接了一次入口,靠人工核对才发现。
+现在 `test/offline.cjs` 强制断言每个 `testPlenti*` 函数都被入口调用,
+已反向验证:摘掉一行入口调用,套件立刻变红。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,

@@ -164,23 +164,53 @@ for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTest
 // 和 plLeadPayload_ 实际推导出来,改了代码自动跟着变,不会漂移。
 // ──────────────────────────────────────────────────────────────
 {
-  // Sunterra sandbox 上确认存在的自定义字段,除此之外只能用标准字段。
-  const ALLOWED_CUSTOM_FIELDS = [
+  // Sunterra org 里**确认已建**的自定义字段。代码无条件写这些,缺一个整个请求就失败。
+  const REQUIRED_CUSTOM_FIELDS = [
     'Contact_Attempt_Count__c',
     'Plenti_Browser_View_HTML__c',
     'Plenti_Lead_ID__c',
     'Plenti_Parsed_JSON__c',
-    'Plenti_Raw_Email__c',
-    'Plenti_Received_At__c'   // [R12] 沙箱已建;org 里没有时运行期会自动跳过
+    'Plenti_Raw_Email__c'
   ];
+  // 可选字段:org 里没有时按 D-023 的 describe 探测自动跳过,不会让请求失败。
+  // 它们允许暂时不存在,但**必须列在这里**,否则等于没人审过就混进了写入路径。
+  const OPTIONAL_CUSTOM_FIELDS = [
+    'Plenti_Received_At__c',   // [R12] 沙箱已建,生产未建
+    'Plenti_Systems__c'        // [R13] 待建;未建时 Description 里有备份
+  ];
+
   props.set('INTAKE_ADMIN_ID', '005000000000000AAA');
-  const used = context.plLeadFieldsUsed_().map((f) => f.name);
+  const used = context.plLeadFieldsUsed_();
   context.plLeadFieldMap_.cache = null;   // 探测缓存不能渗进后面的用例
   props.clear();
-  const custom = used.filter((n) => n.endsWith('__c')).sort();
-  assert.deepEqual([...custom], ALLOWED_CUSTOM_FIELDS,
-    `the code must only touch custom fields that exist in the org. Unexpected: ${custom.filter((n) => !ALLOWED_CUSTOM_FIELDS.includes(n)).join(', ') || '(none)'}`);
-  console.log(`PASS: custom-field allowlist — ${custom.length} custom fields, all confirmed to exist`);
+
+  const custom = used.filter((f) => f.name.endsWith('__c'));
+  const optional = custom.filter((f) => f.optional).map((f) => f.name).sort();
+  const required = custom.filter((f) => !f.optional).map((f) => f.name).sort();
+
+  assert.deepEqual([...required], REQUIRED_CUSTOM_FIELDS,
+    `unconditionally-written custom fields must all exist in the org. Unexpected: ${required.filter((n) => !REQUIRED_CUSTOM_FIELDS.includes(n)).join(', ') || '(none)'}`);
+  assert.deepEqual([...optional], OPTIONAL_CUSTOM_FIELDS,
+    `every optional custom field must be declared here, so a new one cannot slip into the write path unreviewed. Unexpected: ${optional.filter((n) => !OPTIONAL_CUSTOM_FIELDS.includes(n)).join(', ') || '(none)'}`);
+  console.log(`PASS: custom-field allowlist — ${required.length} required (must exist), ${optional.length} optional (degrade if absent)`);
+}
+
+// ──────────────────────────────────────────────────────────────
+// 4c. 每个测试函数都必须被入口调用
+//
+// 定义了却没接进 runPlentiRegressionTests 的用例是**静默失效**的:套件照常
+// 全绿,但那部分根本没跑。加用例时漏接一行入口很容易发生,这里强制检查。
+// ──────────────────────────────────────────────────────────────
+{
+  const src = read(SRC, 'PlentiTests.gs');
+  const defined = [...src.matchAll(/^function (testPlenti\w+)/gm)].map((m) => m[1]);
+  const entry = src.slice(src.indexOf('function runPlentiRegressionTests'));
+  const called = [...entry.matchAll(/(testPlenti\w+)\(\)/g)].map((m) => m[1]);
+  const orphans = defined.filter((n) => !called.includes(n));
+  assert.deepEqual([...orphans], [],
+    `these test functions are defined but never called from runPlentiRegressionTests, so they silently do not run: ${orphans.join(', ')}`);
+  assert.ok(defined.length > 0, 'the scan must actually find test functions, otherwise this guard is vacuous');
+  console.log(`PASS: all ${defined.length} Plenti test functions are wired into the entry point`);
 }
 
 // ──────────────────────────────────────────────────────────────
