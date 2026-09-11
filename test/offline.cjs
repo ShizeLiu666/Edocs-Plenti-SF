@@ -556,4 +556,101 @@ console.log('PASS: sheet logging is optional and never fails the run');
   console.log(`PASS: Q17 — window-aligned loop, minimal out-of-scope state (${stored.length} bytes), purge bounded by the same lower`);
 }
 
+// ──────────────────────────────────────────────────────────────
+// 11. [D-041] 单轮成本跟新邮件量成正比,而不是跟窗口内的邮件量
+//
+// 首次生产运行 56 个会话用了 221 秒(预算 220)。这里锁住两件事:
+//   已处理的邮件不再读邮件头;状态没变的会话不再同步标签。
+// ──────────────────────────────────────────────────────────────
+{
+  const recent = new Date(Date.now() - 3600e3).toISOString();
+  const headerReads = {};
+  const labelOps = {};
+  const getMessagesCalls = {};
+  const noise = (id) => ({
+    getId: () => id,
+    getSubject: () => 'Monthly newsletter',
+    getFrom: () => 'eDocs Group <edocs@example.org>',
+    getDate: () => new Date(recent),
+    getPlainBody: () => 'An ordinary newsletter with no referral link.\n',
+    getBody: () => '',
+    getHeader: (name) => {
+      headerReads[id] = (headerReads[id] || 0) + 1;
+      return ({ To: 'eDocs <edocs@example.org>', 'X-Original-Sender': 'news@elsewhere.example',
+        'X-Original-Authentication-Results': 'mx.example.org; dmarc=pass header.from=elsewhere.example' })[name] || '';
+    },
+    getRawContent: () => { throw new Error('getRawContent must not be called'); },
+    getThread: () => { throw new Error('getThread must not be called'); }
+  });
+  const makeThread = (name, ids) => {
+    const messages = ids.map(noise);
+    return {
+      name,
+      getMessages: () => { getMessagesCalls[name] = (getMessagesCalls[name] || 0) + 1; return messages; },
+      addLabel: () => { labelOps[name] = (labelOps[name] || 0) + 1; },
+      removeLabel: () => { labelOps[name] = (labelOps[name] || 0) + 1; }
+    };
+  };
+  const threads = [
+    makeThread('done', ['d41-done']),
+    makeThread('review', ['d41-review']),
+    makeThread('new', ['d41-new']),
+    makeThread('error', ['d41-error']),
+    makeThread('cleared', ['d41-cleared'])
+  ];
+  const reset = () => { for (const o of [headerReads, labelOps, getMessagesCalls]) for (const k of Object.keys(o)) delete o[k]; };
+  const runOnce = () => { reset(); let calls = 0; gmail.search = () => (calls++ === 0 ? threads : []); context.runIntakeV2(); };
+
+  props.clear();
+  for (const [k, v] of Object.entries({
+    INTAKE_V2_ENABLED: 'true', EDOCS_ADAPTATION_VALIDATED: 'true',
+    INTAKE_V2_START: '2026-09-07T00:00:00+09:30', INTAKE_V2_WATERMARK: '2026-09-10T00:00:00.000Z',
+    EDOCS_GROUP_ADDRESS: 'edocs@example.org', INTAKE_RECIPIENT_ALLOWLIST: 'edocs@example.org',
+    INTERNAL_DOMAIN: 'example.org', PLENTI_TRUSTED_SENDERS: '@plenti.example',
+    INTAKE_MAILBOX: 'edocs-copy@example.org', PLENTI_LEAD_SOURCE: 'Plenti Referrals'
+  })) props.set(k, v);
+  const seed = {
+    'd41-done': { state: 'done', scope: 'out-of-scope', date: recent },
+    'd41-review': { state: 'review', kind: 'review', scope: 'unlisted-sender-with-link', leadCandidate: true, date: recent },
+    'd41-error': { state: 'error', leadCandidate: true, reason: 'fictional transient failure', date: recent },
+    'd41-cleared': { state: 'review', kind: 'referral', created: true, record: '00Qd41000000001AAA', leadCandidate: true, supplied: {}, date: recent }
+  };
+  for (const [id, st] of Object.entries(seed)) props.set(`IV2_MSG_${id}`, JSON.stringify(st));
+  gmail.getMessageById = () => null;           // 让 ivRefreshOutstanding_ 跳过,只测主循环
+  gmail.getUserLabelByName = (name) => ({ name });
+  sheets.openById = () => { throw new Error('no sheet in this section'); };
+  const realQuery = context.ivQuery_;
+  const soql = [];
+  // 例外 Lead 上出现了人填的电话 → review 解除
+  context.ivQuery_ = (q) => { soql.push(q); return [{ Id: '00Qd41000000001AAA', Phone: '0400000000', Email: null, MobilePhone: null, Status: 'New', IsConverted: false }]; };
+
+  try {
+    // ── 第一轮 ──
+    runOnce();
+    assert.ok(!headerReads['d41-done'] && !headerReads['d41-review'] && !headerReads['d41-cleared'],
+      `already-processed messages must not read headers any more: ${JSON.stringify(headerReads)}`);
+    assert.ok(headerReads['d41-new'] > 0, 'a new message still goes through the allowlist and sender checks');
+    assert.ok(headerReads['d41-error'] > 0, 'an error state is re-evaluated in full');
+    assert.ok(!labelOps.done, 'a thread whose state did not change is not re-synced');
+    assert.equal(getMessagesCalls.done, 1, 'and costs exactly one getMessages call');
+    assert.equal(labelOps.new, 3, 'a thread with a newly processed message is synced (three labels)');
+    assert.equal(labelOps.error, 3, 'a retried error thread is synced');
+    assert.equal(labelOps.cleared, 3, 'a thread whose review was cleared is synced');
+    assert.equal(JSON.parse(props.get('IV2_MSG_d41-cleared')).state, 'done', 'the review really was cleared');
+    assert.equal(labelOps.review, 3, 'a thread still in review is synced every run — the Review label self-heals');
+    assert.equal(soql.length, 1, 'only the review-with-Lead message costs a SOQL');
+
+    // ── 第二轮:什么都没变 ──
+    soql.length = 0;
+    runOnce();
+    assert.deepEqual({ ...headerReads }, {}, 'a steady-state run reads no headers at all');
+    assert.deepEqual(Object.keys(labelOps).sort(), ['review'],
+      'a steady-state run only re-syncs threads that still carry a review — the exceptions');
+    assert.equal(soql.length, 0, 'and spends no SOQL — the cleared Lead is done now');
+    console.log('PASS: D-041 — steady-state run reads no headers and only syncs review threads');
+  } finally {
+    context.ivQuery_ = realQuery;
+  }
+}
+
 props.clear();

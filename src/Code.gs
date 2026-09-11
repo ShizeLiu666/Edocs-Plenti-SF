@@ -320,7 +320,12 @@ function runIntakeV2(){
  var threads=GmailApp.search(query,offset,50);if(!threads.length){done=true;break;}
  for(var i=0;i<threads.length;i++){
  stats.threads++;
- var msgs=threads[i].getMessages(),inScope=false;
+ // [D-041] 单轮成本必须跟**新邮件量**成正比,而不是跟 48 小时窗口的邮件量成正比。
+ // 首次生产运行 56 个会话用了 221 秒,预算 220 秒;满窗口时扫不完 → watermark 不前进
+ // → 窗口更大 → 永远扫不完,清理也停(D-034)。两处改动:
+ //   1. 状态检查挪到白名单检查之前。已处理的邮件不再读收件人头,只读一次状态。
+ //   2. 标签只同步"需要同步"的会话,见下方 syncThread。
+ var msgs=threads[i].getMessages(),syncThread=false;
  for(var j=0;j<msgs.length;j++){
   // [Q17 第 1 步] 以扫描窗口下界 lower 为界,而不是 INTAKE_V2_START(cut)。
   // Gmail 检索按 thread 返回,getMessages() 会把 thread 里**所有**消息都带出来,
@@ -331,29 +336,43 @@ function runIntakeV2(){
   // 回来、被当成新邮件重新处理,Messages 表重复写行。见 D-032。
   // lower>=cut 恒成立,原来那道 cut 检查被这一道完全覆盖。
   if(msgs[j].getDate().getTime()<lower)continue;
+  var old=ivGet_(msgs[j].getId());
+  if(old&&old.state!=='error'){
+   // [D-041] 已处理过。白名单检查不必再做:状态只会为命中白名单的邮件写入
+   // (主循环与 R9 入口都先查白名单)。唯一可能要动的是"建出了 Lead 的 review",
+   // 先用已读到的状态筛一道,免得 plRefreshReview_ 再读一次属性。
+   if(old.state==='review'){
+    if(old.record&&plRefreshReview_(msgs[j]))syncThread=true;
+    // 仍挂着 review 的会话每轮都同步:保住 Review 标签的**自愈**。旧代码每轮同步
+    // 所有会话,某一轮同步失败下一轮自然补上;只同步有变化的会话会失去这一点,
+    // 而 Q18 之后 Review 是唯一还要紧的标签。review 只留给例外,量很少。
+    else syncThread=true;
+   }
+   continue;
+  }
   // [R1] 不命中白名单 → 整条跳过,不写状态、不打标签、不占 Properties。
   // [R7] 这类邮件也**不写进 Messages 页** —— 共用邮箱里它们占多数,全记会把表
   // 撑爆,而且我们没有理由留存这些邮件的内容。
   var recipient=plMatchedRecipient_(msgs[j],allow);
   if(!recipient){stats.skipped++;continue;}
-  inScope=true;
-  plRefreshReview_(msgs[j]);
-  var old=ivGet_(msgs[j].getId());
-  if(!old||old.state==='error'){
-   var detail={},result=plProcess_(msgs[j],false,detail);count++;stats.processed++;
-   messageRows.push(ivMessageLogRow_(msgs[j],recipient,result,detail));
-   // [R14] 用 createdNow 而不是 created —— created 现在是持久语义(这封邮件建过),
-   // 用它计数会让 error 重试把同一条 Lead 重复算进月度对账。
-   if(result&&result.createdNow&&result.record)stats.created++;
-   // 摘要带上消息 ID:L-01 触发后要删的键是 IV2_CREATE_<消息 ID>,
-   // Sheet 是长期留底,不带 ID 的话事后无从下手(console.log 保留期短)。
-   if(result&&result.state==='error'){stats.failed++;if(stats.errors.length<5)stats.errors.push(msgs[j].getId()+': '+String(result.reason||'').slice(0,200));}
-  }
+  // 新邮件或 error 重试:本轮处理,状态变了,会话要同步。
+  syncThread=true;
+  var detail={},result=plProcess_(msgs[j],false,detail);count++;stats.processed++;
+  messageRows.push(ivMessageLogRow_(msgs[j],recipient,result,detail));
+  // [R14] 用 createdNow 而不是 created —— created 现在是持久语义(这封邮件建过),
+  // 用它计数会让 error 重试把同一条 Lead 重复算进月度对账。
+  if(result&&result.createdNow&&result.record)stats.created++;
+  // 摘要带上消息 ID:L-01 触发后要删的键是 IV2_CREATE_<消息 ID>,
+  // Sheet 是长期留底,不带 ID 的话事后无从下手(console.log 保留期短)。
+  if(result&&result.state==='error'){stats.failed++;if(stats.errors.length<5)stats.errors.push(msgs[j].getId()+': '+String(result.reason||'').slice(0,200));}
  }
- // [R1] 整条 thread 都不在范围内就不同步标签 —— 共用邮箱里这类 thread 占多数,
- // 每条省下 3 次 Gmail API 调用。代价:若日后把某地址移出白名单,那些 thread
- // 的旧标签不会被自动清除,需人工处理。
- if(inScope)ivSyncLabels_(threads[i]);
+ // [D-041] 只同步:本轮处理过邮件的、review 被解除的、仍挂着 review 的会话。
+ // 其余会话的标签由状态决定,状态没变,标签就不用动 —— 每条省下 7 次 Gmail 调用
+ // (getMessages + 三个标签各一次查找和增删)。
+ // 不在这里同步的另外两种变化:ivRefreshOutstanding_ 处理的会话由它自己同步;
+ // Q17 清理删的是 out-of-scope 状态,本来就不影响标签。
+ // [R1] 旧注释的代价仍然成立:把某地址移出白名单后,旧标签不会被自动清除。
+ if(syncThread)ivSyncLabels_(threads[i]);
  if(Date.now()-began>=220000)break;}
  if(i<threads.length)break;offset+=threads.length;if(threads.length<50){done=true;break;}}
  var all=p.getProperties(),errors=Object.keys(all).some(function(k){if(k.indexOf('IV2_MSG_')!==0)return false;try{return JSON.parse(all[k]).state==='error'}catch(e){return true}});
