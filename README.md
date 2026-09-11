@@ -98,7 +98,11 @@ Google Groups 一定保留了 `X-Original-Sender` 和 `X-Original-Authentication
 **怎么发现:** 运行日志 Sheet 汇总页的 `Failures` 列**连续多轮非零** = watermark 已冻结,
 倒计时在走。错误摘要列里有消息 ID。处理方式见 DECISIONS L-01。
 
-### 2. 触发器的失败通知设为「立即通知」
+### 2. 触发器:用收件邮箱那个账号建,失败通知设为「立即通知」
+
+⚠️ **触发器以创建者身份运行,`GmailApp` 读的是创建者自己的邮箱。** 必须用接收组邮件
+的那个账号来建,失败通知也会发到这个账号 —— 确认有人看它(D-040 ⑤)。
+
 
 建时间驱动触发器时,Failure notification 选**立即**(默认是每日汇总)。
 Script Properties 真的写满时,**error 状态本身都写不进去**,`Failures` 列不会亮,
