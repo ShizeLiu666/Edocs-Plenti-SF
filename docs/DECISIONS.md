@@ -2335,6 +2335,80 @@ Lead 的 Email Alert 在创建那一刻没有收件地址。**但这不等于安
 
 ---
 
+## D-036 生产排查的回执;POST 之前能不能知道会被拒
+
+### ① 回执(Jack,2026-09-11)
+
+- D-035 ① 的实现认可:只写不读、上锁前校验受限 picklist、降级落 review `[NOT ROUTED]`。
+  沙箱上每条都是 `[NOT ROUTED]` 可以接受。
+- **字段权限(FLS)排查中。** 最近新建、都要查集成用户编辑权限的:`Lead_Category__c`
+  (Lily 09-04 建)和 **`Plenti_*` 六个字段(Jack 09-11 在生产建)**。
+- **Q20:兜底 Owner 的语义认同**;前提(Round Robin 进入条件里有没有 Owner)agent 在查。
+- **Q21:agent 重点查"会不会拒绝保存"**,包括 Validation Rules。
+- **Q22 已关闭。** 两条 Workflow Rule 的 Email Alert 收件人都是 **Lead Owner**,
+  Additional Emails 为空,**不会发给客户**。但都是 **Time-Dependent**(1 小时后 / 1 天后)
+  —— D-035 ③ 担心的时间差是真实存在的,只是这次收件人设置挡住了。
+  连带:Owner 在动作触发时才取值,所以 Round Robin 接住了就提醒被分派的人;
+  **没接住就提醒 `INTAKE_ADMIN_ID`** —— 这是 Q20 继续设 OwnerId 的又一条理由
+  (不设的话提醒会发给没人登录的集成用户)。
+  ⚠️ 以后有人改这两条规则的收件人,这个结论就要重看。
+
+### ② 如果 Governance Flow 会拒绝保存,POST 之前能知道吗?
+
+**结论:运行时没有可靠的办法事先知道。能做的是两件事 —— 上线前一次性查清楚,
+以及让"撞上去"变便宜,而不是卡进 L-01。**
+
+**运行时预检的几条路,都走不通或不值得:**
+
+| 办法 | 为什么不行 |
+|---|---|
+| REST 的"只校验不保存" | **不存在。** sObject 创建没有 validate-only / dry-run 参数 |
+| 读 Flow / Validation Rule 的元数据自己判断 | 要 Tooling API 与 "View Setup" 权限,违背集成用户最小权限;而且等于在脚本里重新实现一遍 Salesforce 的公式与 Flow 引擎 |
+| Composite 请求里先建再故意失败,靠 allOrNone 回滚 | 取巧:回滚后成功那一步的返回怎么表示我不确定;每条 Lead 多一倍调用;预检通过、正式 POST 仍可能失败,竞态消除不了 |
+| 部署 Apex 用 Savepoint 试建 | 本项目不往 Salesforce 部署任何东西(规格 §5.3 / §5.9) |
+
+**能提前知道一部分的:** describe 里 `nillable=false`、`defaultedOnCreate=false`、
+可创建的字段就是数据库层的必填项。可以加进 `plTestDescribeLead` 自检,核对 payload
+都带上了。**但 Validation Rule 和 Flow 的逻辑 describe 里看不到**,这一招只挡得住
+`REQUIRED_FIELD_MISSING`。
+
+**所以真正的防线是两层:**
+
+**第一层:上线前一次性查清(Q21,agent 在做),再加一条"金丝雀"。** 读规则只能
+看出写了什么;**实际撞一次才知道**。用**集成用户的 token**(Flow 可能按运行用户区别
+对待)、**完全照 Plenti Lead 的形状**(没有 Email、LeadSource `Plenti Referrals`、
+分类 `New Sales Enquiry`)在生产建一条虚构 Lead。副作用要提前和 Lily 说好:
+Round Robin 会把它分给一个真人、轮值顺序往后挪一格;1 小时后的提醒会发给那个人。
+**建完立刻删** —— 删除记录会一并清掉排队中的 Time-Dependent 动作。
+
+**第二层:让被拒变成确定的结果,不再卡进 L-01。** 这是关键洞察:**被拒不是
+"结果不确定"。** POST 拿到带 Salesforce 错误码的 4xx,说明整个事务已回滚,
+**什么都没建**。创建锁要防的只是"POST 成功了但我们没收到回应"(超时、网络中断),
+被拒不属于这种情况。
+
+| POST 结果 | 含义 | 锁 |
+|---|---|---|
+| 201 | 建成了 | 写 `created`(不变) |
+| 4xx + 错误码(`FIELD_CUSTOM_VALIDATION_EXCEPTION` / `CANNOT_EXECUTE_FLOW_TRIGGER` / `REQUIRED_FIELD_MISSING` / `DUPLICATES_DETECTED` …) | **确定没建** | **释放**,落 error,reason 原样带上错误码和规则的报错文字 |
+| 超时、网络异常、5xx | **不确定** | 保留(今天的 L-01) |
+
+被拒落 **error**,不落 review:被拒几乎都是配置层面的,每封都会一样被拒;error 会
+自动重试,**配置修好后全部自愈**,不需要人逐条重跑。代价是 watermark 冻结 —— 但
+D-034 的倒计时按周算,PLT001 按天算,配置本来就必须在一天内修好。
+
+⚠️ **不只是 Governance。** After Save 的 Record-Triggered Flow 和我们的插入在同一个事务里,
+**Round Robin 自己出了未处理的错误(比如轮值名单里没有可用的人),整条插入同样被回滚**,
+返回 `CANNOT_EXECUTE_FLOW_TRIGGER`。今天这也会卡进 L-01。
+
+⚠️ **Governance 的名字里有 "Draft"。** 它上线后还可能改,上线前查一次不代表以后都安全。
+所以第二层不管第一层的结论如何都值得做。
+
+**建议:** 第二层就是 L-01 原计划 Phase 4 做的那项改进,现在应提到**开触发器之前**。
+改动集中在 `plCreateLead_` 和 `ivReq_` 的错误区分上。**未实施,等 Jack 定。**
+我对上表错误码的把握是"比较确定",具体以金丝雀和 Salesforce 实际返回为准。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -2574,9 +2648,9 @@ watermark 的校验保持原样。
 | ~~Q17~~ | ✅ **已关闭**(2026-09-11)—— 三步都已实施,见 D-032。原提议里"窗口外的也不会再被扫到"按旧代码**不成立**(Gmail 按 thread 返回,旧邮件会随新邮件回到循环),第 1 步正是它成立的前提。原文:🔴 **Script Properties 约 6 个工作日写满(L-04),上线前必须修。** 建议组合拳:① 主循环只处理扫描窗口内的消息(不再遍历会话里的旧消息);② out-of-scope 状态只存最小形态(约 50 字节,而不是 454);③ 清理扫描窗口之外的 out-of-scope 状态 —— 它们不参与标签计算,也不会再被扫到。三条都要动 `runIntakeV2`(Code.gs)。另一条路是规格 §9 的外部状态存储,改动大得多 | 无 | §9 / D-031 / D-032 |
 | ~~Q18~~ | ✅ **已关闭**(2026-09-11)—— 见 D-033。转介重发按 D-026 仍落 review;out-of-scope 改为 done、auditMissing 不列为例外,**Jack 已确认**(D-034)。原文:**review 的语义要不要改成"脚本需要人帮忙",而不是"业务还没处理完"?** 即:干净建出的 referral 直接落 `done`,`review` 只留给降级、来源冲突、可疑发件人、错误。这样同时解决 D-031 的三处影响:合并会话里的 Review 平时不亮,**一旦亮就说明真有事**(包括同标题的冒充邮件);轮询只针对少数例外;"待补联系方式"整体交给 Salesforce List View | 无 | D-024 / D-029 / D-031 / D-033 |
 | Q19 | **永久状态的长期累积。** D-032 只清理 out-of-scope。仍会累积:① internal / ignore / notice 等 `done` 状态,每条约 173 字节,**量没有数据**;② 每条建出的 Lead 占约 472 字节(状态 368 + 创建锁 104 —— 最初估"约一年"时漏算了锁),按 5 条/天约 **9 个月**写满。写满的表现是**静默的停摆**,且会让 error 冻结的倒计时越来越短 —— 分析与准备清单见 **D-034**。建议先加用量读数,按用量(60%)而不是日期触发 (a)+(b)+(c) | 按用量触发,不阻塞上线 | §9 / D-032 / D-034 |
-| Q20 | **还该不该设 `OwnerId`?** 建议继续设,语义改为"Round Robin 没接住时的兜底 Owner"(D-035 ②)。**先核实:** ① Round Robin 的进入条件里有没有 Owner(有的话结论可能反过来);② 生产有没有 Active 的 Lead Assignment Rule(REST 缺省时是否执行,我不确定) | **开触发器前** | D-035 |
-| Q21 | **Lead Entry Governance - Draft(Before Save)到底做什么?** 需要它的规则:会不会改 `Lead_Category__c` / `Description` / `Plenti_Lead_ID__c`,**会不会用 Custom Error 拒绝保存**(Plenti 的 Lead 没有 Email)。拒绝保存会让创建锁卡在 `requested`,掉进 L-01 并冻结 watermark | **开触发器前** | D-035 / L-01 |
-| Q22 | **两条 Workflow Rule(Remind to convert …)会不会给客户发信?** 等 agent 结果。要看动作类型、收件人、是否基于时间、进入条件是否匹配我们的 Lead。创建时没有 Email 不代表安全(基于时间的动作到点时用当时的 Email) | **开触发器前** | D-035 |
+| Q20 | ⏳ **兜底语义 Jack 已认同(D-036)**,只等前提核实。**还该不该设 `OwnerId`?** 建议继续设,语义改为"Round Robin 没接住时的兜底 Owner"(D-035 ②)。**先核实:** ① Round Robin 的进入条件里有没有 Owner(有的话结论可能反过来);② 生产有没有 Active 的 Lead Assignment Rule(REST 缺省时是否执行,我不确定) | **开触发器前** | D-035 |
+| Q21 | **Lead Entry Governance - Draft(Before Save)到底做什么?** 需要它的规则:会不会改 `Lead_Category__c` / `Description` / `Plenti_Lead_ID__c`,**会不会用 Custom Error 拒绝保存**(Plenti 的 Lead 没有 Email)。拒绝保存会让创建锁卡在 `requested`,掉进 L-01 并冻结 watermark。**Round Robin 自己出错也会回滚整条插入**(D-036)。agent 在查,含 Validation Rules。建议把 L-01 的"确定失败释放锁"提到开触发器之前(D-036 ②) | **开触发器前** | D-035 / L-01 |
+| ~~Q22~~ | ✅ **已关闭**(2026-09-11,D-036)—— 两条 Email Alert 收件人都是 Lead Owner,Additional Emails 为空,不发给客户;都是 Time-Dependent(1 小时 / 1 天)。有人改收件人时要重看 | 无 | D-035 / D-036 |
 | ~~Q16~~ | ✅ **已关闭**(2026-09-09)—— 沙箱已建 Date/Time 字段并放开写入,值取自 `message.getDate()`,见 D-023。⚠️ **生产上仍未建**,探测保证不卡住,但建好之前生产无法从专用字段统计 PLT001。原文:**要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |
