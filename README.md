@@ -256,15 +256,19 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **Lead Description 上限 32,000 字符**,超出报错。
 - **本脚本不发送首次回应邮件。** Salesforce 既有的自动回复、分配和其他
   Flow 可能被创建动作触发,需单独验证。
-- 标签的两态含义(D-024):`SF-Lead-Created` + `SF-Lead-Review` = **待补联系
-  方式**;Review 熄灭、只剩 Created = **已补全**。解除信号是 Lead 上出现了
-  `Email` / `Phone` / `MobilePhone` 任一项 —— Plenti 一条都不给,所以非空只
-  可能是人填的。
+- **`review` = 脚本需要人帮忙**(Q18 / D-033)。干净建出的 referral 直接 `done`,
+  只亮 `SF-Lead-Created`;**"待补联系方式"看 Salesforce List View,不看 Gmail 标签。**
+  `SF-Lead-Review` 只在例外时亮:降级(没解析出姓名)、邮件与页面说法不一、
+  转介重发(token 命中别的邮件建的 Lead)、强制创建、带链接的可疑发件人、error。
+  例外的 review 在 Lead 上出现人填的联系方式、被转换或标为 Unqualified 后自动解除。
+- **Messages 表**:SF Lead ID 列是可点的链接(写入时生成);`Final state` 列里
+  `created + review` 表示建出了 Lead 但需要人看。以 `= + - @` 开头的内容一律按文本
+  存,防公式注入(D-033)。
 - 并非每条 review 都对应一条 Salesforce 记录 —— `SF-Lead-Review` 标签既
   可能是已创建的待审核 Lead,也可能是尚未唯一匹配的邮件。
 - **`SF-Lead-Review` 标签只留给带 Plenti browser-view 链接的邮件**(D-027)。
-  没有链接的普通业务邮件仍会落 review 状态、在 Messages 表里留一整行(含完整
-  正文和原因),但**不占标签** —— 否则进组当天真正的 lead 会被业务邮件淹掉。
+  没有链接的普通业务邮件落 `done` 状态(Q18 前是 review)、在 Messages 表里留一整行
+  (含完整正文和原因),但**不占标签** —— 否则进组当天真正的 lead 会被业务邮件淹掉。
   可见面从 Gmail 标签移到 Messages 表,可见性本身没有降低。
 - **手动转发的 Plenti 邮件会被单独标为 `forwarded`**,不会被当成疑似伪造。
   判据是**没有 `X-Original-Sender`**(D-030)—— 不能看 `From`:发件域 DMARC
@@ -279,6 +283,7 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
 - **Plenti 不提供任何联系方式**,电话和邮箱只在 Plenti Portal 里,而 Portal
   每次登录都要双重验证、账号是个人账号,无法自动化。因此**每一条 Plenti 线索
   都必须有人去 Portal 取联系方式**,这是必经状态而非边缘情况(D-024)。
+  Q18 之后这个工作队列在 Salesforce List View 里,不再占用 review。
 - `INTAKE_V2_START` 必须配置且可解析,否则 `runIntakeV2` 直接抛错停止 ——
   脚本**不会**在缺配置时回扫历史邮件(DECISIONS TODO-3 修复了模板的这个缺口)。
 - ✅ ~~Script Properties 约 6 个工作日就会写满~~(L-04)**已由 D-032 解除**:

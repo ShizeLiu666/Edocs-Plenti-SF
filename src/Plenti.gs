@@ -667,7 +667,8 @@ function plEnrichFromBrowserView_(message,parsed){
  * 判据是**邮件里有没有 Plenti browser-view 链接** —— 一个结构事实,
  * 与噪音量无关,所以不需要先跑几天看数据。
  *
- *   无链接 → 普通业务邮件。落 review 状态、进 Messages 表,**不打标签**。
+ *   无链接 → 普通业务邮件。落 done 状态(Q18 前是 review,D-033)、进 Messages 表,
+ *            **不打标签**。状态只存最小形式,窗口外会被清理(Q17,D-032)。
  *   有链接 → **必须打标签**,再按原因细分措辞(scope):
  *     forwarded                 手动转发(没有 X-Original-Sender)
  *     unlisted-sender-with-link 经组投递,发件人不在可信清单(认证未评估)
@@ -1177,12 +1178,11 @@ function plReviewClearedReason_(lead,supplied){
  * 由 runIntakeV2 的消息循环和 ivRefreshOutstanding_ 每轮调用,管道本来就铺好了,
  * 这里只是把空桩换成实现。
  *
- * ### 它带来的两态工作流
+ * ### [Q18] 只管例外(D-033)
  *
- * 不需要新标签,现有标签对就能表达 Jack 要的两个状态:
- *
- *   Created + Review   →  待补联系方式(每条 Plenti 线索的必经状态)
- *   Created(Review 消失)→  已补全
+ * 原先每条新 Lead 都落 review,这里负责"补上联系方式就解除"。Q18 之后干净建出的
+ * 直接 done,"待补联系方式"交给 Salesforce List View;这里只对**例外**
+ * (降级、来源冲突、强制创建)生效 —— 解除条件与指纹逻辑不变。
  *
  * ### 成本:只查真正需要轮询的那些
  *
@@ -1540,6 +1540,28 @@ function plTestFindMessages(query){
 // ============================================================
 
 /**
+ * [Q18] 建出 Lead 之后,哪些情况需要人看一眼(D-033)。返回标记列表,空 = 干净。
+ *
+ * 只列 Jack 批准的几类:
+ *   强制创建     —— 绕过了判定门,值可能是合成的(D-017,临时)
+ *   降级         —— 两个来源都没给出客户姓名,得有人开链接看
+ *   来源冲突     —— 邮件与 browser view 对同一字段说法不一,用了邮件的值
+ *   转介重发     —— token 命中的 Lead 是**别的邮件**建的(created===false)。
+ *                   D-026 已定:只亮 Review 让人看是不是重复,Q18 不改这一条。
+ *                   同一封邮件重跑(marker 命中,created===true)不算,那是干净的。
+ * 刻意**不**列:审计留底缺失(auditMissing,页面没抓到但数据来自邮件)——
+ * 不在批准的清单里,且没有人能做的补救动作;它照旧写进 Description 与 Messages 表。
+ */
+function plCreatedExceptions_(parsed,forced,created){
+ var out=[],conflicts=parsed.browserView&&parsed.browserView.conflicts;
+ if(forced)out.push('[FORCED]');
+ if(!created)out.push('[RESENT: the Lead was created from another message — check for a duplicate]');
+ if(parsed.confidence!=='high')out.push('[DEGRADED]');
+ if(conflicts&&conflicts.length)out.push('[SOURCES DISAGREE: '+conflicts.join(', ')+']');
+ return out;
+}
+
+/**
  * plProcess_(message, force) → state
  *
  * 状态机骨架移植自模板 ivProcess_:prior 检查(幂等)→ 分流 → 写中间态
@@ -1587,7 +1609,10 @@ function plProcess_(message,force,detail){
   if(unverified){
    var visibility=plUnverifiedReview_(message,unverified,source);
    state.kind='review';
-   state.state='review';
+   // [Q18] out-of-scope 是普通邮箱流量(D-027),不需要人帮忙 → done。
+   // 仍然落状态、仍然在 Messages 表留一整行带完整 reason,不是静默丢弃。
+   // 带链接的三类(转发 / 发件人不在清单 / 认证失败)才是"可疑发件人",照旧 review。
+   state.state=visibility.scope==='out-of-scope'?'done':'review';
    state.leadCandidate=visibility.leadCandidate;
    state.scope=visibility.scope;
    state.reason=visibility.reason;
@@ -1672,9 +1697,14 @@ function plProcess_(message,force,detail){
   // POST 时记 —— force 重跑会新建 state 对象,只在 POST 时记的话重跑后就丢了。
   state.supplied=plSuppliedContacts_(parsed);
   state.attached=ivAttachSource_(message,{id:lead.Id});
-  state.state='review';
+  // [Q18] review 的语义是"脚本需要人帮忙",不是"业务还没处理完"(D-033)。
+  // 干净建出的直接 done;只有例外才 review。"待补联系方式"是每条 Plenti 线索的
+  // 必经状态,交给 Salesforce List View,不再占用 review —— 否则合并会话上的
+  // Review 标签永远亮着,真出事(包括同标题的冒充邮件)时反而看不出来(D-031)。
+  var exceptions=plCreatedExceptions_(parsed,forced,state.created);
+  state.state=exceptions.length?'review':'done';
   state.leadCandidate=true;
-  state.reason=(forced?'[FORCED] ':'')+(parsed.confidence!=='high'?'[DEGRADED] ':'')+(state.createdNow?'New Plenti Lead awaiting administrator approval':'Existing Lead matched by delivery token or message marker');
+  state.reason=(exceptions.length?exceptions.join(' ')+' ':'')+(state.createdNow?'New Plenti Lead created':'Existing Lead matched by delivery token or message marker')+(exceptions.length?' — needs a human':'');
   ivSave_(id,state);
   return state;
  }catch(e){

