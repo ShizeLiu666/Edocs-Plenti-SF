@@ -353,6 +353,10 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
   正常运行稳定在约 35 KB。**error 未处理时仍会写满,见顶部「运维须知」。**
 - **所有 referral 都会被 Gmail 合进同一个会话**(D-031)。Gmail 标签按会话打,
   **表示不了单条 referral 的状态**。单条状态以 Salesforce 为准。
+- ⚠️ **不要把 Messages 表导出成 CSV 给外部使用**(D-044)。防公式注入靠的是前导撇号,
+  它只存在于 Google Sheets 内部,**导出 CSV 时会被剥掉**。用 Excel 打开那份 CSV,以 `=`
+  开头的主题或正文会被重新当成公式执行。这张表的用途是排查,不是分发;而且它含客户 PII,
+  本来就不该外发。
 - **人工先建、程序后建会产生重复 Lead,无法自动识别**(L-05)。程序的去重只认得
   程序自己建的 Lead(delivery token 字段、消息 marker),人工建的都没有。管道上线后
   Plenti 的 referral 不要再手工建。清理重复时**只删 Salesforce 里的 Lead,不要删
