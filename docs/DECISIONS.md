@@ -961,6 +961,10 @@ SF 400 INVALID_FIELD
 No such column 'Lead_Category__c' on entity 'Lead'
 ```
 
+> ⚠️ **更正(2026-09-11,D-035):** 下面"org 里从来没有这个字段"只对**沙箱**成立。
+> 生产 2026-09-04 建了它,而且是 Round Robin 的分派条件。从 SOQL 读取列表里移除
+> 仍然正确(沙箱没有它);但**写入**必须恢复,见 D-035。
+
 `Lead_Category__c` 是从 Lily 的 handoff 模板继承来的,**Sunterra 的 org 里
 从来没有这个字段**,却被硬编码进 `ivLeadFields_()` 的 SOQL。
 
@@ -2207,6 +2211,130 @@ try 里)会在清理运行**之前**就让整轮抛出。离线测试测不到�
 
 ---
 
+## D-035 生产排查:Lead_Category__c 写回来(硬需求);生产 Flow 对我们建的 Lead 的影响
+
+Jack 2026-09-11 生产排查的发现。
+
+### ① Lead_Category__c —— 已实现
+
+**D-022 的前提是错的。** R11 删它的理由是"Sunterra 的 org 里从来没有这个字段",
+那是沙箱的结论:Lily **2026-09-04 在生产建了它**,沙箱是更早的副本。
+
+生产事实(Jack 提供):受限 picklist(Restrict picklist 已勾),五个值
+`New Sales Enquiry` / `Existing Customer / After-sales` / `General Product Enquiry` /
+`Commercial Enquiry` / `Other`。生产的 Active Flow **New Sales Lead Round Robin**
+(After Save,创建和更新时)按 `Lead_Category__c = New Sales Enquiry` 六人轮值分派
+Owner。**不写这个字段 → 没人被分派 → 没人跟进 → PLT001 直接违约。**
+老板已确认 Plenti 的 lead 算 `New Sales Enquiry`。
+
+**D-011 的"payload 不写 `Lead_Category__c`"被本条推翻。** D-011 的另一半不变:
+我们不把它当 review 的解除信号读。
+
+| 项 | 实现 |
+|---|---|
+| 值 | 新属性 `PLENTI_LEAD_CATEGORY`,**缺失即抛错**。字段不存在的 org(沙箱)也要求配置 —— 否则切生产那天才发现没配 |
+| 受限 picklist | `plValidatedLeadCategory_` 对照**活跃**值精确匹配(大小写敏感、停用值不认),由 `plCreateLead_` 在**上锁之前**调用 —— 配错不会掉进 L-01 |
+| 字段不可写 | 按 D-023 的 describe 探测:不写该字段(写了整个 POST 失败),**Lead 照建** |
+| 读取 | **只写不读。** 不加回 `ivLeadFields_` —— 沙箱没有这个字段,加回去就是 R11 那次 `INVALID_FIELD` 重演 |
+| 自检 | `plTestDescribeLead` 单独报:字段在不在、可不可写、`PLENTI_LEAD_CATEGORY` 是否是活跃值 |
+
+**降级时要不要报警(Jack 让我判断):要,而且要落 review。** 理由:它缺失的后果是
+"没人跟进",正是 Q18 对 review 的定义"脚本需要人帮忙"。另外两个可选字段缺了只是
+少个标记,所以处理方式不同。四处可见:
+
+1. 状态落 review,reason 以 `[NOT ROUTED: …]` 开头 → `SF-Lead-Review` 亮、Messages 表
+   显示 `created + review`
+2. Lead 的 Description 末尾加 `[NOT ROUTED — … Assign one manually]` —— Lead 会停在
+   `INTAKE_ADMIN_ID` 名下,那个人打开就能看到
+3. console 打 ⚠️⚠️ 告警
+4. 自检报 ❌
+
+Lead 照建,不因为分派不了就不建:SLA 时钟不等人,有 Owner 兜底、有报警的 Lead
+好过没有 Lead。
+
+⚠️ **沙箱没有这个字段,所以沙箱上每条 Lead 都会是 `[NOT ROUTED]` review。** 这是真实
+情况(沙箱没有 Round Robin),不是 bug。
+
+⚠️⚠️ **生产上最可能的降级原因不是"字段不存在",而是集成用户没有这个字段的编辑权限。**
+字段是 09-04 新建的,权限集不会自动带上新字段;没有 FLS 时 describe 根本不返回
+这个字段。**今天建的 `Plenti_Received_At__c` 同理。** 已写进 SANDBOX_SETUP 生产清单。
+
+自检顺带修了一处逻辑:`plLeadFieldsUsed_` 原先按清单成员身份标记"可选",现在
+**被 SOQL 无条件读取的字段永远不算可选**。否则 R11 那一发(读一个不存在的字段)
+会被归进"可选缺失",自检就失明了。
+
+### ② 生产的两个 Active Flow —— Jack 的三个问题(已答,未动手)
+
+| Flow | 时机 | 行为 |
+|---|---|---|
+| Lead Entry Governance - Draft | Before Save,创建时 | 未知 |
+| New Sales Lead Round Robin | After Save,创建和更新时 | 改 Owner,六人轮值 |
+
+**问 1:Owner 被 After Save 覆盖,回读会不会误判?** 不会。
+- `plTestVerifyLead_`(R10 临时)**不读 `OwnerId`**,而且它**不做任何比较**,只打印值
+  或长度。
+- 主流程 POST 后用 `plLeadFields_` 回读(含 `OwnerId`),但**全仓库没有任何代码拿
+  `OwnerId` 和提交值比较**。唯一用 Owner 的是 `Legacy.gs` 的回复路由,主干不调用。
+- After Save 与 POST 同一个事务,回读看到的已经是 Round Robin 分的人。
+
+**问 2:Before Save 改了其他字段,代码怎么处理?** **不处理 —— 不回读比较,改了也
+不会发现,静默接受。** 要紧的是哪些字段有下游依赖:
+
+| 字段 | 谁依赖它 | 被 Flow 改了会怎样 |
+|---|---|---|
+| `Lead_Category__c` | Round Robin | **最危险。** Before Save 若改掉它,After Save 的 Round Robin 不认,没人分派;我们以为写上了,**不会报警** |
+| `Description` 里的 `[Intake: <id>]` | `plResolve_` 判定 `created`(D-026) | 同一封邮件重试会被当成转介重发 → 误报 `[RESENT]` review。不会重复建(token 兜底) |
+| `Plenti_Lead_ID__c` | token 去重 + Unique | 被改或清空 → 下一封重发件会建出重复 Lead |
+| `Phone` / `MobilePhone` | `plRefreshReview_` 的指纹 | 04 ↔ +614 的格式化已被 `plNormalizeDigits_` 抹平;但若把号码挪到另一个字段,会被误判为"人填的",例外 review 被错误解除 |
+| `Status` | 解除条件(`Unqualified`) | 只有被改成 `Unqualified` 才有影响 |
+| 其他 | 无代码依赖 | 只是数据质量 |
+
+**比"改值"更要紧的是:Before Save Flow 可以直接拒绝保存(Custom Error)。**
+那样 POST 返回 400,而**创建锁已经是 `requested`** → L-01:之后每次重试都抛
+"Earlier create outcome is uncertain",watermark 冻结,D-034 的倒计时开始。
+名叫 "Governance" 的 Flow 正是会校验必填项的那一类 —— 而 Plenti 的 Lead
+**永远没有 Email**,有时也没有电话。
+
+建议(**未实施,等 Jack 定**):
+- 建完回读 `Lead_Category__c`(按探测)、`Plenti_Lead_ID__c` 和 marker,与提交值不符就
+  落 review。
+- L-01 区分"确定失败"(4xx,什么都没建)与"结果不确定"(超时),确定失败时回滚锁 ——
+  原计划 Phase 4 做,Governance Flow 让它变急了。
+
+**问 3:还该不该设 OwnerId?** **建议继续设,但语义改成"Round Robin 没接住时的兜底
+Owner"。** 前提是下面第 1 条核实过。
+- **不设的话,Owner 默认是运行用户 —— client credentials 的集成用户,一个没人登录的
+  API 账号。** Round Robin 一旦没接住(字段没写上、FLS 缺失、Governance 改了分类、
+  Flow 出错或被停用),Lead 就挂在一个没人看的账号下,**完全不可见**。设成
+  `INTAKE_ADMIN_ID`,兜底落在一个真人名下,配合 `[NOT ROUTED]` review 看得见。
+- Flow 正常时设了也没坏处:After Save 在同一事务里覆盖它,Lily 的"完全脱手"不受影响。
+- ⚠️ **必须先核实的:Round Robin 的进入条件里有没有 Owner。** 如果它只在 Owner 是某个
+  队列 / 集成用户时才分派,我们设成管理员反而会让它**跳过**这条 Lead。那样结论反过来。
+- ⚠️ **我不确定的一点:** REST API 建 Lead 时,org 里**有效的 Lead Assignment Rule** 默认
+  会不会执行。SANDBOX_SETUP §5 写的是"默认不跑",那是我早先写的;现在我倾向于认为
+  REST 的 `Sforce-Auto-Assign` 头**缺省时会执行**有效规则。离线核实不了。生产 Setup →
+  Lead Assignment Rules 看一眼有没有 Active 的即可;有的话它也会覆盖 Owner。
+- 连带:`Plenti` 路径**建完从不更新 Lead**(没有 PATCH),所以我们的代码不会触发
+  Round Robin 的"更新时"重新分派。**将来实现 supplement 的更新路径(Q6)时要记得这一点**
+  —— 每次 PATCH 都可能让 Owner 被重新轮值。
+
+### ③ 两条 Active Workflow Rule —— 等 agent 结果
+
+Remind to convert the new lead / …first time。一个相关事实:**我们建的 Plenti Lead
+在创建时永远没有 Email**(Plenti 不给,§5.2 也禁止拿 Plenti 地址兜底),所以发给
+Lead 的 Email Alert 在创建那一刻没有收件地址。**但这不等于安全:** 如果是**基于时间的**
+动作,排队期间有人从 Portal 补上了 Email,到点时它会用当时的 Email 发给客户。
+要看的是:动作类型、收件人、是否基于时间、进入条件是否匹配我们的 Lead
+(LeadSource / Lead_Category__c / Status)。
+
+### ④ `Contact_Attempt_Count__c` 是 Number(3, 0)
+
+没有任何地方假设更大的范围。代码只在创建时写 `0`;`plTestVerifyLead_` 回读它只为打印;
+**没有加减、比较或累加**。`Legacy.gs` 也只写 `0`,且主干不调用。离线测试的字段白名单
+只检查它存在,不检查类型。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -2414,6 +2542,7 @@ watermark 的校验保持原样。
 | `INTAKE_RECIPIENT_ALLOWLIST` | 收件人白名单(D-015)。格式同 `PLENTI_TRUSTED_SENDERS`:逗号分隔,`user@domain` 或 `@domain` | **抛错停止** |
 | `INTAKE_LOG_SHEET_ID` | 运行日志 Google Sheet 的 ID(D-016 汇总页 / D-018 Messages 页)。⚠️ **该表含 PII,分享设置必须限制为指定人员**;ID 不入仓库 | **跳过,不报错** |
 | `PLENTI_LEAD_SOURCE` | Lead 的 `LeadSource` 值(D-029)。**必须与 org 的活跃 picklist 值完全一致** —— 生产是 `Plenti Referrals`。建 Lead 前会校验,配错会在上锁前就停下 | **抛错停止** |
+| `PLENTI_LEAD_CATEGORY` | Lead 的 `Lead_Category__c` 值(D-035)—— 生产 Round Robin 的分派条件,生产是 `New Sales Enquiry`。**必须与活跃 picklist 值完全一致**(受限 picklist,错值让整个 POST 失败),建 Lead 前会校验,配错在上锁前就停下。字段不存在的 org 也要求配置 | **抛错停止** |
 | `PLENTI_FORCE_CREATE` | 🔴 **临时**(D-017)。`'true'` 时绕过置信度判定直接建 Lead。**Phase 4 结束后连同代码一起删** | 视为 `false`,不报错 |
 | `PLENTI_TEST_SENDER_OVERRIDE` | 🔴 **临时**(D-021)。**只有 R9 测试入口读它,主流程读不到**(两道锁)。设为一个邮箱地址后,该入口会伪造 §5.1 的两个身份头 —— **伪造的是整条可信验证链,不只是发件人**。进组后必须单独补测身份验证。**Phase 4 结束后连同代码一起删** | 视为未设置,不报错 |
 
@@ -2435,7 +2564,7 @@ watermark 的校验保持原样。
 
 | # | 问题 | 阻塞 | 规格出处 |
 |---|---|---|---|
-| Q1 | **Plenti 线索由谁跟进?** 目前全部指派给 `INTAKE_ADMIN_ID`,意味着 SLA 时钟开始跑但无人被分配联系客户 | **上线** | §5.9 |
+| Q1 | ⏳ **部分有答案(2026-09-11,D-035)**:生产由 New Sales Lead Round Robin 按 `Lead_Category__c = New Sales Enquiry` 六人轮值分派,Lily 已完全交给这个 Flow;代码已写该字段。剩余:兜底 Owner 见 Q20。原文:**Plenti 线索由谁跟进?** 目前全部指派给 `INTAKE_ADMIN_ID`,意味着 SLA 时钟开始跑但无人被分配联系客户 | **上线** | §5.9 |
 | ~~Q2~~ | **已定** —— 字段名确认为 `Plenti_Received_At__c`(Jack,2026-09-08)。⏳ 状态:**待沙箱建字段验证**。⚠️ 规格 §5.3 要求的"先检查 org 中是否已有可复用字段"**照做,不能因为名字定了就跳过** | 待验证 | §5.3 |
 | Q3 | `LeadSource` picklist 是否已有 `Plenti` 值?没有需先加(Setup 操作,不由脚本做) | Phase 4 | §5.9 |
 | Q4 | `Company` 字段:模板写死 `Individual / Residential`,是否适用于 Plenti 转介 | Phase 3 | §5.9 |
@@ -2445,6 +2574,9 @@ watermark 的校验保持原样。
 | ~~Q17~~ | ✅ **已关闭**(2026-09-11)—— 三步都已实施,见 D-032。原提议里"窗口外的也不会再被扫到"按旧代码**不成立**(Gmail 按 thread 返回,旧邮件会随新邮件回到循环),第 1 步正是它成立的前提。原文:🔴 **Script Properties 约 6 个工作日写满(L-04),上线前必须修。** 建议组合拳:① 主循环只处理扫描窗口内的消息(不再遍历会话里的旧消息);② out-of-scope 状态只存最小形态(约 50 字节,而不是 454);③ 清理扫描窗口之外的 out-of-scope 状态 —— 它们不参与标签计算,也不会再被扫到。三条都要动 `runIntakeV2`(Code.gs)。另一条路是规格 §9 的外部状态存储,改动大得多 | 无 | §9 / D-031 / D-032 |
 | ~~Q18~~ | ✅ **已关闭**(2026-09-11)—— 见 D-033。转介重发按 D-026 仍落 review;out-of-scope 改为 done、auditMissing 不列为例外,**Jack 已确认**(D-034)。原文:**review 的语义要不要改成"脚本需要人帮忙",而不是"业务还没处理完"?** 即:干净建出的 referral 直接落 `done`,`review` 只留给降级、来源冲突、可疑发件人、错误。这样同时解决 D-031 的三处影响:合并会话里的 Review 平时不亮,**一旦亮就说明真有事**(包括同标题的冒充邮件);轮询只针对少数例外;"待补联系方式"整体交给 Salesforce List View | 无 | D-024 / D-029 / D-031 / D-033 |
 | Q19 | **永久状态的长期累积。** D-032 只清理 out-of-scope。仍会累积:① internal / ignore / notice 等 `done` 状态,每条约 173 字节,**量没有数据**;② 每条建出的 Lead 占约 472 字节(状态 368 + 创建锁 104 —— 最初估"约一年"时漏算了锁),按 5 条/天约 **9 个月**写满。写满的表现是**静默的停摆**,且会让 error 冻结的倒计时越来越短 —— 分析与准备清单见 **D-034**。建议先加用量读数,按用量(60%)而不是日期触发 (a)+(b)+(c) | 按用量触发,不阻塞上线 | §9 / D-032 / D-034 |
+| Q20 | **还该不该设 `OwnerId`?** 建议继续设,语义改为"Round Robin 没接住时的兜底 Owner"(D-035 ②)。**先核实:** ① Round Robin 的进入条件里有没有 Owner(有的话结论可能反过来);② 生产有没有 Active 的 Lead Assignment Rule(REST 缺省时是否执行,我不确定) | **开触发器前** | D-035 |
+| Q21 | **Lead Entry Governance - Draft(Before Save)到底做什么?** 需要它的规则:会不会改 `Lead_Category__c` / `Description` / `Plenti_Lead_ID__c`,**会不会用 Custom Error 拒绝保存**(Plenti 的 Lead 没有 Email)。拒绝保存会让创建锁卡在 `requested`,掉进 L-01 并冻结 watermark | **开触发器前** | D-035 / L-01 |
+| Q22 | **两条 Workflow Rule(Remind to convert …)会不会给客户发信?** 等 agent 结果。要看动作类型、收件人、是否基于时间、进入条件是否匹配我们的 Lead。创建时没有 Email 不代表安全(基于时间的动作到点时用当时的 Email) | **开触发器前** | D-035 |
 | ~~Q16~~ | ✅ **已关闭**(2026-09-09)—— 沙箱已建 Date/Time 字段并放开写入,值取自 `message.getDate()`,见 D-023。⚠️ **生产上仍未建**,探测保证不卡住,但建好之前生产无法从专用字段统计 PLT001。原文:**要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |

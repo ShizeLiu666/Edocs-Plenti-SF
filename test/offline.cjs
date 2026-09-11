@@ -176,8 +176,9 @@ for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTest
   // 它们允许暂时不存在,但**必须列在这里**,否则等于没人审过就混进了写入路径。
   const OPTIONAL_CUSTOM_FIELDS = [
     'Plenti_Received_At__c',   // [R12] 沙箱已建,生产未建
-    'Plenti_Systems__c'        // [R13] 待建;未建时 Description 里有备份
-  ];
+    'Plenti_Systems__c',       // [R13] 待建;未建时 Description 里有备份
+    'Lead_Category__c'         // [D-035] 生产有、沙箱没有;缺失时 Lead 照建但落 review 报警(不会被分派)
+  ].sort();
 
   props.set('INTAKE_ADMIN_ID', '005000000000000AAA');
   props.set('PLENTI_LEAD_SOURCE', 'Plenti Referrals');

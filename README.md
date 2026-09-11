@@ -262,6 +262,10 @@ Phase 2 新增四项:`INTERNAL_DOMAIN`、`EDOCS_GROUP_ADDRESS`、
 `PLENTI_TRUSTED_SENDERS`、`ATTACH_RAW_EMAIL`(默认关闭)。
 完整清单与格式说明见 [docs/DECISIONS.md](docs/DECISIONS.md)。
 
+⚠️ **`PLENTI_LEAD_CATEGORY`(D-035)决定 Lead 有没有人跟进。** 生产的 Round Robin Flow
+按 `Lead_Category__c = New Sales Enquiry` 分派 Owner。值必须与活跃 picklist 值完全一致;
+集成用户还必须有该字段的编辑权限,否则 Lead 照建但落 `[NOT ROUTED]` review、没人被分派。
+
 凭据**不写进仓库**,只通过获准的安全方式配置,不发在聊天或邮件中。
 
 ---

@@ -212,6 +212,7 @@ Selected OAuth Scopes 只勾:
   - `Street` / `City` / `StateCode` / `PostalCode` / `CountryCode`
   - `Contact_Attempt_Count__c`
   - `Plenti_Received_At__c`(🔴 第 6 节建完之后回来补)
+  - `Lead_Category__c`(⚠️ **仅生产**,沙箱没有这个字段。没有编辑权限时每条 Lead 都不会被 Round Robin 分派,见 D-035)
   - referral ID 字段(🔴 第 7 节建完之后回来补)
 
 **明确不要给**(规格 §5.10 / DECISIONS D-007,本项目是 Lead-only):
@@ -419,7 +420,7 @@ curl -s -X POST "<instance_url>/services/data/v67.0/sobjects/Lead" -H "Authoriza
 
 | 要确认的 | 为什么 |
 |---|---|
-| `OwnerId` **仍然是**你传的那个 ID | 若被改了,说明有 Assignment Rule 或 Flow 在抢分配。REST API 默认**不**跑分配规则(除非传 `Sforce-Auto-Assign` 头),所以被改了就是 Flow 干的 |
+| `OwnerId` **仍然是**你传的那个 ID(**仅沙箱**;生产上预期会被 Round Robin 改掉,见下方生产差异) | 若被改了,说明有 Assignment Rule 或 Flow 在抢分配。⚠️ 这里原先写着"REST API 默认不跑分配规则",**我现在不确定**:REST 的 `Sforce-Auto-Assign` 头缺省时可能会执行 org 里有效的 Lead Assignment Rule(D-035 / Q20)。所以被改了不一定是 Flow,也要看 Setup → Lead Assignment Rules 有没有 Active 的 |
 | `LeadSource` 是 `Plenti` | 第 3 节生效 |
 | **没有邮件发出去** | 检查该 Lead 的 Activity History,以及有没有触发 Auto-Response Rule。规格 §9 明确写了本脚本不发首次回应邮件,但 Salesforce 既有 Flow 可能被创建动作触发 |
 | POST 没有被 **Duplicate Rule** 拦下 | 若返回 `DUPLICATE_VALUE` 或 `DUPLICATES_DETECTED`,说明有重复规则设成了 Block。这会让真实转介创建失败 |
@@ -443,9 +444,28 @@ curl -s -X DELETE "<instance_url>/services/data/v67.0/sobjects/Lead/<新建的 L
 - **生产的用户 ID 与沙箱不同**,`INTAKE_ADMIN_ID` 要重新取
 - 建议生产用一个明显是测试的虚构地址,并且**先确认能立刻删除**
 
-⚠️ 还有一件不是 Salesforce 配置的事:**Plenti 线索到底由谁跟进目前仍未确定
-(Q1)**。指派给审核人意味着 SLA 时钟开始跑但无人联系客户。这是业务未决项,
-不是这份手册能解决的,但在生产开触发器之前必须解决。
+⚠️⚠️ **生产已知的自动化(2026-09-11 排查,D-035)** —— 沙箱是更早的副本,**都没有**:
+
+| 自动化 | 时机 | 对我们建的 Lead |
+|---|---|---|
+| New Sales Lead Round Robin(Flow) | After Save,创建和更新时 | 按 `Lead_Category__c = New Sales Enquiry` 六人轮值改 Owner。**这是预期行为**,Q1 的答案 |
+| Lead Entry Governance - Draft(Flow) | Before Save,创建时 | **规则未知**(Q21)。可能改字段,也可能拒绝保存 |
+| Remind to convert the new lead / …first time(Workflow Rule) | —— | **是否给客户发信未知**(Q22) |
+
+**生产开触发器之前必须做完:**
+
+1. **给集成用户(Run As)开 `Lead_Category__c` 的编辑权限。** 字段 09-04 才建,权限集
+   不会自动带上;没有权限时 describe 看不到这个字段,每条 Lead 都会落 `[NOT ROUTED]`,
+   **Round Robin 不会分派,没人跟进**。
+2. **同样给 `Plenti_Received_At__c` 开编辑权限**(今天新建,同一个原因)。没有权限时
+   PLT001 的计时字段静默为空。
+3. Script Property `PLENTI_LEAD_CATEGORY` = `New Sales Enquiry`(大小写、空格完全一致)。
+4. 跑 `plTestDescribeLead`,确认输出里 `Lead_Category__c` 和 `PLENTI_LEAD_CATEGORY`
+   两行都是 ✅,`Plenti_Received_At__c` 是 PRESENT。
+5. Q20 / Q21 / Q22 有答案。
+
+沙箱上没有 `Lead_Category__c`,**沙箱建出的每条 Lead 都会是 `[NOT ROUTED]` review**,
+这是真实情况(沙箱没有 Round Robin),不是 bug。`PLENTI_LEAD_CATEGORY` 在沙箱上也要配。
 
 ---
 

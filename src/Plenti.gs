@@ -969,7 +969,11 @@ function plResolve_(message,parsed,forced){
  * PLT001 的计时字段静默为空,而这是合同 SLA 的计算依据;默认开 → 切生产
  * 当天直接被 INVALID_FIELD 卡死。探测则两边都自洽,且不需要任何人记得做什么。
  */
-var PLENTI_OPTIONAL_LEAD_FIELDS=['Plenti_Received_At__c','Plenti_Systems__c'];
+// [D-035] Lead_Category__c 也走这套探测(沙箱没有这个字段),但它缺失的**后果不同**:
+// 另外两个缺了只是少一个字段;它缺了,生产上的 Round Robin Flow 不认这条 Lead,
+// 没人被分派 —— PLT001 直接违约。所以它缺失时不是静默跳过,而是落 review 并报警,
+// 见 plLeadRouted_ / plCreatedExceptions_。
+var PLENTI_OPTIONAL_LEAD_FIELDS=['Plenti_Received_At__c','Plenti_Systems__c','Lead_Category__c'];
 
 /**
  * Lead 字段表 {字段名: 是否可写},**按执行缓存**(与模板 ivReq_.token 同一手法)。
@@ -1022,6 +1026,52 @@ function plLeadSource_(){
 function plLeadFieldExists_(name){var f=plLeadFieldMap_()[name];return !!f&&f.createable===true;}
 
 /**
+ * [D-035] Lead_Category__c 的值从 Script Property 读,不写死。缺失即抛错(规格 §3 禁止 #2)。
+ *
+ * 生产上 New Sales Lead Round Robin Flow 的分派条件是 Lead_Category__c = New Sales Enquiry,
+ * 老板已确认 Plenti 的 lead 算 New Sales Enquiry。
+ *
+ * **字段不存在时也要求配置**:这是生产值,缺配置本身就是配置错误,不能因为
+ * 某个 org 恰好没有这个字段就放过 —— 否则切到生产那天才发现没配。
+ */
+function plLeadCategory_(){
+ var value=String(PropertiesService.getScriptProperties().getProperty('PLENTI_LEAD_CATEGORY')||'').trim();
+ if(!value)throw new Error('Configure PLENTI_LEAD_CATEGORY with the exact Lead_Category__c picklist value that the Round Robin Flow assigns on (production: "New Sales Enquiry")');
+ return value;
+}
+
+/**
+ * 这条 Lead 能不能写上 Lead_Category__c(字段存在且对运行用户可写)。
+ *
+ * 不能 → payload 不写这个字段(写了整个 POST 失败)、Lead 照建,但 Round Robin 不会
+ * 分派它,Owner 停在 INTAKE_ADMIN_ID。describe 失败时同样返回 false —— 写一个
+ * 不确定存在的字段,失败会发生在上锁之后,掉进 L-01。
+ *
+ * ⚠️ 生产上最可能的触发原因不是"字段不存在",而是**集成用户没有这个字段的编辑权限**
+ * (字段 2026-09-04 才建,权限集不会自动带上新字段)。describe 对没有 FLS 的用户
+ * 根本不返回该字段。
+ */
+function plLeadRouted_(){return plLeadFieldExists_('Lead_Category__c');}
+
+/**
+ * 取 Lead_Category__c 的值并对照 org 的**活跃** picklist 校验。
+ *
+ * ⚠️ 该字段是**受限** picklist,值不在列表里会让整个 POST 失败。所以与
+ * plValidatedLeadSource_ 一样,由 plCreateLead_ 在**写 IV2_CREATE_ 锁之前**调用 ——
+ * 配错了在上锁前就停下,不会掉进 L-01。
+ *
+ * 属性一律先读(缺失即抛错);字段不可写时不校验(反正不写);picklist 值拿不到
+ * 时不阻断,与 LeadSource 同一策略。
+ */
+function plValidatedLeadCategory_(){
+ var value=plLeadCategory_(),field=plLeadFieldMap_().Lead_Category__c;
+ if(plLeadRouted_()&&field.picklist&&field.picklist.length&&field.picklist.indexOf(value)<0){
+  throw new Error('PLENTI_LEAD_CATEGORY "'+value+'" is not an active Lead_Category__c picklist value in this org (restricted picklist — the create would fail). Active values: '+field.picklist.join(', '));
+ }
+ return value;
+}
+
+/**
  * 取 LeadSource 并对照 org 的 picklist 校验。
  *
  * ⚠️ 由 plCreateLead_ 在**写 IV2_CREATE_ 锁之前**调用。所以配错的 LeadSource
@@ -1063,6 +1113,11 @@ function plDescriptionFlags_(meta){
  return out;
 }
 
+/** [D-035] 跟进的人打开 Lead 就要看到:这条不会被自动分派。 */
+function plRoutingFlag_(routed){
+ return routed?'':' [NOT ROUTED — Lead Category could not be set, so the Round Robin will not assign an owner. Assign one manually]';
+}
+
 function plLeadPayload_(message,parsed,enrichment){
  var c=parsed.customer,marker='[Intake: '+message.getId()+']',meta=(enrichment&&enrichment.meta)||{};
  var fieldCount=(meta.found||[]).length;
@@ -1082,8 +1137,11 @@ function plLeadPayload_(message,parsed,enrichment){
   // [R13] 摘要里带上 systems —— 跟进的人一眼要看到客户想装什么。
   // 这不违反 D-012:那条禁的是 referralId 之外的**内部标识符**,而 systems 是
   // 客户需求本身,正是 D-012 允许的"销售必要信息"。
-  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(parsed.systems?'; systems: '+parsed.systems:'')+plDescriptionFlags_(meta),PLENTI_DESCRIPTION_LIMIT)
+  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(parsed.systems?'; systems: '+parsed.systems:'')+plDescriptionFlags_(meta)+plRoutingFlag_(plLeadRouted_()),PLENTI_DESCRIPTION_LIMIT)
  };
+ // [D-035] Round Robin 的分派条件。字段不可写时不写(否则整个 POST 失败),
+ // Lead 照建但落 review 报警。值已在上锁前校验过(plValidatedLeadCategory_)。
+ if(plLeadRouted_())payload.Lead_Category__c=plLeadCategory_();
  // [R13] 专用字段:Description 是自由文本,分组和筛选都做不了。Schedule 3 季度
  // 报告和 PLT002 的转化率分析都可能要按系统类型切分,所以另建一个可报表字段。
  // 字段还没建时按 D-023 自动跳过,Description 里的那份保证信息不会不可见。
@@ -1128,6 +1186,7 @@ function plCreateLead_(message,parsed,enrichment){
  // 是因为字段自检的探针也调 plLeadPayload_ —— 自检工具不能在配错时自己崩掉,
  // 它的用处恰恰是把配错报出来。
  plValidatedLeadSource_();
+ plValidatedLeadCategory_();
  var payload=plLeadPayload_(message,parsed,enrichment);
  p.setProperty('IV2_CREATE_'+id,JSON.stringify({state:'requested',at:new Date().toISOString()}));
  var result=ivReq_('sobjects/Lead','post',payload);
@@ -1252,6 +1311,9 @@ function plLeadFieldsUsed_(){
  // 全集,否则探测失败时它会从清单里消失,正好躲开检查。
  for(i=0;i<PLENTI_OPTIONAL_LEAD_FIELDS.length;i++){
   name=PLENTI_OPTIONAL_LEAD_FIELDS[i];
+  // [D-035] 被 SOQL **无条件读取**的字段永远不算可选 —— 读一个不存在的字段整条
+  // 查询就失败(R11 那一发)。可选只针对"按探测结果决定写不写"的写入。
+  if(usage[name]&&usage[name].indexOf('read')>=0)continue;
   optional[name]=true;
   if(!usage[name])usage[name]='write';
  }
@@ -1318,6 +1380,24 @@ function plTestDescribeLead(){
   console.log('[R11] ❌ PLENTI_LEAD_SOURCE="'+configured+'" is NOT an active LeadSource value in this org. Active values: '+lsValues.join(', '));
  }else{
   console.log('[R11] ✅ PLENTI_LEAD_SOURCE="'+configured+'" is an active LeadSource value in this org');
+ }
+
+ // [D-035] Lead_Category__c 缺失的后果是**没人跟进**,不能和另外两个可选字段一样
+ // 只报一行 ⓘ。要么字段不存在(沙箱),要么集成用户没有编辑权限(生产最可能)。
+ var cat=have.Lead_Category__c,catConfigured=String(PropertiesService.getScriptProperties().getProperty('PLENTI_LEAD_CATEGORY')||'').trim();
+ if(!cat){
+  console.log('[R11] ❌ Lead_Category__c is ABSENT for the integration user — Leads will be created WITHOUT a category, the Round Robin will not assign them, and nobody will follow up. If the field exists in this org, grant the integration user Edit access to it.');
+ }else if(cat.createable!==true){
+  console.log('[R11] ❌ Lead_Category__c is visible but NOT createable — grant the integration user Edit access, otherwise Leads are not routed.');
+ }else{
+  console.log('[R11] ✅ Lead_Category__c is present and createable');
+ }
+ if(!catConfigured){
+  console.log('[R11] ❌ PLENTI_LEAD_CATEGORY is not configured — every Lead creation will stop');
+ }else if(cat&&cat.picklist&&cat.picklist.length&&cat.picklist.indexOf(catConfigured)<0){
+  console.log('[R11] ❌ PLENTI_LEAD_CATEGORY="'+catConfigured+'" is NOT an active Lead_Category__c value (restricted picklist — the create would fail). Active values: '+cat.picklist.join(', '));
+ }else if(cat&&cat.picklist&&cat.picklist.length){
+  console.log('[R11] ✅ PLENTI_LEAD_CATEGORY="'+catConfigured+'" is an active Lead_Category__c value');
  }
 
  // [R14] Plenti_Lead_ID__c 的三个属性 —— 人肉核对不算数,让 describe 说话。
@@ -1546,15 +1626,19 @@ function plTestFindMessages(query){
  *   强制创建     —— 绕过了判定门,值可能是合成的(D-017,临时)
  *   降级         —— 两个来源都没给出客户姓名,得有人开链接看
  *   来源冲突     —— 邮件与 browser view 对同一字段说法不一,用了邮件的值
+ *   未分派       —— [D-035] Lead_Category__c 没写上,Round Robin 不会分派 Owner,
+ *                   不处理就没人跟进,PLT001 违约。这是 Jack 让我判断的那一条:
+ *                   它的后果是"没人跟进",正是"需要人帮忙"的定义。
  *   转介重发     —— token 命中的 Lead 是**别的邮件**建的(created===false)。
  *                   D-026 已定:只亮 Review 让人看是不是重复,Q18 不改这一条。
  *                   同一封邮件重跑(marker 命中,created===true)不算,那是干净的。
  * 刻意**不**列:审计留底缺失(auditMissing,页面没抓到但数据来自邮件)——
  * 不在批准的清单里,且没有人能做的补救动作;它照旧写进 Description 与 Messages 表。
  */
-function plCreatedExceptions_(parsed,forced,created){
+function plCreatedExceptions_(parsed,forced,created,routed){
  var out=[],conflicts=parsed.browserView&&parsed.browserView.conflicts;
  if(forced)out.push('[FORCED]');
+ if(routed===false)out.push('[NOT ROUTED: Lead_Category__c could not be set — the Round Robin will not assign an owner; assign one manually]');
  if(!created)out.push('[RESENT: the Lead was created from another message — check for a duplicate]');
  if(parsed.confidence!=='high')out.push('[DEGRADED]');
  if(conflicts&&conflicts.length)out.push('[SOURCES DISAGREE: '+conflicts.join(', ')+']');
@@ -1701,7 +1785,9 @@ function plProcess_(message,force,detail){
   // 干净建出的直接 done;只有例外才 review。"待补联系方式"是每条 Plenti 线索的
   // 必经状态,交给 Salesforce List View,不再占用 review —— 否则合并会话上的
   // Review 标签永远亮着,真出事(包括同标题的冒充邮件)时反而看不出来(D-031)。
-  var exceptions=plCreatedExceptions_(parsed,forced,state.created);
+  var routed=plLeadRouted_();
+  if(!routed)console.log('⚠️⚠️ Lead '+lead.Id+' was created WITHOUT Lead_Category__c — the Round Robin will not assign it and nobody will follow up (PLT001). Check that the field exists and the integration user can edit it; run plTestDescribeLead.');
+  var exceptions=plCreatedExceptions_(parsed,forced,state.created,routed);
   state.state=exceptions.length?'review':'done';
   state.leadCandidate=true;
   state.reason=(exceptions.length?exceptions.join(' ')+' ':'')+(state.createdNow?'New Plenti Lead created':'Existing Lead matched by delivery token or message marker')+(exceptions.length?' — needs a human':'');

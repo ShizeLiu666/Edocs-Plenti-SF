@@ -80,8 +80,11 @@ function ivSave_(id,s){s.at=new Date().toISOString();PropertiesService.getScript
 // 完整 reason 不丢 —— 调用方拿到的是完整状态对象,Messages 表那一行照常写全。
 function ivSaveOutOfScope_(id,s){PropertiesService.getScriptProperties().setProperty(ivKey_(id),JSON.stringify({state:s.state,scope:'out-of-scope',date:s.date}));}
 function ivLabel_(th,name,add){var l=GmailApp.getUserLabelByName(name);if(!l&&add)l=GmailApp.createLabel(name);if(l){if(add)th.addLabel(l);else th.removeLabel(l);}}
-// [R11] 去掉 Lead_Category__c —— 模板遗留字段,Sunterra 的 org 里从来没建过。
-// 它被硬编码进 SOQL,导致查询报 INVALID_FIELD: No such column 'Lead_Category__c'。
+// [R11] 去掉 Lead_Category__c —— 它被硬编码进 SOQL,在沙箱报 INVALID_FIELD:
+// No such column 'Lead_Category__c'。
+// ⚠️ [D-035] 当时"org 里从来没建过"的判断是错的:生产 2026-09-04 建了,沙箱是更早的
+// 副本。现在它**只写不读** —— 由 plLeadPayload_ 按 describe 探测写入;这里的读取列表
+// **不能**加回去,否则没有这个字段的 org(沙箱)整条查询又会失败。
 // Salesforce 是全有全无,一个字段不存在整个请求就失败(DECISIONS D-022)。
 // ⚠️ StateCode / CountryCode 是**条件字段**:只有启用 State & Country Picklists
 // 的 org 才有。先保留(推断存在,依据见 D-022),用 plTestDescribeLead 确认。

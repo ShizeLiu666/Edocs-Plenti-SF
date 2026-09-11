@@ -71,6 +71,8 @@ function plTestBaseline_(){
   INTAKE_ADMIN_ID:'005000000000000AAA',
   // [R17] 刻意用和代码旧写死值('Plenti')不同的值,证明是从属性读的
   PLENTI_LEAD_SOURCE:'Plenti Referrals',
+  // [D-035] Round Robin 的分派条件
+  PLENTI_LEAD_CATEGORY:'New Sales Enquiry',
   ATTACH_RAW_EMAIL:null
  });
  plTestClearState_();
@@ -89,9 +91,23 @@ function plTestClearState_(){
  * UrlFetchApp 的桩仍然会抛错 —— 这里替换的是它上面一层,任何漏网的
  * 真实请求都会立刻炸出来,不会静默走出去。
  */
+/**
+ * [D-035] 假 describe 里的 Lead_Category__c:受限 picklist,五个值与生产一致,外加一个
+ * 停用值(证明只认活跃值)。默认 org 就"有这个字段且可写",否则每条建出的 Lead 都会
+ * 落 NOT ROUTED,把别的断言全搅了。字段缺失的情形在 testPlentiLeadCategory 里单测。
+ */
+function plTestCategoryField_(){
+ var names=['New Sales Enquiry','Existing Customer / After-sales','General Product Enquiry','Commercial Enquiry','Other'],vals=[],i;
+ for(i=0;i<names.length;i++)vals.push({value:names[i],active:true});
+ vals.push({value:'Retired Category',active:false});
+ return {name:'Lead_Category__c',createable:true,type:'picklist',restrictedPicklist:true,picklistValues:vals};
+}
+
 function plTestWithFakeApi_(fn){
  var realReq=ivReq_,realQuery=ivQuery_,calls=[];
- ivReq_=function(path,method,data){calls.push({kind:'req',path:path,method:method||'get',data:data});return {id:'00Qfixture000001AAA'};};
+ ivReq_=function(path,method,data){calls.push({kind:'req',path:path,method:method||'get',data:data});
+  if(path==='sobjects/Lead/describe')return {fields:[plTestCategoryField_()]};
+  return {id:'00Qfixture000001AAA'};};
  ivQuery_=function(q){
   calls.push({kind:'query',query:q});
   if(/WHERE Id='/.test(q))return [{Id:'00Qfixture000001AAA',Description:'',IsConverted:false,Status:'New'}];
@@ -492,7 +508,10 @@ function testPlentiLeadPayload(){
  // [R11] Plenti_Received_At__c 暂时不写(org 里没建,D-022),但时间戳不能丢
  plAssert_(!('Plenti_Received_At__c' in payload),'the field is omitted while it does not exist in the org — one missing field fails the whole request');
  plAssertEq_(JSON.parse(payload.Plenti_Parsed_JSON__c).receivedAt,message.getDate().toISOString(),'the received timestamp is preserved in the parsed JSON instead');
- plAssert_(!('Lead_Category__c' in payload),'Lead_Category__c is deliberately not written (D-011)');
+ // [D-035] D-011 的"不写"已被推翻:生产的 Round Robin 靠它分派。值来自属性。
+ // 这个用例没走假 API,describe 失败 → 字段不可写 → 不写,并在 Description 里标出来。
+ plAssert_(!('Lead_Category__c' in payload),'when the field cannot be confirmed writable it is omitted — writing it blind would fail the whole POST');
+ plAssert_(/\[NOT ROUTED/.test(payload.Description),'and the Description tells whoever opens the Lead that it will not be auto-assigned');
  plAssertEq_(payload.StateCode,'SA','state code is upper-cased');
  plAssertEq_(payload.CountryCode,'AU','country code accompanies an Australian address');
 
@@ -1351,7 +1370,7 @@ function testPlentiFieldSelfCheck(){
  plTestBaseline_();
 
  // ---- 模板遗留字段必须已经清干净 ----
- plAssert_(ivLeadFields_().indexOf('Lead_Category__c')<0,'Lead_Category__c must be gone from the SOQL field list — the org never had it');
+ plAssert_(ivLeadFields_().indexOf('Lead_Category__c')<0,'Lead_Category__c must stay out of the SOQL read list — the sandbox has no such field and the whole query would fail (D-035: it is written, never read)');
  plAssert_(plLeadFields_().indexOf('Lead_Category__c')<0,'and gone from the Plenti field list too');
  plAssert_(plLeadFields_().indexOf('Plenti_Lead_ID__c')>=0,'the delivery-token field is still selected');
 
@@ -1367,7 +1386,8 @@ function testPlentiFieldSelfCheck(){
  function optionalOf(n){var j;for(j=0;j<used.length;j++)if(used[j].name===n)return used[j].optional===true;return false;}
  plAssertEq_(optionalOf('Plenti_Received_At__c'),true,'and flagged as optional so a missing field is not reported as an error');
  plAssertEq_(optionalOf('Plenti_Lead_ID__c'),false,'required fields are not flagged optional');
- plAssert_(names.indexOf('Lead_Category__c')<0,'the template leftover stays gone');
+ plAssertEq_(usageOf('Lead_Category__c'),'write','[D-035] Lead_Category__c is back as a write-only field');
+ plAssertEq_(optionalOf('Lead_Category__c'),true,'probed like the other optional fields, so an org without it still gets a Lead');
 
  // 用法标注要正确 —— write-only 与 read+write 要分得开
  function usageOf(n){var j;for(j=0;j<used.length;j++)if(used[j].name===n)return used[j].usage;return '';}
@@ -1408,8 +1428,15 @@ function testPlentiFieldSelfCheck(){
  plAssert_(gap.missing[0].indexOf(skipped)===0,'and named exactly');
  plAssert_(gap.missing[0].indexOf('write')>=0,'together with how the code uses it');
 
- // 这正是本轮撞到的那一发:Lead_Category__c 若还在,自检应当报出来
- var withCategory=withDescribe(names,function(){
+ // 这正是 R11 撞到的那一发:org 里没有 Lead_Category__c(沙箱),而 SOQL 又去读它,
+ // 自检应当报出来。[D-035] 它现在是可选的**写入**字段,但被无条件**读取**时
+ // 必须回到必需清单 —— 读一个不存在的字段整条查询就失败,探测救不了。
+ var noCategory=[];
+ for(j=0;j<names.length;j++)if(names[j]!=='Lead_Category__c')noCategory.push(names[j]);
+ var sandboxLike=withDescribe(noCategory,function(){return plTestDescribeLead();});
+ plAssertEq_(sandboxLike.missing.length,0,'[D-035] an org without Lead_Category__c is not an error for the write path');
+ plAssert_(sandboxLike.optionalMissing.indexOf('Lead_Category__c')>=0,'it is reported as an absent optional field');
+ var withCategory=withDescribe(noCategory,function(){
   var saved=plLeadFields_;
   plLeadFields_=function(){return saved()+',Lead_Category__c';};
   try{return plTestDescribeLead();}finally{plLeadFields_=saved;}
@@ -1657,7 +1684,7 @@ function testPlentiCreatedDurability(){
   var realReq=ivReq_,realQuery=ivQuery_;
   plLeadFieldMap_.cache=null;
   ivReq_=function(path,method,data){
-   if(path==='sobjects/Lead/describe')return {fields:[]};
+   if(path==='sobjects/Lead/describe')return {fields:[plTestCategoryField_()]};
    if(method==='post'){lead={Id:'00Qdur00000002AAA',Description:data.Description,IsConverted:false,Status:'New'};return {id:lead.Id};}
    return {};
   };
@@ -2213,7 +2240,83 @@ function testPlentiReviewMeansHelpNeeded(){
  plTestClearState_();
 }
 
+// ============================================================
+// 30. [D-035] Lead_Category__c —— 生产 Round Robin 的分派条件
+// ============================================================
+
+function testPlentiLeadCategory(){
+ plTestBaseline_();
+ var p=PropertiesService.getScriptProperties();
+ // describeFields: 假 describe 返回的字段;null 表示 describe 本身失败
+ function run(describeFields){
+  plTestClearState_();
+  plLeadFieldMap_.cache=null;
+  var linked=plTestMessage_('trusted-referral-with-link'),lead=null,posts=[],out={};
+  var realReq=ivReq_,realQuery=ivQuery_;
+  ivReq_=function(path,method,data){
+   if(path==='sobjects/Lead/describe'){if(describeFields===null)throw new Error('SIMULATED DESCRIBE FAILURE');return {fields:describeFields};}
+   if(method==='post'){posts.push(data);lead={Id:'00Qcat000000001AAA',Description:data.Description,IsConverted:false,Status:'New'};return {id:lead.Id};}
+   return {};
+  };
+  ivQuery_=function(){return lead?[lead]:[];};
+  try{
+   plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(){out.state=plProcess_(linked,false);});
+  }finally{ivReq_=realReq;ivQuery_=realQuery;plLeadFieldMap_.cache=null;}
+  out.posts=posts;
+  out.lock=p.getProperty('IV2_CREATE_'+linked.getId());
+  return out;
+ }
+
+ // ---- 1. 字段在、值合法 → 写上,干净的 done ----
+ var ok=run([plTestCategoryField_()]);
+ plAssertEq_(ok.posts.length,1,'one Lead');
+ plAssertEq_(ok.posts[0].Lead_Category__c,'New Sales Enquiry','the category comes from PLENTI_LEAD_CATEGORY');
+ plAssert_(!/NOT ROUTED/.test(ok.posts[0].Description),'no routing warning when the category is written');
+ plAssertEq_(ok.state.state,'done','a routed clean Lead is done (Q18)');
+
+ // ---- 2. 属性缺失 → 上锁之前就停,不发 POST ----
+ p.deleteProperty('PLENTI_LEAD_CATEGORY');
+ var missing=run([plTestCategoryField_()]);
+ plAssertEq_(missing.posts.length,0,'a missing property must stop before any POST');
+ plAssertEq_(missing.lock,null,'and before the create lock — no L-01 manual clean-up');
+ plAssertEq_(missing.state.state,'error','it is a configuration error that freezes the run until fixed');
+ plAssert_(/Configure PLENTI_LEAD_CATEGORY/.test(missing.state.reason),'the reason names the property');
+ // 字段不存在的 org 也要求配置:切到生产那天才发现没配就晚了
+ var missingNoField=run([]);
+ plAssertEq_(missingNoField.posts.length,0,'the property is required even where the field does not exist');
+ p.setProperty('PLENTI_LEAD_CATEGORY','New Sales Enquiry');
+
+ // ---- 3. 受限 picklist:值不在活跃列表里 → 上锁之前就停 ----
+ ['Plenti','new sales enquiry','Retired Category'].forEach(function(bad){
+  p.setProperty('PLENTI_LEAD_CATEGORY',bad);
+  var r=run([plTestCategoryField_()]);
+  plAssertEq_(r.posts.length,0,'"'+bad+'" must never reach the POST — the restricted picklist would fail it');
+  plAssertEq_(r.lock,null,'"'+bad+'" is rejected before the lock');
+  plAssert_(/not an active Lead_Category__c picklist value/.test(r.state.reason),'"'+bad+'": the reason explains why');
+  plAssert_(/New Sales Enquiry/.test(r.state.reason),'"'+bad+'": and lists the active values');
+ });
+ p.setProperty('PLENTI_LEAD_CATEGORY','New Sales Enquiry');
+
+ // ---- 4. 字段不可写 → Lead 照建(SLA 不等人),但落 review 并在三处报警 ----
+ var cases=[
+  [[],'the field does not exist (sandbox)'],
+  [[{name:'Lead_Category__c',createable:false,type:'picklist',picklistValues:[{value:'New Sales Enquiry',active:true}]}],'the integration user cannot edit it (the likely production cause)'],
+  [null,'describe failed']
+ ];
+ cases.forEach(function(c){
+  var r=run(c[0]);
+  plAssertEq_(r.posts.length,1,c[1]+': the Lead is still created — the SLA clock does not wait');
+  plAssert_(!('Lead_Category__c' in r.posts[0]),c[1]+': the field is omitted, otherwise the whole POST would fail');
+  plAssertEq_(r.state.state,'review',c[1]+': nobody will be assigned, which is exactly "needs a human" (Q18)');
+  plAssert_(/\[NOT ROUTED/.test(r.state.reason),c[1]+': the reason says why');
+  plAssertEq_(ivLeadLabelFlags_([r.state]).review,true,c[1]+': SF-Lead-Review lights');
+  plAssert_(/\[NOT ROUTED/.test(r.posts[0].Description),c[1]+': the Description tells the admin who ends up owning it');
+ });
+ plTestClearState_();
+}
+
 function runPlentiRegressionTests(){
+ testPlentiLeadCategory();
  testPlentiReviewMeansHelpNeeded();
  testPlentiOutOfScopeState();
  testPlentiLinkHost();
