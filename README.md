@@ -267,8 +267,13 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
   正文和原因),但**不占标签** —— 否则进组当天真正的 lead 会被业务邮件淹掉。
   可见面从 Gmail 标签移到 Messages 表,可见性本身没有降低。
 - **手动转发的 Plenti 邮件会被单独标为 `forwarded`**,不会被当成疑似伪造。
-  判据是 `From` 在内部域上 —— ⚠️ `From` 可伪造,所以它**只影响 reason 措辞,
-  不影响是否打标签**。
+  判据是**没有 `X-Original-Sender`**(D-030)—— 不能看 `From`:发件域 DMARC
+  `p=REJECT` 时 Google Groups 会把 `From` 改写成组地址,组投递的邮件 `From`
+  永远在内部域上。该区分**只影响 reason 措辞,不影响是否打标签**。
+- ⚠️ **`PLENTI_TRUSTED_SENDERS` 必须填精确的 referral 发信地址,不能填整个
+  `@plenti.com.au` 域**(D-030)。Plenti 有多条业务线往 eDocs 发信,填整个域的话,
+  其他业务线的邮件只要带 Customer.io 链接就会**建出垃圾 Lead**。发件人不在清单
+  里时,reason 会原样打出该地址,告诉你该往清单里加什么。
 - **`SF-Lead-Updated` 在 Plenti 路径上永远不亮**(D-024)。它唯一的触发条件
   `verifiedFields` 只有 `Legacy.gs` 里的回复补录逻辑会写,而主干不调用它。
 - **Plenti 不提供任何联系方式**,电话和邮箱只在 Plenti Portal 里,而 Portal

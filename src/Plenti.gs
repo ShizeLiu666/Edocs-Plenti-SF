@@ -641,7 +641,10 @@ function plEnrichFromBrowserView_(message,parsed){
  * 与噪音量无关,所以不需要先跑几天看数据。
  *
  *   无链接 → 普通业务邮件。落 review 状态、进 Messages 表,**不打标签**。
- *   有链接 → 要么是认证头丢了的真转介(漏单),要么是伪造。**必须打标签。**
+ *   有链接 → **必须打标签**,再按原因细分措辞(scope):
+ *     forwarded                 手动转发(没有 X-Original-Sender)
+ *     unlisted-sender-with-link 经组投递,发件人不在可信清单(认证未评估)
+ *     unverified-with-link      认证失败 —— 认证头丢了的真转介,或伪造
  *
  * ⚠️ 不违反"绝不静默丢弃":状态照常存进 Script Properties,消息照常在
  * Messages 表里留一整行(含完整正文),人看得见 —— 只是不占 Gmail 标签。
@@ -657,18 +660,41 @@ function plEnrichFromBrowserView_(message,parsed){
  * 绝不用来降低可见性** —— 两类的 leadCandidate 都是 true,标签照打。
  * reason 里也明说了 From 可伪造,提醒人别把它当结论。
  */
-function plUnverifiedReview_(message,baseReason){
+function plUnverifiedReview_(message,baseReason,source){
  if(!plBrowserViewUrl_(message)){
   return {leadCandidate:false,scope:'out-of-scope',
    reason:'Out of scope: no Plenti browser-view link in this message, so it is ordinary mailbox traffic rather than a referral. State and full body are recorded in the Messages log; no Gmail label applied. ('+baseReason+')'};
  }
- var from=plAddress_(message.getFrom()),internal=from!==''&&plDomain_(from)===ivInternalDomain_();
+ // [R18] "同事转发"必须**没有** X-Original-Sender。
+ //
+ // 第一封真实组投递邮件证实:发件域设了 DMARC p=REJECT 时,Google Groups 会把
+ // From 改写成**组地址**(edocs@<内部域>)。所以组投递的邮件 From 永远落在内部域上,
+ // 旧判据会把每一封"经组投递、但发件人不在可信清单里"的带链接邮件都标成
+ // "FORWARDED BY A COLLEAGUE" —— 而且 reason 还声称"组投递的头缺失",事实上
+ // 那些头都在。
+ //
+ // 真正的区分是投递方式:组投递带 X-Original-Sender,手动转发不带。
+ // 组投递的邮件 From 没有信息量,不看它。
+ var from=plAddress_(message.getFrom()),viaGroup=plHeader_(message,'X-Original-Sender')!=='';
+ var internal=!viaGroup&&from!==''&&plDomain_(from)===ivInternalDomain_();
  if(internal){
   return {leadCandidate:true,scope:'forwarded',
    reason:'FORWARDED BY A COLLEAGUE ('+from+'): carries a Plenti browser-view link, and the Google Groups headers are missing because it was forwarded rather than delivered through the group — not a missed referral and not a spoof. NOTE: From can be forged, so this wording is a hint, not a verdict. ('+baseReason+')'};
  }
+ // [R18] 发件人**不在清单里**和**认证失败**是两回事,措辞必须分开。
+ //
+ // isPlentiSource_ 先查清单(第 2 步)再查认证(第 3、4 步),所以"不在清单"
+ // 时认证状态根本没被评估 —— 不能说它"可能是冒充"。第一封真实组投递邮件
+ // (WA Battery Scheme)正是这种情况:DMARC 完全通过,只是那个地址不在清单里。
+ //
+ // 更要紧的是:**第一封真实 referral 在其发信地址被加进清单之前,也会落在这里**。
+ // 所以这里把 X-Original-Sender 原样打出来 —— 系统自己告诉你该往清单里加什么。
+ if(source&&source.sender&&source.reason==='Sender is not listed in PLENTI_TRUSTED_SENDERS'){
+  return {leadCandidate:true,scope:'unlisted-sender-with-link',
+   reason:'⚠️ SENDER NOT IN TRUSTED LIST: '+source.sender+' sent a message carrying a Plenti browser-view link. If this is a referral, add '+source.sender+' to PLENTI_TRUSTED_SENDERS. It may also be another Plenti business line using the same mail platform, or a spoof — authentication was not evaluated because the sender is unlisted. ('+baseReason+')'};
+ }
  return {leadCandidate:true,scope:'unverified-with-link',
-  reason:'⚠️ NEEDS A HUMAN: carries a Plenti browser-view link but the sender could not be verified — either a genuine referral whose authentication headers were lost in transit, or an impersonation attempt. ('+baseReason+')'};
+  reason:'⚠️ NEEDS A HUMAN: carries a Plenti browser-view link but the sender failed verification — either a genuine referral whose authentication headers were lost in transit, or an impersonation attempt. ('+baseReason+')'};
 }
 
 // ============================================================
@@ -1517,13 +1543,13 @@ function plProcess_(message,force,detail){
   }
   // [R15] "没能确认为可信 Plenti 发件人"有两个入口:发件人头缺失(转发件走这条)
   // 和可信验证不通过。两者的可见性判定完全相同,合成一处,见 D-027。
-  var unverified='';
+  var unverified='',source=null;
   if(excluded&&excluded.unverified){
    detail.sender='';
    detail.trusted=false;
    unverified=excluded.reason;
   }else{
-   var source=isPlentiSource_(message);
+   source=isPlentiSource_(message);
    detail.sender=source.sender;
    detail.trusted=source.trusted;
    if(!source.trusted){
@@ -1532,7 +1558,7 @@ function plProcess_(message,force,detail){
    }
   }
   if(unverified){
-   var visibility=plUnverifiedReview_(message,unverified);
+   var visibility=plUnverifiedReview_(message,unverified,source);
    state.kind='review';
    state.state='review';
    state.leadCandidate=visibility.leadCandidate;

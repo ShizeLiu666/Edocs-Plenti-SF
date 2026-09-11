@@ -1747,6 +1747,105 @@ describe 失败(拿不到 picklist)时不阻断,照配置的值写 —— 与可
 
 ---
 
+## D-030 第一封真实组投递邮件:四项确认、一个 bug、一个设计缺口
+
+**日期** 2026-09-11 · **阶段** R18
+
+进组后收到第一封经 Google Groups 投递的真实 Plenti 邮件(WA Battery Scheme,
+不是 referral),身份相关的头都在。**这是 §5.1 可信验证第一次拿到真实输入。**
+
+### 四项确认
+
+| # | 结论 |
+|---|---|
+| 1 | `dmarc=pass (p=REJECT sp=REJECT dis=NONE)`,Plenti 是严格拒绝策略。用真实头跑 `isPlentiSource_`:`dmarc=pass` 命中;`header.from` 提取到 `plenti.com.au`,**不会误取 dkim 段里的 `header.i`**;与 `X-Original-Sender` 域名对齐。D-009 的严格版判定现在有真实依据了 |
+| 2 | 代码**只读** `X-Original-Authentication-Results`(Plenti.gs:249),全仓库没有任何地方读顶层的 `Authentication-Results`。对照:顶层那个 `dmarc=fail header.from=sunterra.com.au`,取错了就每封都判不可信 |
+| 3 | 代码**没有任何地方**直接读或比对 `List-ID` 的值。唯一相关的是 Gmail 的 `list:` 搜索操作符 —— ⚠️ 见下 |
+| 4 | `X-Original-From` 未使用,记着 |
+
+#### ⚠️ `list:` 操作符是今天唯一还没验证的环节
+
+`runIntakeV2` 的查询是 `list:edocs@sunterra.com.au`,而 `List-ID` 的值是
+`<edocs.sunterra.com.au>`(点号)。**我不确定 Gmail 会把 `@` 形式映射到点号形式。**
+如果不匹配,`runIntakeV2` 一封信都搜不到 —— 比任何身份问题都靠前。
+
+**验证只要 10 秒**:在 Gmail 搜索框里分别搜 `list:edocs@sunterra.com.au`
+和 `list:edocs.sunterra.com.au`,看 WA 那封出不出来。规格 §5.7 早就把这一项
+标为"待样本验证"。
+
+### 🐛 Bug:组投递的邮件被误判成"同事转发"(已修复)
+
+**D-027 的转发判据是"`From` 在内部域上"。真实头证明它是错的:**
+
+```
+From: "'Plenti - Western Australia Battery Scheme' via Sunterra E-Documents" <edocs@sunterra.com.au>
+```
+
+发件域设了 DMARC `p=REJECT` 时,**Google Groups 会把 `From` 改写成组地址** ——
+而组地址就在内部域上。所以每一封"经组投递、发件人不在可信清单、带 Plenti 链接"
+的邮件,都会被标成:
+
+> FORWARDED BY A COLLEAGUE (edocs@sunterra.com.au): ... the Google Groups headers are missing because it was forwarded ...
+
+**两处都是错的**:不是同事转发,而且组投递的头明明都在。
+
+**修复**:真正的区分是**投递方式** —— 组投递带 `X-Original-Sender`,手动转发不带。
+`forwarded` 现在要求 `X-Original-Sender` **不存在**。组投递的邮件 `From` 没有信息量,不看。
+有回归断言复现了真实的改写后 `From`。
+
+标签不受影响(两类都打标签),错的只是措辞 —— 但措辞错得正好会让人放松警惕。
+
+### 措辞按失败原因拆开,并报出发件地址
+
+`isPlentiSource_` **先查清单(第 2 步)再查认证(第 3、4 步)**。所以"不在清单"时
+认证状态根本没被评估,**不能说它"可能是冒充"** —— WA 那封 DMARC 完全通过,
+只是地址不在清单里。现在四类:
+
+| scope | 情形 | 标签 |
+|---|---|---|
+| `out-of-scope` | 没有 Plenti 链接 | 不打 |
+| `forwarded` | 手动转发(没有 `X-Original-Sender`) | 打 |
+| `unlisted-sender-with-link` | 经组投递,**发件人不在清单**,认证未评估 | 打 |
+| `unverified-with-link` | 发件人**在清单里但认证失败** —— 真正的伪造信号 | 打,显眼 |
+
+**`unlisted-sender-with-link` 的 reason 会原样打出发件地址:**
+
+> ⚠️ SENDER NOT IN TRUSTED LIST: `<地址>` sent a message carrying a Plenti browser-view link. If this is a referral, add `<地址>` to PLENTI_TRUSTED_SENDERS ...
+
+这直接解决"要等下一封真实 referral 才能拿到准确地址"—— **第一封真 referral 在它的
+地址被加进清单之前就会落在这里,系统自己告诉你该加什么。**
+
+### ⚠️ 设计缺口:"带 Plenti 链接" ≠ "是 referral"
+
+D-019 的判定门是"拿到 delivery token 就是 referral",D-027 的收窄判据是"带 Plenti
+链接就打标签"。**两者都默认了只有 referral 邮件才带 Customer.io 的 browser-view 链接。**
+
+Plenti 至少有两条业务线往 eDocs 发信。**如果 WA Battery Scheme 的邮件也是经
+Customer.io 发的(很可能),它也会带同样形态的链接。** 模拟结果:
+
+| 情况 | 结果 |
+|---|---|
+| A. WA 邮件**无** Customer.io 链接 | `out-of-scope`,不打标签 ✅ 符合预期 |
+| B. WA 邮件**有**链接,清单只含 referral 地址 | `unlisted-sender-with-link`,**打标签** —— Q10 想挡掉的噪音挡不住 |
+| C. 清单误填整个 `@plenti.com.au` | ⚠️ **建出一条垃圾 Lead**(DEGRADED,无客户姓名) |
+
+**C 证实了 Jack 的判断,而且比预期更严重**:不只是"被当成可信来源",而是会
+**真的建 Lead** —— 因为判定门只看 token。所以 `PLENTI_TRUSTED_SENDERS` 必须是
+**精确的 referral 发信地址**,不能填整个域。这一点现在是硬性要求,不只是建议。
+
+**B 需要 Jack 决定。** 先查一件事就能判断它是不是真问题:在那封 WA 邮件的原文里
+搜 `customeriomail.com/deliveries/`。搜不到,B 就不存在;搜得到,有两个方向:
+
+- 收窄判据:要求"带链接**且**正文里有 referral 模板的字段标签"(例如 `Customer name`)
+  才打标签。代价:认证失败 **且** 邮件正文为空的真 referral(双重故障)会只进
+  Messages 表、不打标签
+- 或按主题收窄(`Action required: New lead`)。主题可伪造,但这里只影响打不打标签、
+  不影响建不建 Lead
+
+两种都**只影响未验证邮件的标签**,不碰判定门,所以不会让任何可信 referral 漏建。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,

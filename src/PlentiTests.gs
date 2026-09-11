@@ -1755,9 +1755,19 @@ function testPlentiScopeNarrowing(){
    'X-Original-Authentication-Results':'mx; dmarc=fail header.from=attacker.example'},
   body:'View in Browser: '+link+'\n'}));
  plAssertEq_(suspicious.leadCandidate,true,'a Plenti link with an unverifiable sender must be labelled');
- plAssertEq_(suspicious.scope,'unverified-with-link','and categorised as needing a human');
- plAssert_(/NEEDS A HUMAN/.test(suspicious.reason),'the reason is loud');
+ plAssertEq_(suspicious.scope,'unlisted-sender-with-link','an unlisted sender: authentication is never evaluated, so we cannot call it a spoof (R18)');
+ plAssert_(/SENDER NOT IN TRUSTED LIST: referrals@attacker\.example/.test(suspicious.reason),'the reason names the sender so it can be added to the list if legitimate');
+ plAssert_(/could also be|may also be/.test(suspicious.reason),'and still mentions it may be a spoof');
  plAssertEq_(ivLeadLabelFlags_([suspicious]).review,true,'SF-Lead-Review lights');
+
+ // ---- 2b. [R18] 发件人在清单里、但认证失败 → 这才是"疑似伪造" ----
+ var authFailed=run(make({id:'scope-auth-failed',subject:'Action required: New lead',
+  headers:{'To':'eDocs <edocs@example.org>','X-Original-Sender':'referrals@plenti.example',
+   'X-Original-Authentication-Results':'mx; dkim=fail; dmarc=fail header.from=plenti.example'},
+  body:'View in Browser: '+link+'\n'}));
+ plAssertEq_(authFailed.scope,'unverified-with-link','a LISTED sender that fails authentication is the real spoof signal');
+ plAssert_(/NEEDS A HUMAN/.test(authFailed.reason),'and the reason is loud');
+ plAssert_(/failed verification/.test(authFailed.reason),'naming it as a verification failure');
 
  // ---- 3. 同事手动转发 → 也打标签,但 reason 区分得出来 ----
  //     这正是我们测的那封:没有 X-Original-Sender,但链接完整保留。
@@ -1781,6 +1791,24 @@ function testPlentiScopeNarrowing(){
   body:'View in Browser: '+link+'\n'}));
  plAssertEq_(spoofedFrom.leadCandidate,true,'forging From must NOT suppress the label');
  plAssertEq_(ivLeadLabelFlags_([spoofedFrom]).review,true,'the label still lights');
+ plAssert_(spoofedFrom.scope!=='forwarded','and with X-Original-Sender present it is NOT presented as a colleague forward (R18)');
+
+ // ---- 3b. [R18] 真实组投递:From 被改写成组地址 ----
+ //      第一封真实组投递邮件证实:发件域 DMARC p=REJECT 时,Google Groups 把 From
+ //      改写成组地址,而组地址在内部域上。旧判据会把它误判成"同事转发"。
+ var viaGroup=run(make({id:'scope-via-group',subject:'Scheme update',
+  from:'"\'Plenti Scheme\' via Group" <edocs@example.org>',
+  // 发件人刻意选在可信清单**之外**:测试基线信任整个 @plenti.example 域,
+  // 用 @plenti.example 的地址会直接通过可信验证并建出 Lead(见 D-030 的情况 C)。
+  headers:{'To':'eDocs <edocs@example.org>','X-Original-Sender':'scheme@schemes.example',
+   'X-Original-Authentication-Results':'mx; dkim=pass; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=schemes.example',
+   'List-ID':'<edocs.example.org>'},
+  body:'View in Browser: '+link+'\n'}));
+ plAssert_(viaGroup.scope!=='forwarded','a group-delivered message whose From was rewritten to the group address must NOT be called a colleague forward');
+ plAssertEq_(viaGroup.scope,'unlisted-sender-with-link','it came through the group from a sender outside the trusted list');
+ plAssert_(/scheme@schemes\.example/.test(viaGroup.reason),'and the reason tells you exactly which address to add if it is legitimate');
+ plAssert_(!/FORWARDED BY A COLLEAGUE/.test(viaGroup.reason),'the reason must not claim the group headers are missing — they are present');
+ plAssertEq_(viaGroup.leadCandidate,true,'still labelled: it carries a Plenti link');
 
  // ---- 4. 判据只看链接存在,绝不发起抓取 ----
  plTestClearState_();
@@ -1807,7 +1835,7 @@ function testPlentiScopeNarrowing(){
 
  plTestClearState_();
  plTestBaseline_();
- console.log('PASS: 22 scope-narrowing cases (label reserved for Plenti-linked mail; forwards distinguished)');
+ console.log('PASS: 33 scope-narrowing cases (label reserved for Plenti-linked mail; forward / unlisted / auth-failed told apart)');
 }
 
 // ============================================================
