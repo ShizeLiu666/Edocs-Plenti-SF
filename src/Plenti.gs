@@ -1591,7 +1591,10 @@ function plProcess_(message,force,detail){
    state.leadCandidate=visibility.leadCandidate;
    state.scope=visibility.scope;
    state.reason=visibility.reason;
-   ivSave_(id,state);
+   // [Q17 第 2 步] out-of-scope 只落最小形式(D-032);**返回的仍是完整状态**,
+   // Messages 表那一行照常带完整 reason。其他三类(带链接)量极少且要打标签,
+   // 照旧完整落盘。
+   if(visibility.scope==='out-of-scope')ivSaveOutOfScope_(id,state);else ivSave_(id,state);
    return state;
   }
   var parsed=parsePlentiReferral_(message);

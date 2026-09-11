@@ -437,8 +437,122 @@ props.delete('INTAKE_LOG_SHEET_ID');
 searchCalls = 0;
 props.delete('IV2_MSG_wire-in-scope');
 props.delete('IV2_MSG_wire-html-only');
+// [Q17] 上一轮把 watermark 推到了现在,lower 随之变成 now−48h,而这些 fixture
+// 的日期是 2026-09-08 —— 不删的话主循环会按窗口跳过它们,这条用例就成了空转。
+props.delete('INTAKE_V2_WATERMARK');
 sheets.openById = () => { throw new Error('openById must not be called when no sheet is configured'); };
 assert.doesNotThrow(() => context.runIntakeV2(), 'no sheet configured means no logging, not an error');
+assert.ok(props.has('IV2_MSG_wire-in-scope'), 'the messages were really processed in this run, so the no-sheet path was exercised');
 console.log('PASS: sheet logging is optional and never fails the run');
+
+// ──────────────────────────────────────────────────────────────
+// 10. [Q17] 扫描窗口对齐 + out-of-scope 状态清理(D-032)
+//
+// 固定 watermark = 2026-09-10T00:00Z → lower = 2026-09-08T00:00Z。
+// ──────────────────────────────────────────────────────────────
+{
+  const WATERMARK = '2026-09-10T00:00:00.000Z';
+  const LOWER = '2026-09-08T00:00:00.000Z';
+  const OLD = '2026-09-07T01:00:00.000Z';        // lower 之前,但在 INTAKE_V2_START 之后
+  const IN_WINDOW = '2026-09-08T12:00:00.000Z';  // lower 之后,但早于任何 now−48h
+  const recent = new Date(Date.now() - 3600e3).toISOString();
+  const noiseMessage = (id, when) => ({
+    getId: () => id,
+    getSubject: () => 'Monthly newsletter',
+    getFrom: () => 'eDocs Group <edocs@example.org>',
+    getDate: () => new Date(when),
+    getPlainBody: () => 'An ordinary newsletter with no referral link.\n',
+    getBody: () => '',
+    getHeader: (name) => ({
+      To: 'eDocs <edocs@example.org>',
+      'X-Original-Sender': 'news@elsewhere.example',
+      'X-Original-Authentication-Results': 'mx.example.org; dmarc=pass header.from=elsewhere.example'
+    })[name] || '',
+    getRawContent: () => { throw new Error('getRawContent must not be called'); },
+    getThread: () => { throw new Error('getThread must not be called'); }
+  });
+  // 同一条 thread:一封早已滑出窗口的旧邮件(状态已被清理 = 没有状态),
+  // 加一封新到的。Gmail 检索因为新邮件命中而返回整条 thread。
+  const grownThread = {
+    getMessages: () => [noiseMessage('q17-old-in-thread', OLD), noiseMessage('q17-new', recent)],
+    addLabel: () => {}, removeLabel: () => {}
+  };
+  const rows = [];
+  const tab = { getLastRow: () => rows.length, appendRow: (r) => rows.push(r),
+    getRange: () => ({ setValues: (v) => v.forEach((r) => rows.push(r)) }) };
+  const summary = { getLastRow: () => 1, appendRow: () => {} };
+  const book = { getSheets: () => [summary], getNumSheets: () => 2, getSheetByName: () => tab, insertSheet: () => tab };
+  const runOnce = () => {
+    let calls = 0;
+    gmail.search = () => (calls++ === 0 ? [grownThread] : []);
+    context.runIntakeV2();
+  };
+
+  props.clear();
+  for (const [k, v] of Object.entries({
+    INTAKE_V2_ENABLED: 'true', EDOCS_ADAPTATION_VALIDATED: 'true',
+    INTAKE_V2_START: '2026-09-07T00:00:00+09:30', INTAKE_V2_WATERMARK: WATERMARK,
+    EDOCS_GROUP_ADDRESS: 'edocs@example.org', INTAKE_RECIPIENT_ALLOWLIST: 'edocs@example.org',
+    INTERNAL_DOMAIN: 'example.org', PLENTI_TRUSTED_SENDERS: '@plenti.example',
+    INTAKE_MAILBOX: 'edocs-copy@example.org', PLENTI_LEAD_SOURCE: 'Plenti Referrals',
+    INTAKE_LOG_SHEET_ID: 'fixture-sheet-id'
+  })) props.set(k, v);
+  const seed = {
+    'q17-purge-min': { state: 'review', scope: 'out-of-scope', date: OLD },
+    'q17-purge-legacy': { state: 'review', kind: 'review', scope: 'out-of-scope', leadCandidate: false,
+      reason: 'Out of scope: fictional pre-Q17 full-size state. '.repeat(6), date: OLD, at: OLD },
+    'q17-keep-in-window': { state: 'review', scope: 'out-of-scope', date: IN_WINDOW },
+    'q17-keep-error': { state: 'error', scope: 'out-of-scope', leadCandidate: true, reason: 'fictional', date: OLD },
+    'q17-keep-created': { state: 'review', kind: 'referral', created: true, record: '00Qq17000000001AAA', leadCandidate: true, date: OLD },
+    'q17-keep-with-link': { state: 'review', scope: 'unlisted-sender-with-link', leadCandidate: true, date: OLD },
+    'q17-keep-internal': { state: 'done', kind: 'internal', reason: 'Internal sender', date: OLD }
+  };
+  for (const [id, s] of Object.entries(seed)) props.set(`IV2_MSG_${id}`, JSON.stringify(s));
+  props.set('IV2_MSG_q17-keep-unparsable', 'not json');
+  props.set('IV2_CREATE_q17-keep-created', JSON.stringify({ state: 'created', id: '00Qq17000000001AAA' }));
+  gmail.getMessageById = () => null;   // ivRefreshOutstanding_ 会去拿 error / review 的消息
+  gmail.getUserLabelByName = (name) => ({ name });
+  sheets.openById = () => book;
+
+  // ── 第一轮:watermark 被 error 冻结 ──
+  runOnce();
+  assert.ok(!props.has('IV2_MSG_q17-purge-min'), 'a minimal out-of-scope state outside the window is purged');
+  assert.ok(!props.has('IV2_MSG_q17-purge-legacy'), 'a pre-Q17 full-size out-of-scope state outside the window is purged too');
+  for (const id of ['q17-keep-in-window', 'q17-keep-error', 'q17-keep-created', 'q17-keep-with-link', 'q17-keep-internal', 'q17-keep-unparsable'])
+    assert.ok(props.has(`IV2_MSG_${id}`), `${id} must survive the purge`);
+  assert.ok(props.has('IV2_CREATE_q17-keep-created'), 'create locks are never touched');
+  assert.equal(props.get('INTAKE_V2_WATERMARK'), WATERMARK, 'pending errors keep the watermark frozen (unchanged behaviour)');
+
+  // 第 1 步:thread 带回来的旧邮件不再被处理
+  assert.ok(!props.has('IV2_MSG_q17-old-in-thread'),
+    'an old message brought back by its thread must not be reprocessed — this is what makes the purge safe');
+  assert.ok(props.has('IV2_MSG_q17-new'), 'the new message in the same thread is processed');
+  const loggedIds = rows.filter((r) => r[2] !== 'Gmail message ID').map((r) => r[2]);
+  assert.deepEqual([...loggedIds], ['q17-new'], 'only the new message reaches the Messages tab — no duplicate row for the old one');
+
+  // 第 2 步:落盘最小,Messages 行仍带完整 reason
+  const stored = props.get('IV2_MSG_q17-new');
+  assert.ok(stored.length <= 80, `minimal state expected, got ${stored.length} bytes: ${stored}`);
+  const newRow = rows.find((r) => r[2] === 'q17-new');
+  assert.match(newRow[10], /Out of scope: no Plenti browser-view link/, 'the Messages row still carries the full reason');
+
+  // ── 第二轮:watermark 仍冻结。按 now−48h 清理的话 IN_WINDOW 会被误删 ──
+  runOnce();
+  assert.ok(props.has('IV2_MSG_q17-keep-in-window'),
+    'with the watermark frozen, lower stays at the old value — a state still inside that window must not be purged');
+  assert.equal(rows.filter((r) => r[2] === 'q17-new').length, 1, 'an already-processed message is not logged twice');
+
+  // ── 第三轮:清掉 error,watermark 推进到现在,IN_WINDOW 滑出窗口 ──
+  props.delete('IV2_MSG_q17-keep-error');
+  props.delete('IV2_MSG_q17-keep-unparsable');   // 无法解析的也被当作 error、冻结 watermark
+  runOnce();
+  assert.notEqual(props.get('INTAKE_V2_WATERMARK'), WATERMARK, 'with no errors pending the watermark advances');
+  runOnce();                                      // 新 lower = now−48h 的这一轮才会清掉它
+  assert.ok(!props.has('IV2_MSG_q17-keep-in-window'), 'once the window moves past it, the state is purged');
+  assert.ok(props.has('IV2_MSG_q17-new'), 'a recent state is still inside the new window');
+  for (const id of ['q17-keep-created', 'q17-keep-with-link', 'q17-keep-internal'])
+    assert.ok(props.has(`IV2_MSG_${id}`), `${id} is never purged, no matter how old`);
+  console.log(`PASS: Q17 — window-aligned loop, minimal out-of-scope state (${stored.length} bytes), purge bounded by the same lower`);
+}
 
 props.clear();

@@ -2059,7 +2059,75 @@ function testPlentiLinkHost(){
 // 入口
 // ============================================================
 
+// ============================================================
+// 28. [Q17] out-of-scope 状态最小落盘 + 窗口外清理判定(D-032)
+//     主循环接线(thread 带回旧邮件、冻结 watermark)在 test/offline.cjs 第 10 节。
+// ============================================================
+
+function testPlentiOutOfScopeState(){
+ plTestBaseline_();
+ var p=PropertiesService.getScriptProperties();
+ var link='https://e.customeriomail.com/deliveries/'+plTestBrowserToken_();
+ function make(id,body){
+  return plTestMessageFrom_({id:id,subject:'Invoice for August',date:'2026-09-10T02:00:00.000Z',
+   from:'Someone <someone@elsewhere.example>',
+   headers:{'To':'eDocs <edocs@example.org>','X-Original-Sender':'accounts@supplier.example',
+    'X-Original-Authentication-Results':'mx; dmarc=pass header.from=supplier.example'},
+   body:body});
+ }
+
+ // ---- 第 2 步:落盘最小,返回完整 ----
+ plTestClearState_();
+ var message=make('q17-noise','Just an ordinary business email.\n');
+ var returned=plTestWithFakeApi_(function(){return plProcess_(message,false);});
+ plAssertEq_(returned.scope,'out-of-scope','fixture is out of scope');
+ plAssert_(String(returned.reason).length>200,'the caller still gets the full reason for the Messages log');
+ var raw=p.getProperty('IV2_MSG_q17-noise'),stored=JSON.parse(raw);
+ // 以前约 454 字节。80 是上界不是目标:实际 72 左右,留一点余量给 state 取值变化。
+ plAssert_(raw.length<=80,'the persisted out-of-scope state must stay minimal, got '+raw.length+' bytes: '+raw);
+ plAssertEq_(Object.keys(stored).sort().join(','),'date,scope,state','only state, scope and date are persisted');
+ plAssertEq_(stored.date,'2026-09-10T02:00:00.000Z','date is the message date — the purge aligns to it');
+ plAssert_(stored.state!=='error','must never be error — the idempotency short-circuit depends on it');
+ plAssertEq_(ivLeadLabelFlags_([stored]).review,false,'the stored minimal state lights no Review label');
+ plAssertEq_(ivLeadLabelFlags_([stored]).created,false,'nor a Created label');
+ plTestWithFakeApi_(function(calls){
+  var again=plProcess_(message,false);
+  plAssertEq_(calls.length,0,'a second run performs no calls');
+  plAssertEq_(again.scope,'out-of-scope','and returns the stored minimal state');
+ });
+
+ // 带链接的几类照旧完整落盘:量极少,而且标签靠 leadCandidate
+ plTestClearState_();
+ plTestWithFakeApi_(function(){plProcess_(make('q17-with-link','View in Browser: '+link+'\n'),false);});
+ var linked=JSON.parse(p.getProperty('IV2_MSG_q17-with-link'));
+ plAssertEq_(linked.leadCandidate,true,'a with-link state keeps leadCandidate');
+ plAssert_(linked.reason&&linked.reason.length>50,'and keeps its full reason');
+
+ // ---- 第 3 步:哪些能删 ----
+ var lower=new Date('2026-09-08T00:00:00Z').getTime(),old='2026-09-07T01:00:00.000Z';
+ var cases=[
+  [{state:'review',scope:'out-of-scope',date:old},true,'minimal out-of-scope outside the window'],
+  [{state:'review',kind:'review',scope:'out-of-scope',leadCandidate:false,reason:'Out of scope: fictional',date:old,at:old},true,
+   'a pre-Q17 full-size out-of-scope state outside the window'],
+  [{state:'review',scope:'out-of-scope',date:'2026-09-08T12:00:00.000Z'},false,'inside the window'],
+  [{state:'review',scope:'out-of-scope',date:'2026-09-08T00:00:00.000Z'},false,'exactly at lower is still inside — same comparison as the main loop'],
+  [{state:'error',scope:'out-of-scope',date:old},false,'error is never purged'],
+  [{state:'done',scope:'out-of-scope',record:'00Qq17000000001AAA',date:old},false,'a state with a record is never purged'],
+  [{state:'done',scope:'out-of-scope',created:true,date:old},false,'a created state is never purged'],
+  [{state:'review',scope:'out-of-scope',leadCandidate:true,date:old},false,'a lead candidate is never purged'],
+  [{state:'review',scope:'unlisted-sender-with-link',leadCandidate:true,date:old},false,'with-link scopes are never purged'],
+  [{state:'done',kind:'internal',reason:'Internal sender',date:old},false,'other done states are outside the authorised scope (Q19)'],
+  [{state:'review',scope:'out-of-scope',date:null},false,'a null date must not turn into 1970 and get purged'],
+  [{state:'review',scope:'out-of-scope'},false,'a missing date is not purged'],
+  [{state:'review',scope:'out-of-scope',date:'not-a-date'},false,'an unparsable date is not purged'],
+  [null,false,'null']
+ ];
+ cases.forEach(function(c){plAssertEq_(ivPurgeable_(c[0],lower),c[1],c[2]);});
+ plTestClearState_();
+}
+
 function runPlentiRegressionTests(){
+ testPlentiOutOfScopeState();
  testPlentiLinkHost();
  testPlentiTwoSources();
  testPlentiScopeNarrowing();

@@ -64,6 +64,21 @@ function ivQuery_(q){var d=ivReq_('query?q='+encodeURIComponent(q));if(!d.done)t
 function ivKey_(id){return 'IV2_MSG_'+id;}
 function ivGet_(id){var s=PropertiesService.getScriptProperties().getProperty(ivKey_(id));return s?JSON.parse(s):null;}
 function ivSave_(id,s){s.at=new Date().toISOString();PropertiesService.getScriptProperties().setProperty(ivKey_(id),JSON.stringify(s));}
+// [Q17 第 2 步] out-of-scope 状态的最小落盘形式(D-032)。
+// 这类邮件占组流量的绝大多数(实测约 97%),完整状态每条约 454 字节 —— reason
+// 那段长说明占了大头 —— 按日均量约 6 个工作日就会撑满 Script Properties 的
+// 500KB 上限,而撑满的后果是**整条管道停摆**(L-04)。
+//
+// 只存三个字段,每个都有读者:
+//   state —— 必须存且不能是 'error':runIntakeV2 与 plProcess_ 的幂等短路靠它
+//            判定"处理过了"。
+//   scope —— 清理(ivPurgeOutOfScope_)只认这个标记。
+//   date  —— 清理按消息日期对齐扫描窗口。
+// 刻意不存 leadCandidate / record / kind:缺省即"不是线索",
+// ivLeadLabelFlags_ 与 ivRefreshOutstanding_ 都不会选中它。
+// 也不写 at:没有任何代码读它。
+// 完整 reason 不丢 —— 调用方拿到的是完整状态对象,Messages 表那一行照常写全。
+function ivSaveOutOfScope_(id,s){PropertiesService.getScriptProperties().setProperty(ivKey_(id),JSON.stringify({state:s.state,scope:'out-of-scope',date:s.date}));}
 function ivLabel_(th,name,add){var l=GmailApp.getUserLabelByName(name);if(!l&&add)l=GmailApp.createLabel(name);if(l){if(add)th.addLabel(l);else th.removeLabel(l);}}
 // [R11] 去掉 Lead_Category__c —— 模板遗留字段,Sunterra 的 org 里从来没建过。
 // 它被硬编码进 SOQL,导致查询报 INVALID_FIELD: No such column 'Lead_Category__c'。
@@ -230,13 +245,27 @@ function runIntakeV2(){
   // 只告警不拦截:sandbox 域名形态不是本项目能担保的判据,拦错了会挡住正常验收。
   if(String(p.getProperty('SF_LOGIN_URL')||'').indexOf('.sandbox.my.salesforce.com')<0)console.log('⚠️⚠️⚠️ PLENTI_FORCE_CREATE is enabled but SF_LOGIN_URL does not look like a sandbox. Confirm the target org before continuing.');
  }
+ // [Q17 第 3 步] 清理窗口外的 out-of-scope 状态。必须用**本轮这同一个 lower**,
+ // 不能另算 now−48h:有 error 时 watermark 冻结,lower 停在旧处,主循环仍在
+ // 重扫 lower 之后的邮件 —— 按 now−48h 清会删掉仍在窗口内的状态,导致每轮重处理。
+ // 放在主循环之前:耗时计入 220 秒扫描预算,单轮总时长仍受原有结构约束;
+ // 所有必填配置此时都已校验过,不会在配置缺失时先做写操作。
+ var purged=ivPurgeOutOfScope_(lower,began+45000);
  while(Date.now()-began<220000){
  var threads=GmailApp.search(query,offset,50);if(!threads.length){done=true;break;}
  for(var i=0;i<threads.length;i++){
  stats.threads++;
  var msgs=threads[i].getMessages(),inScope=false;
  for(var j=0;j<msgs.length;j++){
-  if(msgs[j].getDate().getTime()<cut.getTime())continue;
+  // [Q17 第 1 步] 以扫描窗口下界 lower 为界,而不是 INTAKE_V2_START(cut)。
+  // Gmail 检索按 thread 返回,getMessages() 会把 thread 里**所有**消息都带出来,
+  // 包括早已滑出窗口的旧消息。原来只挡 cut 之前的,所以一条老 thread 每来一封
+  // 新邮件,里面的旧邮件就全部回到循环里。Groups 把 p=REJECT 发件人的 From 改写成
+  // 组地址,同主题的邮件会并进同一条 thread,这种情况是常态,不是边角。
+  // 这一步是第 3 步(清理)的**前提**:没有它,被清理掉状态的旧邮件会随 thread
+  // 回来、被当成新邮件重新处理,Messages 表重复写行。见 D-032。
+  // lower>=cut 恒成立,原来那道 cut 检查被这一道完全覆盖。
+  if(msgs[j].getDate().getTime()<lower)continue;
   // [R1] 不命中白名单 → 整条跳过,不写状态、不打标签、不占 Properties。
   // [R7] 这类邮件也**不写进 Messages 页** —— 共用邮箱里它们占多数,全记会把表
   // 撑爆,而且我们没有理由留存这些邮件的内容。
@@ -264,7 +293,7 @@ function runIntakeV2(){
  if(i<threads.length)break;offset+=threads.length;if(threads.length<50){done=true;break;}}
  var all=p.getProperties(),errors=Object.keys(all).some(function(k){if(k.indexOf('IV2_MSG_')!==0)return false;try{return JSON.parse(all[k]).state==='error'}catch(e){return true}});
  if(done&&!errors)p.setProperty('INTAKE_V2_WATERMARK',new Date(began).toISOString());
- console.log(JSON.stringify({reviewed:count,skippedOutOfScope:stats.skipped,threads:stats.threads,created:stats.created,failed:stats.failed,forceCreate:stats.forced,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
+ console.log(JSON.stringify({reviewed:count,skippedOutOfScope:stats.skipped,purgedOutOfScopeStates:purged,threads:stats.threads,created:stats.created,failed:stats.failed,forceCreate:stats.forced,scanComplete:done,errorsPending:errors,watermark:p.getProperty('INTAKE_V2_WATERMARK')}));
  ivLogRun_(began,stats);
  ivLogMessages_(messageRows);
  }finally{lock.releaseLock();}
@@ -279,4 +308,34 @@ function ivRefreshOutstanding_(deadline){
  var start=Number(p.getProperty('IV2_REVIEW_CURSOR')||0)%keys.length,n=0;
  while(n<Math.min(keys.length,10)&&Date.now()<deadline){var key=keys[(start+n)%keys.length],id=key.slice(8);n++;try{var m=GmailApp.getMessageById(id);if(!m)continue;var s=ivGet_(id);if(s.state==='error')plProcess_(m,false);else plRefreshReview_(m);ivSyncLabels_(m.getThread());}catch(e){console.log('Outstanding intake item '+id+' needs review: '+String(e.message||e).slice(0,180));}}
  p.setProperty('IV2_REVIEW_CURSOR',String((start+n)%keys.length));
+}
+// [Q17 第 3 步] 窗口外的 out-of-scope 状态可以删,理由(D-032):
+//   1. 不会再被处理:主循环跳过 date<lower 的消息(第 1 步),而 lower 只会前移
+//      (watermark 单调,只在整轮扫完且无 error 时推进)。
+//   2. 不影响标签:out-of-scope 不是线索,ivLeadLabelFlags_ 本来就不看它 ——
+//      删掉(读回 null)与留着,算出的标签完全相同。
+//   3. 不影响重试:ivRefreshOutstanding_ 只挑 error 和带 Lead 的 review。
+// 绝不删的(哪怕带着 out-of-scope 标记):error(待重试,且冻结 watermark 的
+// 判断靠它)、带 record 或 created 的(标签与去重靠它)、leadCandidate 为 true 的
+// (SF-Lead-Review 标签靠它)。无法解析的也不删 —— 看不懂的东西不动。
+// date 必须是字符串再解析:new Date(null) 得 1970 年而不是 NaN(TODO-3 的同一个坑),
+// 缺 date 的状态会被当成"很老"而误删。
+// 只管 out-of-scope,不管 internal / ignore 等其他 done 状态:授权范围只到这里(Q19)。
+function ivPurgeable_(s,lower){
+ if(!s||s.scope!=='out-of-scope')return false;
+ if(s.state==='error'||s.record||s.created||s.leadCandidate===true)return false;
+ if(typeof s.date!=='string')return false;
+ var t=new Date(s.date).getTime();
+ return !isNaN(t)&&t<lower;
+}
+// 单轮最多删 200 条并受 deadline 约束:剩下的下一轮接着删,正确性不依赖一次删完。
+function ivPurgeOutOfScope_(lower,deadline){
+ var p=PropertiesService.getScriptProperties(),all=p.getProperties(),keys=Object.keys(all),n=0,s;
+ for(var i=0;i<keys.length&&n<200&&Date.now()<deadline;i++){
+  if(keys[i].indexOf('IV2_MSG_')!==0)continue;
+  try{s=JSON.parse(all[keys[i]]);}catch(e){continue;}
+  if(!ivPurgeable_(s,lower))continue;
+  p.deleteProperty(keys[i]);n++;
+ }
+ return n;
 }
