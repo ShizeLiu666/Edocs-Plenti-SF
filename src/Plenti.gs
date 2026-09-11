@@ -1044,7 +1044,7 @@ function plLeadCategory_(){
  * 这条 Lead 能不能写上 Lead_Category__c(字段存在且对运行用户可写)。
  *
  * 不能 → payload 不写这个字段(写了整个 POST 失败)、Lead 照建,但 Round Robin 不会
- * 分派它,Owner 停在 INTAKE_ADMIN_ID。describe 失败时同样返回 false —— 写一个
+ * 分派它,Owner 停在运行用户(集成用户)名下。describe 失败时同样返回 false —— 写一个
  * 不确定存在的字段,失败会发生在上锁之后,掉进 L-01。
  *
  * ⚠️ 生产上最可能的触发原因不是"字段不存在",而是**集成用户没有这个字段的编辑权限**
@@ -1123,8 +1123,12 @@ function plLeadPayload_(message,parsed,enrichment){
  var fieldCount=(meta.found||[]).length;
  var payload={
   LastName:plTruncateField_(c.lastName||('Plenti referral '+String(parsed.referralId||'').slice(0,24)),80),
+  // [D-038] Round Robin 的进入条件之一。
   Status:'New',
-  OwnerId:ivAdmin_(),
+  // [D-038] **刻意不设 OwnerId。** 生产 Round Robin 的进入条件要求 OwnerId 与
+  // CreatedById 都是 Lily 的账号,而集成用户就是她:留空 → Owner 默认等于运行用户
+  // → 命中条件;显式设成任何人 → 条件不满足,Round Robin 直接不跑,没人跟进。
+  // D-035 的"兜底 Owner"在这个 org 不成立,已推翻。主干因此不再读 INTAKE_ADMIN_ID。
   LeadSource:plLeadSource_(),
   Company:'Individual / Residential',
   Contact_Attempt_Count__c:0,

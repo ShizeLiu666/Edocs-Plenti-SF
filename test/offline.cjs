@@ -180,7 +180,7 @@ for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTest
     'Lead_Category__c'         // [D-035] 生产有、沙箱没有;缺失时 Lead 照建但落 review 报警(不会被分派)
   ].sort();
 
-  props.set('INTAKE_ADMIN_ID', '005000000000000AAA');
+  // [D-038] 不设 INTAKE_ADMIN_ID:主干不再读它,字段探测也必须在它缺失时跑得通。
   props.set('PLENTI_LEAD_SOURCE', 'Plenti Referrals');
   const used = context.plLeadFieldsUsed_();
   context.plLeadFieldMap_.cache = null;   // 探测缓存不能渗进后面的用例

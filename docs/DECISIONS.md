@@ -2245,7 +2245,7 @@ Owner。**不写这个字段 → 没人被分派 → 没人跟进 → PLT001 直
 1. 状态落 review,reason 以 `[NOT ROUTED: …]` 开头 → `SF-Lead-Review` 亮、Messages 表
    显示 `created + review`
 2. Lead 的 Description 末尾加 `[NOT ROUTED — … Assign one manually]` —— Lead 会停在
-   `INTAKE_ADMIN_ID` 名下,那个人打开就能看到
+   `INTAKE_ADMIN_ID` 名下,那个人打开就能看到(⚠️ D-038 更正:不再设 OwnerId,停在运行用户名下)
 3. console 打 ⚠️⚠️ 告警
 4. 自检报 ❌
 
@@ -2301,7 +2301,7 @@ Lead 照建,不因为分派不了就不建:SLA 时钟不等人,有 Owner 兜底�
 - L-01 区分"确定失败"(4xx,什么都没建)与"结果不确定"(超时),确定失败时回滚锁 ——
   原计划 Phase 4 做,Governance Flow 让它变急了。
 
-**问 3:还该不该设 OwnerId?** **建议继续设,但语义改成"Round Robin 没接住时的兜底
+**问 3:还该不该设 OwnerId?** ❌ **此建议已被 D-038 推翻 —— 不设。** 原建议:**继续设,但语义改成"Round Robin 没接住时的兜底
 Owner"。** 前提是下面第 1 条核实过。
 - **不设的话,Owner 默认是运行用户 —— client credentials 的集成用户,一个没人登录的
   API 账号。** Round Robin 一旦没接住(字段没写上、FLS 缺失、Governance 改了分类、
@@ -2453,6 +2453,65 @@ D-034 的倒计时按周算,PLT001 按天算,配置本来就必须在一天内�
 下一轮 POST 成功 → 自愈;5xx / 超时 / 非 Salesforce 4xx → 锁保留、下一轮**不重复 POST**。
 六个变异(永不判被拒、5xx 判被拒、无错误码的 4xx 判被拒、不释放锁、reason 截在 1800、
 丢掉规则原文)全部被捕获。
+
+---
+
+## D-038 不设 OwnerId —— D-035 的"兜底 Owner"在这个 org 不成立 · Q20 / Q21 关闭
+
+agent 查到生产配置,**推翻了 D-035 ② 问 3 的建议**(Jack,2026-09-11)。
+
+### ① Round Robin 的进入条件
+
+```
+AND(
+  NOT(IsConverted),
+  ISPICKVAL(Status, "New"),
+  ISPICKVAL(Lead_Category__c, "New Sales Enquiry"),
+  OR(OwnerId     = <Lily 的账号 A>, OwnerId     = <Lily 的账号 B>),
+  OR(CreatedById = <Lily 的账号 A>, CreatedById = <Lily 的账号 B>)
+)
+```
+
+(具体 User ID 是生产值,不写进仓库。)Login History 显示**集成用户就是 Lily 的账号 A**。
+
+- OwnerId 留空 → 默认等于运行用户 → **命中** ✅
+- OwnerId 显式设成任何人 → **不命中**,Round Robin 直接不跑
+
+**我 D-035 的推理错在前提:** 我假设集成用户是"一个没人登录的 API 账号",所以留空
+等于把 Lead 挂到看不见的地方。在这个 org,集成用户就是 Lily 本人,而 Flow 恰恰只认
+她名下的 Lead。**兜底反而会让 Round Robin 失效。**
+
+**实现:** `plLeadPayload_` 不再写 `OwnerId`。主干**不再读 `INTAKE_ADMIN_ID`**,Jack 会
+清空它;清空或留着旧值都不影响建 Lead(测试基线就是清空状态)。`ivAdmin_` 函数保留:
+`Legacy.gs` 还引用它,而 Legacy 不能改。
+
+Round Robin 进入条件里由我们控制的三项(`Status = New`、分类、不设 OwnerId)都有测试
+逐一断言。`[NOT ROUTED]` 时 Lead 停在运行用户(Lily)名下 —— D-035 里"停在
+`INTAKE_ADMIN_ID` 名下"的说法作废。
+
+### ⚠️ 新风险:分派依赖 Lily 的个人账号
+
+Round Robin 的条件写死了 Lily 的两个 User ID,集成又以她的身份运行。所以:
+
+- **她的账号停用**,或者**将来按 SANDBOX_SETUP §2.5 的建议把集成换成专用用户**,
+  Round Robin 都会**静默停止**分派 Plenti 的 Lead;
+- **代码的 `[NOT ROUTED]` 查不出来** —— 分类照样写上了,是 Flow 不认创建者。
+
+换 Run As 用户之前,必须先改 Round Robin 的条件。**不在本轮处理**,记在这里。
+将来若要代码能自己发现:建完回读 `OwnerId`,与 `CreatedById` 相同即说明没被分派。
+
+### ② ~ ⑤ agent 查到的其他事实
+
+| # | 事实 | 结论 |
+|---|---|---|
+| ② | Lead Entry Governance 的三个 Decision 对我们全部落空:`Is_Sales_Owned_Manual_Lead` 要求运行用户是 Inside Sales Rep(集成用户是 System Administrator);`Is_Clear_After_Sales_Enquiry` 只认 not working / fault / failed / repair / complaint;`Is_Clear_Sales_Source` 只认 LeadSource 含 `_ad` 或 `quote` | 它**永远不会**替我们设分类 —— **必须自己写**,D-035 正确 |
+| ③ | Governance 的 Initialize Contact Attempt Count 在保存前把 `Contact_Attempt_Count__c` 覆盖成 0 | 我们写的 0 是白写,无害。**本轮不删**(只做 ①) |
+| ④ | 两个 Flow 都没有 Custom Error / Fault Path / Roll Back Records,只有 Decision + Get Records + Update Records。Lead 上 3 条 Validation Rule,2 条 Active:`Block_Confirmed_Spam_Emails`(25 个精确邮箱黑名单,Email 为空匹配不上)、`Unqualified_Reason`(只在 Status = Unqualified 时触发) | **目前没有东西会阻止保存,缺 Email 不影响写入。** D-037 仍然值得:Flow 名带 Draft、随时会改;Round Robin 自己出错也会回滚整条插入 |
+| ⑤ | 集成用户是 System Administrator,`Lead_Category__c` 和六个 `Plenti_*` 字段 Read + Edit 全部勾上 | 字段权限没问题,不需要 Permission Set |
+
+⚠️ ⑤ 也意味着集成以**系统管理员**身份运行,与 SANDBOX_SETUP §2.5 "生产 Run As 必须是
+专用、非管理员用户"的建议不符。上线不因此阻塞(Jack 已知情),但与上面的"依赖 Lily
+个人账号"是同一件事,将来要一起处理。
 
 ---
 
@@ -2648,7 +2707,7 @@ watermark 的校验保持原样。
 | `SF_CLIENT_ID` | 新建集成的凭据,**不复用 info 项目的** |
 | `SF_CLIENT_SECRET` | 同上 |
 | `INTAKE_MAILBOX` | eDocs 实际邮箱地址。**只用于来源说明文字,不切换邮箱** —— GmailApp 操作的是触发器实际执行用户的邮箱 |
-| `INTAKE_ADMIN_ID` | 新 Lead 审核人的 Salesforce User ID,`005` 开头。见 README 的 Owner 未决风险 |
+| `INTAKE_ADMIN_ID` | ⚠️ **Plenti 主干不再使用(D-038)**,可以清空 —— 设了 OwnerId 会让生产 Round Robin 不跑。只有 `Legacy.gs` 的 `ivAdmin_` 还引用它,主干不调用 |
 | `INTAKE_V2_START` | 明确时区的 ISO 上线时间,不自动回扫历史邮件 |
 | `INTAKE_V2_ENABLED` | 默认 `false`,上线开关 |
 | `EDOCS_ADAPTATION_VALIDATED` | 默认 `false`,验收后手动打开的安全锁 |
@@ -2691,7 +2750,7 @@ watermark 的校验保持原样。
 
 | # | 问题 | 阻塞 | 规格出处 |
 |---|---|---|---|
-| Q1 | ⏳ **部分有答案(2026-09-11,D-035)**:生产由 New Sales Lead Round Robin 按 `Lead_Category__c = New Sales Enquiry` 六人轮值分派,Lily 已完全交给这个 Flow;代码已写该字段。剩余:兜底 Owner 见 Q20。原文:**Plenti 线索由谁跟进?** 目前全部指派给 `INTAKE_ADMIN_ID`,意味着 SLA 时钟开始跑但无人被分配联系客户 | **上线** | §5.9 |
+| ~~Q1~~ | ✅ **已关闭**(2026-09-11,D-035 / D-038)—— 生产由 New Sales Lead Round Robin 六人轮值分派;代码写 `Lead_Category__c`、不设 OwnerId,满足它的进入条件。⚠️ 分派依赖 Lily 的个人账号,见 D-038 | 无 | §5.9 |
 | ~~Q2~~ | **已定** —— 字段名确认为 `Plenti_Received_At__c`(Jack,2026-09-08)。⏳ 状态:**待沙箱建字段验证**。⚠️ 规格 §5.3 要求的"先检查 org 中是否已有可复用字段"**照做,不能因为名字定了就跳过** | 待验证 | §5.3 |
 | Q3 | `LeadSource` picklist 是否已有 `Plenti` 值?没有需先加(Setup 操作,不由脚本做) | Phase 4 | §5.9 |
 | Q4 | `Company` 字段:模板写死 `Individual / Residential`,是否适用于 Plenti 转介 | Phase 3 | §5.9 |
@@ -2701,8 +2760,8 @@ watermark 的校验保持原样。
 | ~~Q17~~ | ✅ **已关闭**(2026-09-11)—— 三步都已实施,见 D-032。原提议里"窗口外的也不会再被扫到"按旧代码**不成立**(Gmail 按 thread 返回,旧邮件会随新邮件回到循环),第 1 步正是它成立的前提。原文:🔴 **Script Properties 约 6 个工作日写满(L-04),上线前必须修。** 建议组合拳:① 主循环只处理扫描窗口内的消息(不再遍历会话里的旧消息);② out-of-scope 状态只存最小形态(约 50 字节,而不是 454);③ 清理扫描窗口之外的 out-of-scope 状态 —— 它们不参与标签计算,也不会再被扫到。三条都要动 `runIntakeV2`(Code.gs)。另一条路是规格 §9 的外部状态存储,改动大得多 | 无 | §9 / D-031 / D-032 |
 | ~~Q18~~ | ✅ **已关闭**(2026-09-11)—— 见 D-033。转介重发按 D-026 仍落 review;out-of-scope 改为 done、auditMissing 不列为例外,**Jack 已确认**(D-034)。原文:**review 的语义要不要改成"脚本需要人帮忙",而不是"业务还没处理完"?** 即:干净建出的 referral 直接落 `done`,`review` 只留给降级、来源冲突、可疑发件人、错误。这样同时解决 D-031 的三处影响:合并会话里的 Review 平时不亮,**一旦亮就说明真有事**(包括同标题的冒充邮件);轮询只针对少数例外;"待补联系方式"整体交给 Salesforce List View | 无 | D-024 / D-029 / D-031 / D-033 |
 | Q19 | **永久状态的长期累积。** D-032 只清理 out-of-scope。仍会累积:① internal / ignore / notice 等 `done` 状态,每条约 173 字节,**量没有数据**;② 每条建出的 Lead 占约 472 字节(状态 368 + 创建锁 104 —— 最初估"约一年"时漏算了锁),按 5 条/天约 **9 个月**写满。写满的表现是**静默的停摆**,且会让 error 冻结的倒计时越来越短 —— 分析与准备清单见 **D-034**。建议先加用量读数,按用量(60%)而不是日期触发 (a)+(b)+(c) | 按用量触发,不阻塞上线 | §9 / D-032 / D-034 |
-| Q20 | ⏳ **兜底语义 Jack 已认同(D-036)**,只等前提核实。**还该不该设 `OwnerId`?** 建议继续设,语义改为"Round Robin 没接住时的兜底 Owner"(D-035 ②)。**先核实:** ① Round Robin 的进入条件里有没有 Owner(有的话结论可能反过来);② 生产有没有 Active 的 Lead Assignment Rule(REST 缺省时是否执行,我不确定) | **开触发器前** | D-035 |
-| Q21 | **Lead Entry Governance - Draft(Before Save)到底做什么?** 需要它的规则:会不会改 `Lead_Category__c` / `Description` / `Plenti_Lead_ID__c`,**会不会用 Custom Error 拒绝保存**(Plenti 的 Lead 没有 Email)。拒绝保存会让创建锁卡在 `requested`,掉进 L-01 并冻结 watermark。**Round Robin 自己出错也会回滚整条插入**(D-036)。agent 在查,含 Validation Rules。✅ **第二层已实施(D-037)**:被拒时锁释放、落 error、reason 带完整原文,改完配置自动重试。规则本身仍在查 | **开触发器前** | D-035 / L-01 |
+| ~~Q20~~ | ✅ **已关闭**(2026-09-11,D-038)—— **不设 OwnerId。** Round Robin 的进入条件要求 OwnerId 与 CreatedById 都是 Lily 的账号,集成用户就是她;设了任何 Owner 都会让它不跑。D-035 的兜底建议作废 | 无 | D-035 / D-038 |
+| ~~Q21~~ | ✅ **已关闭**(2026-09-11,D-038)—— 两个 Flow 都没有 Custom Error / Fault Path / Roll Back;2 条 Active Validation Rule 对缺 Email 的 Lead 都不触发。目前没有东西会阻止保存。D-037 的锁释放保留(Flow 带 Draft、随时会改) | 无 | D-035 / D-037 / D-038 |
 | ~~Q22~~ | ✅ **已关闭**(2026-09-11,D-036)—— 两条 Email Alert 收件人都是 Lead Owner,Additional Emails 为空,不发给客户;都是 Time-Dependent(1 小时 / 1 天)。有人改收件人时要重看 | 无 | D-035 / D-036 |
 | ~~Q16~~ | ✅ **已关闭**(2026-09-09)—— 沙箱已建 Date/Time 字段并放开写入,值取自 `message.getDate()`,见 D-023。⚠️ **生产上仍未建**,探测保证不卡住,但建好之前生产无法从专用字段统计 PLT001。原文:**要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |

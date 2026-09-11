@@ -68,7 +68,8 @@ function plTestBaseline_(){
   INTERNAL_DOMAIN:'example.org',
   EDOCS_GROUP_ADDRESS:'edocs@example.org',
   INTAKE_MAILBOX:'edocs-copy@example.org',
-  INTAKE_ADMIN_ID:'005000000000000AAA',
+  // [D-038] 刻意清空:主干不再读它,Jack 会在生产清空这个属性。
+  INTAKE_ADMIN_ID:null,
   // [R17] 刻意用和代码旧写死值('Plenti')不同的值,证明是从属性读的
   PLENTI_LEAD_SOURCE:'Plenti Referrals',
   // [D-035] Round Robin 的分派条件
@@ -503,7 +504,8 @@ function testPlentiLeadPayload(){
  plAssert_(payload.Email!=='referrals@plenti.example','Lead.Email must never be the Plenti sender address');
  plAssertEq_(payload.LeadSource,'Plenti Referrals','LeadSource comes from PLENTI_LEAD_SOURCE, not a hardcoded value (D-029)');
  plAssertEq_(payload.Contact_Attempt_Count__c,0,'Contact_Attempt_Count__c starts at zero');
- plAssertEq_(payload.OwnerId,'005000000000000AAA','OwnerId comes from INTAKE_ADMIN_ID');
+ // [D-038] 设了 OwnerId,Round Robin 的进入条件就不满足,直接不跑。
+ plAssert_(!('OwnerId' in payload),'OwnerId must NOT be set — the Round Robin only runs while the owner is still the integration user');
  plAssertEq_(payload.Status,'New','Status');
  // [R11] Plenti_Received_At__c 暂时不写(org 里没建,D-022),但时间戳不能丢
  plAssert_(!('Plenti_Received_At__c' in payload),'the field is omitted while it does not exist in the org — one missing field fails the whole request');
@@ -606,9 +608,12 @@ function testPlentiRequiredProperties(){
  plTestSetProps_({EDOCS_GROUP_ADDRESS:null});
  plAssertThrows_(function(){ivGroupAddress_();},/EDOCS_GROUP_ADDRESS/,'missing group address must stop processing');
 
+ // [D-038] INTAKE_ADMIN_ID 不再是主干的必填项:清空或填错都不影响建 Lead。
  plTestBaseline_();
  plTestSetProps_({INTAKE_ADMIN_ID:'not-a-user-id'});
- plAssertThrows_(function(){plLeadPayload_(plTestMessage_('trusted-referral'),plTestParsed_());},/INTAKE_ADMIN_ID/,'invalid admin id must stop processing');
+ plAssert_(!('OwnerId' in plLeadPayload_(plTestMessage_('trusted-referral'),plTestParsed_())),'a leftover INTAKE_ADMIN_ID value is ignored — never written as OwnerId');
+ plTestSetProps_({INTAKE_ADMIN_ID:null});
+ plAssert_(!('OwnerId' in plLeadPayload_(plTestMessage_('trusted-referral'),plTestParsed_())),'and a cleared INTAKE_ADMIN_ID does not stop processing');
 
  plTestBaseline_();
  console.log('PASS: 5 missing-configuration cases');
@@ -2273,6 +2278,10 @@ function testPlentiLeadCategory(){
  plAssertEq_(ok.posts[0].Lead_Category__c,'New Sales Enquiry','the category comes from PLENTI_LEAD_CATEGORY');
  plAssert_(!/NOT ROUTED/.test(ok.posts[0].Description),'no routing warning when the category is written');
  plAssertEq_(ok.state.state,'done','a routed clean Lead is done (Q18)');
+ // [D-038] Round Robin 进入条件里由我们控制的三项,逐一对上
+ plAssertEq_(ok.posts[0].Status,'New','Round Robin condition: Status = New');
+ plAssert_(!('OwnerId' in ok.posts[0]),'Round Robin condition: OwnerId left to default to the integration user');
+ plAssert_(!('IsConverted' in ok.posts[0]),'IsConverted is not ours to set');
 
  // ---- 2. 属性缺失 → 上锁之前就停,不发 POST ----
  p.deleteProperty('PLENTI_LEAD_CATEGORY');

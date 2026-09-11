@@ -398,6 +398,10 @@ Setup → Object Manager → Lead → Fields & Relationships → 搜
 
 **操作**
 
+> ⚠️ **D-038:Plenti 主干已不再设 OwnerId、不再读 `INTAKE_ADMIN_ID`。** 生产 Round Robin
+> 只认 Owner 仍是集成用户(Lily)的 Lead,设了 Owner 它就不跑。下面这段沿用的是早期
+> 流程,生产不需要再取这个 ID。
+
 先取 `INTAKE_ADMIN_ID`(审核人的 Salesforce User ID):
 Setup → Users → 点开该用户 → 浏览器地址栏里那段 `005` 开头的 ID。
 代码要求 15 位或 18 位、`005` 开头(`src/Code.gs` 的 `ivAdmin_` 有正则校验)。
@@ -460,6 +464,7 @@ curl -s -X DELETE "<instance_url>/services/data/v67.0/sobjects/Lead/<新建的 L
 2. **同样给 `Plenti_Received_At__c` 开编辑权限**(今天新建,同一个原因)。没有权限时
    PLT001 的计时字段静默为空。
 3. Script Property `PLENTI_LEAD_CATEGORY` = `New Sales Enquiry`(大小写、空格完全一致)。
+   `INTAKE_ADMIN_ID` 可以清空(D-038)。
 4. 跑 `plTestDescribeLead`,确认输出里 `Lead_Category__c` 和 `PLENTI_LEAD_CATEGORY`
    两行都是 ✅,`Plenti_Received_At__c` 是 PRESENT。
 5. Q20 / Q21 / Q22 有答案。

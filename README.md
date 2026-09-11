@@ -121,21 +121,26 @@ Apps Script 的执行记录。
 
 ---
 
-## ⚠️ 未决风险:新建 Lead 无人跟进(规格 §5.9)
+## 谁跟进新建的 Lead:生产 Round Robin(D-035 / D-038)
 
-**这是本项目目前最重要的业务未决项,上线前必须由 Jack 解决。**
+~~模板逻辑把新建 Lead 全部指派给审核管理员 `INTAKE_ADMIN_ID`~~ —— **已改。**
+生产的 Active Flow **New Sales Lead Round Robin** 六人轮值分派 Owner,代码配合它的
+进入条件:
 
-模板逻辑把新建 Lead 全部指派给审核管理员 `INTAKE_ADMIN_ID`。在 Plenti
-模型下这意味着:
+| 进入条件 | 代码怎么满足 |
+|---|---|
+| `Status = New` | payload 写 `New` |
+| `Lead_Category__c = New Sales Enquiry` | 写 `PLENTI_LEAD_CATEGORY`;写不上就落 `[NOT ROUTED]` review |
+| `OwnerId` 是 Lily 的账号 | **不设 OwnerId**,默认等于运行用户 —— 集成用户就是 Lily |
+| `CreatedById` 是 Lily 的账号 | 同上,记录由运行用户创建 |
 
-> **SLA 时钟(PLT001,1 个工作日内尝试联系)开始跑,但没有任何人被分配
-> 去联系客户。**
+⚠️ **不要给 payload 加 `OwnerId`。** 设成任何人,Round Robin 都会直接不跑。
+主干不再读 `INTAKE_ADMIN_ID`,可以清空。
 
-合同 SLA 未达标时 Plenti **可立即终止合同,没有补救期**。目前 Plenti 线索
-的跟进人尚未确定(Graham Bottomley 出现过但角色未定义)。
-
-**这是业务未决项,不是代码问题。** 代码先按 `INTAKE_ADMIN_ID` 实现,
-但在跟进人确定并配置好之前**不得启用本项目的触发器**。
+⚠️⚠️ **分派依赖 Lily 的个人账号。** Round Robin 的条件里写死了她的两个 User ID,
+而集成就以她的身份运行。**她的账号停用,或者将来把集成换成专用用户,Round Robin
+都会静默停止分派 Plenti 的 Lead** —— 而且代码的 `[NOT ROUTED]` 查不出来(分类照样
+写上了)。换人之前必须先改 Flow 的条件。见 D-038。
 
 ---
 
