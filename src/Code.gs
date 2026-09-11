@@ -55,9 +55,36 @@ function ivReq_(path,method,data){
  if(!ivReq_.token)ivReq_.token=getSalesforceClientCredentialsToken_();
  var t=ivReq_.token,opt={method:method||'get',headers:{Authorization:'Bearer '+t.access_token},muteHttpExceptions:true};
  if(data!==undefined){opt.contentType='application/json';opt.payload=JSON.stringify(data);}
- var r=UrlFetchApp.fetch(t.instance_url+'/services/data/v67.0/'+path,opt),body=r.getContentText();
- if(r.getResponseCode()>=300)throw new Error('SF '+r.getResponseCode()+' '+body.slice(0,1800));
+ var r=UrlFetchApp.fetch(t.instance_url+'/services/data/v67.0/'+path,opt),body=r.getContentText(),code=r.getResponseCode();
+ if(code>=300){
+  // [D-037] 区分"确定被拒"与"结果不确定"。消息格式不变(Legacy 与既有断言依赖它),
+  // 分类挂在 Error 对象上:
+  //   sfRejected=true  —— 4xx 且响应体是 Salesforce 的错误数组(带 errorCode)。
+  //                       Salesforce 已回滚整个事务,**确定什么都没写入**。
+  //   sfRejected=false —— 5xx、3xx、或 4xx 但响应体不是 Salesforce 错误(代理页面等):
+  //                       不能断定,按不确定处理。
+  // 超时 / 网络异常根本走不到这里:UrlFetchApp.fetch 自己抛错,没有这些属性,
+  // 同样按不确定处理。
+  // sfErrors 是**完整**解析结果,不截断 —— 规则的报错文字是告诉人"该改哪条规则"的
+  // 唯一信息。消息里的 1800 截断只影响 message,不影响这里。
+  var err=new Error('SF '+code+' '+body.slice(0,1800));
+  err.sfStatus=code;
+  err.sfErrors=ivSfErrors_(body);
+  err.sfRejected=code>=400&&code<500&&err.sfErrors.length>0;
+  throw err;
+ }
  return body?JSON.parse(body):{};
+}
+/** Salesforce REST 错误响应 [{errorCode, message, fields}] → 同形数组;不是这个形状就返回 []。 */
+function ivSfErrors_(body){
+ var list;
+ try{list=JSON.parse(body);}catch(e){return [];}
+ if(!list||typeof list.length!=='number')return [];
+ var out=[],i;
+ for(i=0;i<list.length;i++){
+  if(list[i]&&typeof list[i].errorCode==='string'&&list[i].errorCode)out.push({errorCode:list[i].errorCode,message:String(list[i].message||''),fields:list[i].fields||[]});
+ }
+ return out;
 }
 function ivQuote_(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
 function ivQuery_(q){var d=ivReq_('query?q='+encodeURIComponent(q));if(!d.done)throw new Error('Ambiguous result exceeds query page');return d.records;}

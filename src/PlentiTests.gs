@@ -2315,7 +2315,103 @@ function testPlentiLeadCategory(){
  plTestClearState_();
 }
 
+// ============================================================
+// 31. [D-037] Salesforce 明确拒绝时释放创建锁;不确定时保留(L-01)
+//     走**真实的 ivReq_**,只替换 UrlFetchApp —— 分类逻辑在 ivReq_ 里,必须一起测到。
+// ============================================================
+
+function testPlentiRejectionReleasesLock(){
+ plTestBaseline_();
+ var p=PropertiesService.getScriptProperties(),linked=plTestMessage_('trusted-referral-with-link'),lockKey='IV2_CREATE_'+linked.getId();
+ // 虚构的规则文字。刻意做长(超过旧的 1800 截断),证明原文完整保留。
+ var ruleText='Fictional governance rule: every new Lead must have an Email before it can be saved. '+new Array(31).join('Ask the administrator to review the fictional rule configuration. ');
+ var sfBody=JSON.stringify([
+  {message:ruleText,errorCode:'FIELD_CUSTOM_VALIDATION_EXCEPTION',fields:['Email']},
+  {message:'Fictional flow fault detail.',errorCode:'CANNOT_EXECUTE_FLOW_TRIGGER',fields:[]}
+ ]);
+ function run(postResponse){
+  var created=null,posts=0,realToken=ivReq_.token,state;
+  ivReq_.token={access_token:'fixture',instance_url:'https://fixture.my.salesforce.example'};
+  plLeadFieldMap_.cache=null;
+  try{
+   plTestWithFetch_(function(url){
+    if(url.indexOf('e.customeriomail.com/deliveries/')>=0)return {code:200,text:plTestBrowserHtml_()};
+    if(/\/sobjects\/Lead\/describe$/.test(url))return {code:200,text:JSON.stringify({fields:[plTestCategoryField_()]})};
+    if(/\/sobjects\/Lead$/.test(url)){
+     posts++;
+     var r=postResponse();
+     if(r&&r.code===201)created={Id:'00Qrej000000001AAA',Description:'[Intake: '+linked.getId()+'] fictional',IsConverted:false,Status:'New'};
+     return r;
+    }
+    if(url.indexOf('/query?q=')>=0){
+     var q=decodeURIComponent(url.split('q=')[1]);
+     return {code:200,text:JSON.stringify({done:true,records:(created&&/WHERE Id='/.test(q))?[created]:[]})};
+    }
+    throw new Error('unexpected request in test: '+url);
+   },function(){state=plProcess_(linked,false);});
+  }finally{ivReq_.token=realToken;plLeadFieldMap_.cache=null;}
+  return {state:state,posts:posts};
+ }
+ function rejected(){return {code:400,text:sfBody};}
+ function ok(){return {code:201,text:JSON.stringify({id:'00Qrej000000001AAA',success:true,errors:[]})};}
+
+ // ---- 1. 明确拒绝 → 锁释放,error,reason 带完整原文 ----
+ plTestClearState_();
+ var r1=run(rejected);
+ plAssertEq_(r1.posts,1,'one POST was attempted');
+ plAssertEq_(r1.state.state,'error','a rejection lands in error so it is retried automatically');
+ plAssertEq_(p.getProperty(lockKey),null,'the create lock is RELEASED — Salesforce rolled back, nothing was created');
+ plAssertEq_(r1.state.reason.indexOf('SF REJECTED (HTTP 400) FIELD_CUSTOM_VALIDATION_EXCEPTION: '),0,
+  'the error code comes first — the run-log summary only shows 200 characters');
+ plAssert_(r1.state.reason.indexOf(ruleText)>=0,'the rule text is kept VERBATIM and COMPLETE ('+ruleText.length+' chars, beyond the old 1800 cut)');
+ plAssert_(r1.state.reason.indexOf('[fields: Email]')>=0,'the offending field is named');
+ plAssert_(r1.state.reason.indexOf('CANNOT_EXECUTE_FLOW_TRIGGER: Fictional flow fault detail.')>=0,'every error in the response is kept, not just the first');
+ var saved=p.getProperty('IV2_MSG_'+linked.getId());
+ plAssert_(JSON.parse(saved).reason.indexOf(ruleText)>=0,'the persisted state keeps the full text too');
+ plAssert_(saved.length<9000,'and still fits the 9KB Script Properties value limit, got '+saved.length);
+
+ // ---- 2. 配置修好 → 下一轮自动补建,不用人删键 ----
+ var r2=run(ok);
+ plAssertEq_(r2.posts,1,'the retry POSTs again — no "outcome is uncertain" block');
+ plAssertEq_(r2.state.created,true,'and the Lead is created');
+ plAssertEq_(JSON.parse(p.getProperty(lockKey)).state,'created','the lock now records the created Lead');
+
+ // ---- 3. 不确定的三种 → 锁保留(L-01 不变),下一轮不重复 POST ----
+ var uncertain=[
+  [function(){return {code:500,text:sfBody};},'a 5xx'],
+  [function(){return null;},'a timeout / network failure (fetch throws)'],
+  [function(){return {code:400,text:'<html>proxy error</html>'};},'a 4xx whose body is not a Salesforce error']
+ ];
+ uncertain.forEach(function(c){
+  plTestClearState_();
+  var first=run(c[0]);
+  plAssertEq_(first.state.state,'error',c[1]+': error');
+  plAssertEq_(JSON.parse(p.getProperty(lockKey)).state,'requested',c[1]+': the lock is KEPT — the Lead may exist');
+  plAssert_(first.state.reason.indexOf('SF REJECTED')<0,c[1]+': not reported as a rejection');
+  var second=run(ok);
+  plAssertEq_(second.posts,0,c[1]+': the retry must NOT POST again — that is what the lock is for');
+  plAssert_(/Earlier create outcome is uncertain/.test(second.state.reason),c[1]+': it asks a human to check Salesforce (L-01, unchanged)');
+ });
+
+ // ---- 4. ivReq_ 的分类本身 ----
+ var realToken=ivReq_.token;
+ var thrownBy=function(resp){var caught=null;plTestWithFetch_(function(){return resp;},function(){try{ivReq_('sobjects/Lead','post',{});}catch(e){caught=e;}});return caught;};
+ ivReq_.token={access_token:'fixture',instance_url:'https://fixture.my.salesforce.example'};
+ try{
+  var e400=thrownBy({code:400,text:sfBody});
+  plAssertEq_(e400.message.indexOf('SF 400 '),0,'the message format is unchanged — Legacy and older assertions rely on it');
+  plAssertEq_(e400.sfRejected,true,'4xx + Salesforce error code = rejected');
+  plAssertEq_(e400.sfErrors[0].message,ruleText,'sfErrors carries the full text, not the 1800-char message');
+  plAssertEq_(thrownBy({code:401,text:JSON.stringify([{message:'Session expired or invalid',errorCode:'INVALID_SESSION_ID'}])}).sfRejected,true,'401 with an error code is also a definite "not created"');
+  plAssertEq_(thrownBy({code:503,text:sfBody}).sfRejected,false,'5xx is never treated as a definite rejection');
+  plAssertEq_(thrownBy({code:302,text:''}).sfRejected,false,'3xx is not a rejection');
+  plAssertEq_(thrownBy({code:400,text:'[]'}).sfRejected,false,'an empty error array carries no error code');
+ }finally{ivReq_.token=realToken;}
+ plTestClearState_();
+}
+
 function runPlentiRegressionTests(){
+ testPlentiRejectionReleasesLock();
  testPlentiLeadCategory();
  testPlentiReviewMeansHelpNeeded();
  testPlentiOutOfScopeState();

@@ -2409,6 +2409,53 @@ D-034 的倒计时按周算,PLT001 按天算,配置本来就必须在一天内�
 
 ---
 
+## D-037 Salesforce 明确拒绝时释放创建锁 —— 上线前唯一的保险
+
+### 背景与决定(Jack,2026-09-11)
+
+- **金丝雀取消。** 老板不想在生产再做任何测试。
+- **唯一的验证就是第一条真实 referral**(2026-09-11 从组里进来,Salesforce 里还没有
+  对应记录,本来就要建)。它不是测试,是第一条真实业务。
+- 正因为只有一次机会,**D-036 ② 的第二层必须先落地**:万一被 Governance Flow 拦下,
+  拿到的是明确的错误信息,改完配置自动重试补上,而不是锁卡在 `requested`、要人工删键。
+- **范围严格限制,只做这一件。** describe 必填字段自检**不做**(不阻塞上线);
+  Q20 的 `OwnerId` **保持现状**(继续设,兜底语义)。
+- 被拒落 **error** 不落 review(理由见 D-036 ②)。
+
+### 实现
+
+| 位置 | 改动 |
+|---|---|
+| `ivReq_`(Code.gs) | 抛出的 Error 上挂三个属性:`sfStatus`、`sfErrors`(**完整**解析的 Salesforce 错误数组)、`sfRejected`。**消息格式不变**,Legacy 与既有断言依赖它 |
+| `plCreateLead_` | POST 抛错且 `sfRejected` → **删 `IV2_CREATE_` 锁**,抛出带原文的错误;其他一律原样抛出、保留锁 |
+| `plRejectionReason_` | 错误码放最前(汇总页每条错误只显示前 200 字符);每条错误的**报错文字原样完整**,附出错字段;多条全部保留 |
+| `plProcess_` 的 catch | 被拒时 reason 上限从 1800 放宽到 6000。不能更高:状态进 Script Properties,单值上限 9KB,超了保存本身失败 |
+
+**"确定被拒"的判据:4xx 且响应体是带 `errorCode` 的 Salesforce 错误数组。** 其余全部
+按不确定处理、保留锁:
+
+| 情形 | 判定 | 为什么 |
+|---|---|---|
+| 4xx + Salesforce 错误码 | 被拒 → 释放 | Salesforce 已回滚整个事务。含 `FIELD_CUSTOM_VALIDATION_EXCEPTION`(Validation Rule 与 Flow Custom Error)、`CANNOT_EXECUTE_FLOW_TRIGGER`(Flow 出错,**包括 After Save 的 Round Robin**)、`REQUIRED_FIELD_MISSING`、`DUPLICATES_DETECTED`、401 `INVALID_SESSION_ID` 等 |
+| 5xx | 不确定 | 服务端出错时不能断定事务没提交 |
+| 超时 / 网络异常 | 不确定 | 根本没拿到响应 —— 锁存在的原因 |
+| 4xx 但响应体不是 Salesforce 错误(代理页面等) | 不确定 | 不知道请求到没到 Salesforce |
+| 3xx | 不确定 | 不该出现,保守处理 |
+
+⚠️ **被拒之后的自动重试需要"有下一轮"。** 触发器没开时,改完配置要**手动再跑一次**。
+⚠️ `DUPLICATES_DETECTED`(Duplicate Rule 设成 Block)不是全局配置问题,而是针对某个
+客户:它会每轮被拒、冻结 watermark,直到有人处理。reason 里有原文,看得出来。
+
+### 验证
+
+`testPlentiRejectionReleasesLock` 走**真实的 `ivReq_`**,只替换 UrlFetchApp:
+被拒 → 锁释放、reason 带完整的 2000+ 字符规则原文与出错字段、持久化后仍在 9KB 内;
+下一轮 POST 成功 → 自愈;5xx / 超时 / 非 Salesforce 4xx → 锁保留、下一轮**不重复 POST**。
+六个变异(永不判被拒、5xx 判被拒、无错误码的 4xx 判被拒、不释放锁、reason 截在 1800、
+丢掉规则原文)全部被捕获。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -2454,6 +2501,11 @@ Jack 要求在改存储结构之前,基于实际代码回答三个问题。结�
 
 ### L-01 `IV2_CREATE_` 防重锁不回滚,任何写入失败都需人工介入
 
+> ⏳ **部分解决(2026-09-11,D-037):** Salesforce **明确拒绝**(4xx + 错误码)时锁已释放、
+> 落 error 自动重试。**仍然需要人工的只剩真正不确定的三种:超时 / 网络异常、5xx、
+> 响应体不是 Salesforce 错误的 4xx。** 下文的"HTTP 500 也被一视同仁"保持不变 ——
+> 5xx 不能断定没写入,按不确定处理是有意的。
+
 **发现于** 2026-09-08 审计 · **本轮不改**(Jack 决定)
 
 `plCreateLead_` 在 POST **之前**把 `IV2_CREATE_<msgId>` 写成 `requested`,
@@ -2470,8 +2522,9 @@ POST 抛错时**不回滚**。下次重试直接抛
 要列举的线程越来越多,最终撞上 220 秒预算 → `done=false` → watermark 更不前移。
 这就是 EXPORT_NOTES 说的"积压需监控"。
 
-**可能的改法(未决,不在本轮)**:按 HTTP 状态码区分 —— 4xx 且非 timeout 视为
-"确定失败"可回滚锁;5xx / 超时 / 网络错误保持现状。需要 `ivReq_` 把状态码带出来。
+~~**可能的改法(未决,不在本轮)**:按 HTTP 状态码区分 —— 4xx 且非 timeout 视为
+"确定失败"可回滚锁;5xx / 超时 / 网络错误保持现状。需要 `ivReq_` 把状态码带出来。~~
+**已按此实施,并收紧为"4xx 且响应体带 Salesforce 错误码",见 D-037。**
 
 ### L-02 崩溃恢复后 `SF-Lead-Created` 标签不会亮
 
@@ -2649,7 +2702,7 @@ watermark 的校验保持原样。
 | ~~Q18~~ | ✅ **已关闭**(2026-09-11)—— 见 D-033。转介重发按 D-026 仍落 review;out-of-scope 改为 done、auditMissing 不列为例外,**Jack 已确认**(D-034)。原文:**review 的语义要不要改成"脚本需要人帮忙",而不是"业务还没处理完"?** 即:干净建出的 referral 直接落 `done`,`review` 只留给降级、来源冲突、可疑发件人、错误。这样同时解决 D-031 的三处影响:合并会话里的 Review 平时不亮,**一旦亮就说明真有事**(包括同标题的冒充邮件);轮询只针对少数例外;"待补联系方式"整体交给 Salesforce List View | 无 | D-024 / D-029 / D-031 / D-033 |
 | Q19 | **永久状态的长期累积。** D-032 只清理 out-of-scope。仍会累积:① internal / ignore / notice 等 `done` 状态,每条约 173 字节,**量没有数据**;② 每条建出的 Lead 占约 472 字节(状态 368 + 创建锁 104 —— 最初估"约一年"时漏算了锁),按 5 条/天约 **9 个月**写满。写满的表现是**静默的停摆**,且会让 error 冻结的倒计时越来越短 —— 分析与准备清单见 **D-034**。建议先加用量读数,按用量(60%)而不是日期触发 (a)+(b)+(c) | 按用量触发,不阻塞上线 | §9 / D-032 / D-034 |
 | Q20 | ⏳ **兜底语义 Jack 已认同(D-036)**,只等前提核实。**还该不该设 `OwnerId`?** 建议继续设,语义改为"Round Robin 没接住时的兜底 Owner"(D-035 ②)。**先核实:** ① Round Robin 的进入条件里有没有 Owner(有的话结论可能反过来);② 生产有没有 Active 的 Lead Assignment Rule(REST 缺省时是否执行,我不确定) | **开触发器前** | D-035 |
-| Q21 | **Lead Entry Governance - Draft(Before Save)到底做什么?** 需要它的规则:会不会改 `Lead_Category__c` / `Description` / `Plenti_Lead_ID__c`,**会不会用 Custom Error 拒绝保存**(Plenti 的 Lead 没有 Email)。拒绝保存会让创建锁卡在 `requested`,掉进 L-01 并冻结 watermark。**Round Robin 自己出错也会回滚整条插入**(D-036)。agent 在查,含 Validation Rules。建议把 L-01 的"确定失败释放锁"提到开触发器之前(D-036 ②) | **开触发器前** | D-035 / L-01 |
+| Q21 | **Lead Entry Governance - Draft(Before Save)到底做什么?** 需要它的规则:会不会改 `Lead_Category__c` / `Description` / `Plenti_Lead_ID__c`,**会不会用 Custom Error 拒绝保存**(Plenti 的 Lead 没有 Email)。拒绝保存会让创建锁卡在 `requested`,掉进 L-01 并冻结 watermark。**Round Robin 自己出错也会回滚整条插入**(D-036)。agent 在查,含 Validation Rules。✅ **第二层已实施(D-037)**:被拒时锁释放、落 error、reason 带完整原文,改完配置自动重试。规则本身仍在查 | **开触发器前** | D-035 / L-01 |
 | ~~Q22~~ | ✅ **已关闭**(2026-09-11,D-036)—— 两条 Email Alert 收件人都是 Lead Owner,Additional Emails 为空,不发给客户;都是 Time-Dependent(1 小时 / 1 天)。有人改收件人时要重看 | 无 | D-035 / D-036 |
 | ~~Q16~~ | ✅ **已关闭**(2026-09-09)—— 沙箱已建 Date/Time 字段并放开写入,值取自 `message.getDate()`,见 D-023。⚠️ **生产上仍未建**,探测保证不卡住,但建好之前生产无法从专用字段统计 PLT001。原文:**要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |

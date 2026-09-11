@@ -1171,6 +1171,20 @@ function plLeadPayload_(message,parsed,enrichment){
 }
 
 /**
+ * [D-037] 被拒时的 reason。**错误码和报错文字原样、完整**:它是告诉人"该改哪条
+ * 规则"的唯一信息 —— Validation Rule 与 Flow 的 Custom Error 都会把规则里写的文字
+ * 放进 message。错误码放最前面:运行日志汇总页每条错误只显示前 200 字符。
+ */
+function plRejectionReason_(e){
+ var parts=[],list=e.sfErrors||[],i,x;
+ for(i=0;i<list.length;i++){
+  x=list[i];
+  parts.push(x.errorCode+': '+x.message+(x.fields&&x.fields.length?' [fields: '+x.fields.join(', ')+']':''));
+ }
+ return 'SF REJECTED (HTTP '+e.sfStatus+') '+parts.join(' | ')+' — Salesforce rolled the create back, so nothing was created; the create lock was released and this message will be retried automatically every run until the rule or configuration is fixed';
+}
+
+/**
  * 创建前防重锁(规格 §2 第三样可继承的东西,模板 Code.gs L113)。
  *
  * IV2_CREATE_<msgId> 属性已存在 → 抛错要求人工核查,**不重试创建**。
@@ -1189,7 +1203,24 @@ function plCreateLead_(message,parsed,enrichment){
  plValidatedLeadCategory_();
  var payload=plLeadPayload_(message,parsed,enrichment);
  p.setProperty('IV2_CREATE_'+id,JSON.stringify({state:'requested',at:new Date().toISOString()}));
- var result=ivReq_('sobjects/Lead','post',payload);
+ var result;
+ try{
+  result=ivReq_('sobjects/Lead','post',payload);
+ }catch(e){
+  // [D-037] 锁防的是"POST 可能成功了、但我们没收到回应"。Salesforce 明确拒绝
+  // (4xx + 错误码)不是这种情况:整个事务已回滚,什么都没建。此时保留锁只会让
+  // 之后每次重试都抛 "outcome is uncertain",要人工删 Script Property(L-01)。
+  // 所以释放锁、抛出带原文的错误 —— plProcess_ 落 error,下一轮自动重试,
+  // 配置修好后自愈。
+  // 超时 / 网络异常 / 5xx 仍然保留锁:那才是真的不确定。
+  if(e&&e.sfRejected===true){
+   p.deleteProperty('IV2_CREATE_'+id);
+   var rejected=new Error(plRejectionReason_(e));
+   rejected.sfRejected=true;
+   throw rejected;
+  }
+  throw e;
+ }
  p.setProperty('IV2_CREATE_'+id,JSON.stringify({state:'created',id:result.id,at:new Date().toISOString()}));
  return ivQuery_("SELECT "+plLeadFields_()+" FROM Lead WHERE Id='"+ivQuote_(result.id)+"'")[0];
 }
@@ -1796,7 +1827,9 @@ function plProcess_(message,force,detail){
  }catch(e){
   state.state='error';
   state.leadCandidate=true;
-  state.reason=String(e.message||e).slice(0,1800);
+  // [D-037] 被拒时 reason 要完整保留规则的报错文字,上限放宽到 6000。不能更高:
+  // 状态整体进 Script Properties,单值上限 9KB,超了这次保存本身会失败。
+  state.reason=String(e.message||e).slice(0,e&&e.sfRejected?6000:1800);
   ivSave_(id,state);
   console.log('Plenti intake error '+id+': '+state.reason);
   return state;
