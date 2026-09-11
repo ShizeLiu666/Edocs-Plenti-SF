@@ -349,6 +349,10 @@ REST API,那是另一套写法、另一次重写。Phase 4 会实测确认,但�
   正常运行稳定在约 35 KB。**error 未处理时仍会写满,见顶部「运维须知」。**
 - **所有 referral 都会被 Gmail 合进同一个会话**(D-031)。Gmail 标签按会话打,
   **表示不了单条 referral 的状态**。单条状态以 Salesforce 为准。
+- **人工先建、程序后建会产生重复 Lead,无法自动识别**(L-05)。程序的去重只认得
+  程序自己建的 Lead(delivery token 字段、消息 marker),人工建的都没有。管道上线后
+  Plenti 的 referral 不要再手工建。清理重复时**只删 Salesforce 里的 Lead,不要删
+  对应的 `IV2_MSG_*` / `IV2_CREATE_*`**,否则那封邮件会被再建一次。
 - **跨邮箱去重在 Plenti 路径上实际失效**(Q15)。规格 §5.5 那一层靠客户邮箱
   查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能
   自动拦截,只能靠人工审核兜住。

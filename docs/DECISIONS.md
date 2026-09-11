@@ -2515,6 +2515,80 @@ Round Robin 的条件写死了 Lily 的两个 User ID,集成又以她的身份�
 
 ---
 
+## D-039 生产首次真实运行(2026-09-11)
+
+### 结果
+
+```
+{"reviewed":74,"skippedOutOfScope":0,"purgedOutOfScopeStates":0,"threads":56,
+ "created":3,"failed":0,"scanComplete":true,"errorsPending":false,
+ "watermark":"2026-09-11T08:16:18.148Z"}
+```
+
+- **3 条 referral 建成,Owner 全部被 Round Robin 分派**,落在轮值名单的三个连续位置
+  (每建一条指针前进一格)。证明 `Lead_Category__c` 写上了、进入条件命中了、不设
+  OwnerId(D-038)是对的。
+- **§5.1 发件人验证第一次在真实条件下通过。** `PLENTI_TEST_SENDER_OVERRIDE` 已删,
+  这一轮是真实的 `X-Original-Sender` + DMARC。两封同事手动转发的 referral(带完整
+  browser-view 链接、没有 `X-Original-Sender`)被正确拦下、没有建 Lead;三封经组投递的
+  全部建成。**D-021 里"进组之后必须单独补测身份验证"这一项完成。**
+
+### ① `skippedOutOfScope=0` 不代表 Q10 没执行 —— 是计数器名字起错了
+
+这个名字是我在 R1 起的,**它数的是"收件人不在白名单"**(`plMatchedRecipient_` 未命中),
+和 Q10 的 out-of-scope 是两回事:
+
+| 层 | 挡什么 | 计数 |
+|---|---|---|
+| 收件人白名单(R1) | 不是发给 `INTAKE_RECIPIENT_ALLOWLIST` 里地址的邮件 | `skippedOutOfScope` |
+| `plExclude_` | 内部发件人、自动回复、Salesforce 通知等 | 无单独计数,算在 `reviewed` 里 |
+| 发件人验证 + Q10(`plUnverifiedReview_`) | 不可信发件人且无 Plenti 链接 → `done`、`scope: out-of-scope`、不打标签 | 无单独计数,算在 `reviewed` 里 |
+
+组里的邮件全都发给组地址,而组地址就在白名单里,所以**白名单一封都不挡,0 是预期值**。
+噪音全部进了 `plProcess_`(`reviewed:74` 就是这 74 封),在第三层被判为 out-of-scope。
+Q10 的收窄**执行了**,只是汇总里没有它的计数。
+
+**核对方法:** Messages 表按 `Final state` 和备注列开头分组 —— 应该是 3 行 `created`、
+2 行 `review`(备注以 `FORWARDED BY A COLLEAGUE` 开头)、其余大多是 `done` 且备注以
+`Out of scope: no Plenti browser-view link` 开头。噪音会话上不应有 `SF-Lead-Review` 标签。
+
+**建议(未实施):** 把 `skippedOutOfScope` 改名为 `skippedByRecipientAllowlist`,并按
+最终分类加几个计数。改的是 `runIntakeV2` 的 console 汇总,需 Jack 授权。
+
+### ② Created Date 差 4 小时 —— 显示时区问题,存的值没错
+
+**代码里没有任何本地时区换算。** 所有时间都是 `message.getDate().toISOString()` 或
+`new Date().toISOString()`,即带 `Z` 的 UTC ISO 8601;Gmail 查询用 epoch 秒。项目的
+`appsscript.json` 时区(Australia/Adelaide)不影响 `toISOString()`。
+`Plenti_Received_At__c` 写的就是邮件接收时刻的 UTC 值,Salesforce 按 UTC 解析、存储。
+
+**4 小时从哪来:** 运行开始于 08:16Z = 阿德莱德 17:46(9 月还是 ACST,UTC+9:30)。
+页面显示 1:49 PM,正好是 **UTC+5:30(印度标准时间)** 下的 08:19Z。Salesforce 存 UTC,
+**显示按查看者个人设置里的时区**。所以大概率是查看者的 Salesforce 用户时区设成了
+UTC+5:30。**这是推断,以 My Settings → Language & Time Zone 为准。**
+
+同一个查看者看 `Plenti_Received_At__c` 也会差同样的 4 小时,但**存储的时刻是对的**。
+经 API 直接读原始值会是 UTC(带 `Z`)。
+
+**真正会让 SLA 报表出错的是这三处,都不在代码里:**
+
+1. **Business Hours(Q8)仍是 Los Angeles + 24/7。** "1 个工作日"按它算就是错的。
+   这是最大的一处。
+2. **报表按"天"分组时用查看者的时区**:UTC+5:30 的人和 UTC+9:30 的人看到的日期边界不同。
+   SLA 报表应当由阿德莱德时区的用户运行或订阅。
+3. **公式字段里的 `DATEVALUE(日期时间)` 按 GMT 取日期。** 若有人用它从
+   `Plenti_Received_At__c` 算"接收日",阿德莱德上午 9:30 之前收到的都会被算成前一天。
+
+⚠️ 代码侧有一处可读性问题,**不是错误**:Lead 的 Description 和 Messages 表里的时间都是
+UTC。例如阿德莱德 14:11 收到的邮件显示为 `04:41:00.000Z`,销售读 Description 可能误判
+这条 lead 有多急。要不要加本地时间是另一个决定,本轮不动。
+
+### ③ L-05 人工先建、程序后建 → 重复 Lead,无法自动识别
+
+见"已知限制"L-05。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -2584,6 +2658,34 @@ POST 抛错时**不回滚**。下次重试直接抛
 ~~**可能的改法(未决,不在本轮)**:按 HTTP 状态码区分 —— 4xx 且非 timeout 视为
 "确定失败"可回滚锁;5xx / 超时 / 网络错误保持现状。需要 `ivReq_` 把状态码带出来。~~
 **已按此实施,并收紧为"4xx 且响应体带 Salesforce 错误码",见 D-037。**
+
+### L-05 人工先建、程序后建会产生重复 Lead,无法自动识别
+
+**发现于** 2026-09-11 生产首次运行。上线当天有 2 条 referral 已被人工建过 Lead,
+程序又各建了一条。
+
+**为什么认不出来:** 程序的去重每一层都只认得**程序自己建的** Lead:
+
+| 层 | 依据 | 人工建的 Lead 有没有 |
+|---|---|---|
+| 消息状态 `IV2_MSG_*` | Gmail 消息 ID | 没有(不是程序处理的) |
+| 创建锁 `IV2_CREATE_*` | 同上 | 没有 |
+| 业务去重 `plFindReferral_` | `Plenti_Lead_ID__c`(delivery token) | **没有** —— 人工建的不填这个字段 |
+| Description marker | `[Intake: <消息 ID>]` | 没有 |
+| 跨邮箱去重(规格 §5.5) | 客户邮箱 | 失效 —— Plenti 从不提供客户邮箱(Q15) |
+
+**影响:** 同一客户两条 Lead、两个销售,Round Robin 轮值被多消耗一格。
+
+**处置(2026-09-11):** 删掉程序建的那两条,保留销售已经在跟进的人工 Lead。
+⚠️ **对应的 `IV2_MSG_*` 与 `IV2_CREATE_*` 都要保留**,原因:
+这两封邮件还在扫描窗口里(约 48 小时),状态被删就会被当成新邮件再建一次。
+Salesforce 的 SOQL 查不到回收站里的记录,token 去重也拦不住。
+
+**防止再发生:**
+- 流程上:管道上线后,**Plenti 的 referral 不再手工建 Lead**。上线当天的重叠是一次性的。
+- 技术上(未决,归入 Q15):建之前按电话号码找近期 Lead,命中就转 review 而不建。
+  Plenti 现在会给 Customer phone,这是比姓名更可靠的信号;但人工录入的号码格式不一,
+  SOQL 不能规范化比较,要么用 SOSL,要么多查几种格式。有误报风险,需要 Jack 决定。
 
 ### L-02 崩溃恢复后 `SF-Lead-Created` 标签不会亮
 
