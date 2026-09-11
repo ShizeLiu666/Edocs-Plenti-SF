@@ -1846,6 +1846,111 @@ Customer.io 发的(很可能),它也会带同样形态的链接。** 模拟结�
 
 ---
 
+## D-031 入组首日的实测事实;链接主机收紧;标签方案降级
+
+**日期** 2026-09-11 · **阶段** 入组首日
+
+### 实测事实(只读核查,未改动邮箱任何状态)
+
+**① `list:` 两种写法等价。** `list:edocs@sunterra.com.au` 与 `list:edocs.sunterra.com.au`
+都返回 34 个会话。代码现用的 `@` 写法能搜到组投递邮件,不用改。
+
+**② Plenti 用四个地址往 eDocs 发信,只有 referral 带 browser-view 链接。**
+每类各查了一封原文:
+
+| X-Original-Sender | 业务 | 发信系统 | `/deliveries/` 链接 | `Customer name` 字段 |
+|---|---|---|:--:|:--:|
+| **`renewables-referrals@plenti.com.au`** | **referral** | Customer.io | ✅ | ✅ |
+| `wabatteryscheme@plenti.com.au` | WA 返利工单回复 | Zoho Desk → Mailgun | ❌ | ❌ |
+| `contact@plenti.com.au` | WA 返利状态通知 | — | ❌ | ❌ |
+| `noreply.greenfinance@plenti.com.au` | 贷款审批结果 | — | ❌ | ❌ |
+
+四个都是 `dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=plenti.com.au`。
+
+**`PLENTI_TRUSTED_SENDERS` 填 `renewables-referrals@plenti.com.au`,只填这一个。**
+之前从正文联系方式里推测的地址,就是真实发信地址。
+D-030 担心的"其他业务线带链接被误打标签",在今天的样本里**不存在**。
+
+**③ D-029 的"同一模板"假设已用真实邮件验证。** 把 `plParseBrowserView_` 的配对
+算法原样放到真实 referral 邮件的 HTML 上跑:四个标签各出现两次(双区块),
+四个值**全部走主路径、取自右对齐段落**;地址拆分与电话分流都正确。
+
+**④ ⚠️ Gmail 把所有 referral 合进同一个会话。** 标题相同(`Action required: New lead`)
+且 `From` 都被组改写成同一个组地址,两封真实 referral 落进了一个会话。
+**Gmail 标签是按会话打的,不是按封。**
+
+**⑤ 噪音量**:入组后约 2 小时 32 个会话(约 37 封),referral 1 个会话(2 封),
+占 3%。其余是电网并网审批、电气安全证书、Synergy、Plenti 其他业务线等。
+**Q10 的收窄是必要的** —— 不收窄的话 31 个会话会被挂上 Review。
+
+### 链接主机收紧(已实现)
+
+同一封真实 referral 里有两个形态的链接,token 相同、主机不同:
+
+| 部分 | 链接 |
+|---|---|
+| HTML 版 | `https://e.customeriomail.com/deliveries/<token>` —— 直达 browser view |
+| 纯文本版 | `https://track.customer.io/deliveries/<token>` —— **点击跟踪跳转域名** |
+
+**抓 `track.customer.io` 很可能在 Plenti 的 Customer.io 后台记一次"客户点击"** ——
+我们会在别人的营销数据里伪造客户行为。以前的代码是**碰巧**避开的:正则匹配不上
+那个主机名,而 `plBrowserViewUrl_` 先查纯文本、落空后才转去 HTML。
+
+现在:
+
+- 正则只认 **`https://e.customeriomail.com/deliveries/`**,一个字符都不放宽
+- 顺带堵上旧正则的两个口子:**没有域名边界**(`evilcustomeriomail.com` 也能匹配,
+  与 D-009 修过的是同一类 bug),以及任意子域名 / `http://` 都能匹配
+- **抓取不再跟随跳转**(`followRedirects:false`)。实测直达链接 0 次跳转;若哪天它
+  开始 3xx,很可能是跳向跟踪域名 —— 不能在这一层又从后门放进来。3xx 当作抓取失败:
+  R17 之后数据已能从邮件正文拿到,只丢审计留底、不丢 Lead
+- 两道守卫都做了反向验证:把正则放宽成能匹配跟踪域名、或改回跟随跳转,套件都会变红
+
+代价:若 Plenti 换 Customer.io 区域(主机名不同),会一个都匹配不上 → 不建 Lead、
+落 review。这是**可见的**失败,比静默地去抓跟踪域名好。
+
+真实 token 是 URL 安全的 base64,带 `-`。正则和 `Plenti_Lead_ID__c` 都能处理。
+
+### 🔴 L-04 Script Properties 约 6 个工作日写满 —— 上线阻塞项
+
+**由今天的噪音量数据推出来的,不是标签问题,但比标签问题急。**
+
+每一封通过收件人白名单的邮件都会写一条 `IV2_MSG_*` 状态 —— **包括不打标签的
+out-of-scope 噪音**。Q10 收窄只省掉了标签,没省掉状态。实测一条噪音状态 454 字节:
+
+```
+约 18 封/小时 × 10 个工作小时 ≈ 176 封/天 × 454 字节 ≈ 78 KB/天
+Script Properties 上限 500 KB → 约 6.4 个工作日写满
+```
+
+写满之后 `setProperty` 抛错 → 每封邮件都落 `error` → watermark 冻结 →
+**整条管道停摆,包括 referral。** 规格 §9 早就把 500KB 列为已知限制,但当时的
+假设是"长期运行"—— 按实际噪音量,是**一周之内**。
+
+建议的修法(未实施,见下方待决项)。
+
+### 标签方案降级 —— 分析与待决项
+
+Jack 的判断:**标签对 referral 作废,工作队列改用 Salesforce List View**
+(筛 LeadSource + 状态,按 `Plenti_Received_At__c` 排序);标签保留,角色降为
+"这个会话里有东西要看"。
+
+**判断成立**,补三处影响:
+
+1. **与 referral 同标题的可疑邮件也会合进 referral 会话。** 组投递的 `From` 全被
+   改写成同一个组地址,所以一封冒充 referral、或 Plenti 换了发信地址后的
+   `unlisted-sender-with-link` 邮件,只要标题还是 `Action required: New lead`,
+   就会合进那个会话 —— **而那个会话的 Review 标签本来就一直亮着,最该响的警报被
+   淹没了。**"可疑邮件各自独立会话"只在标题不同时成立。
+2. **合并会话让轮询成本随 referral 数线性增长。** `runIntakeV2` 对搜到的会话遍历
+   **所有**消息(只按上线时间过滤,不按扫描窗口),每条"已建 Lead 且仍在 review"
+   的消息都会触发一次 SOQL。所有 referral 都在一个会话里、且都停在 review,
+   每轮扫描就要查 N 次,N 随上线天数增长。
+3. **生产上 `Plenti_Received_At__c` 还没建**(D-023),List View 在生产暂时只能按
+   `CreatedDate` 排,而那恰恰是规格 §5.3 说不能用来算 SLA 的字段。
+
+---
+
 ## Phase 2 审计记录(2026-09-08)
 
 Jack 要求在改存储结构之前,基于实际代码回答三个问题。结论摘要如下,
@@ -2077,6 +2182,8 @@ watermark 的校验保持原样。
 | Q5 | 数据留存范围:是否允许保存整份融资申请 / 身份证明。在拍板前 `ATTACH_RAW_EMAIL` 保持 `false` | Phase 3 | §5.6 |
 | ~~Q6~~ | ✅ **已关闭**(2026-09-09)—— delivery token 落地为 `Plenti_Lead_ID__c`,`plFindReferral_` 已实现为真实查询,见 D-019。原文:**已定** —— 存 Lead 自定义字段 `Plenti_Lead_ID__c`(Jack,2026-09-08),不用 Script Properties。因 D-013 任务 B 要 upsert,该字段**必须建成 External ID + Unique**。⏳ 状态:**待沙箱建字段验证**;字段长度待 2026-09-09 样本确认 ID 格式 | 待验证 | §5.4 / D-013 |
 | Q7 | 模板"老客户在 Account 上建 Completed Task"分支是否保留(默认关闭) | Phase 2 | §5.10 |
+| Q17 | 🔴 **Script Properties 约 6 个工作日写满(L-04),上线前必须修。** 建议组合拳:① 主循环只处理扫描窗口内的消息(不再遍历会话里的旧消息);② out-of-scope 状态只存最小形态(约 50 字节,而不是 454);③ 清理扫描窗口之外的 out-of-scope 状态 —— 它们不参与标签计算,也不会再被扫到。三条都要动 `runIntakeV2`(Code.gs)。另一条路是规格 §9 的外部状态存储,改动大得多 | **上线** | §9 / D-031 |
+| Q18 | **review 的语义要不要改成"脚本需要人帮忙",而不是"业务还没处理完"?** 即:干净建出的 referral 直接落 `done`,`review` 只留给降级、来源冲突、可疑发件人、错误。这样同时解决 D-031 的三处影响:合并会话里的 Review 平时不亮,**一旦亮就说明真有事**(包括同标题的冒充邮件);轮询只针对少数例外;"待补联系方式"整体交给 Salesforce List View | 上线前 | D-024 / D-029 / D-031 |
 | ~~Q16~~ | ✅ **已关闭**(2026-09-09)—— 沙箱已建 Date/Time 字段并放开写入,值取自 `message.getDate()`,见 D-023。⚠️ **生产上仍未建**,探测保证不卡住,但建好之前生产无法从专用字段统计 PLT001。原文:**要不要建?** 我的建议是**建**。规格 §5.3 要求 PLT001 SLA 按该字段计算而非 `CreatedDate`,理由是轮询延迟会放大偏差;SLA 未达标 Plenti 可立即终止合同、无补救期。当前时间戳暂存在 `Plenti_Parsed_JSON__c` 里 —— 能满足审计,但**不可用于报表查询**,做不了 SLA 统计 | 上线前(建议尽快) | §5.3 / D-022 |
 | Q15 | **跨邮箱去重(规格 §5.5)在 Plenti 路径上实际失效。** 它靠客户邮箱查询,而 Plenti 从不提供客户邮箱。info 与 eDocs 同时收到同一客户时不再能自动拦截。可能的替代:按姓名+地址模糊匹配(会误报),或接受这个缺口并靠人工审核兜住 | 上线前评估 | §5.5 / D-019 |
 | Q14 | **PLT003(退出请求 2 个工作日内处理)怎么承载?** 规格 §1 列了这条 SLA,但"用 `Lead.Status` 的 `Withdrawn` 值记录退出请求"这个设计**从未在本项目做出过** —— 全仓库零记录,代码里 `plLeadPayload_` 写死的 Status 只有 `'New'`。汇报口径:**SLA 条款已识别,承载方式尚未设计**(Jack 2026-09-08 确认采用此口径,汇报中已删除 Withdrawn)。➡️ Jack 将在 2026-09-09 会上向 Plenti 索取退出请求的邮件样本与格式,拿到后再定承载方式 | 上线前 | §1 PLT003 |

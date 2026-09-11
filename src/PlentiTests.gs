@@ -2005,10 +2005,62 @@ function testPlentiTwoSources(){
 }
 
 // ============================================================
+// 28. D-031 链接主机:只认 e.customeriomail.com,绝不碰跟踪域名
+// ============================================================
+
+function testPlentiLinkHost(){
+ plTestBaseline_();
+ var real=plTestMessage_('trusted-referral-real-shape'),tok=plFixtures_()['trusted-referral-real-shape'].token;
+ var direct='https://e.customeriomail.com/deliveries/'+tok;
+
+ // ---- 1. 真实形态:纯文本是跟踪域名,HTML 是直达 → 必须拿到直达那个 ----
+ plAssertEq_(plBrowserViewUrl_(real),direct,'the direct e.customeriomail.com link is chosen, never the tracking one');
+ plAssertEq_(plDeliveryToken_(plBrowserViewUrl_(real)),tok,'the token survives intact, including its "-"');
+
+ // ---- 2. 只有跟踪域名的形态 → 必须跳过,宁可拿不到 token ----
+ var trackedOnly=plTestMessageFrom_({id:'tracked-only',subject:'s',headers:{},
+  body:'View in Browser ( https://track.customer.io/deliveries/'+tok+' )',html:''});
+ plAssertEq_(plBrowserViewUrl_(trackedOnly),'','a track.customer.io link must be skipped — fetching it would register a fake customer click in Plenti\'s Customer.io');
+
+ // ---- 3. 域名边界与协议 ----
+ function urlOf(u){return plBrowserViewUrl_(plTestMessageFrom_({id:'u',subject:'s',headers:{},body:u,html:''}));}
+ plAssertEq_(urlOf('https://evilcustomeriomail.com/deliveries/AB=='),'','no domain-boundary bypass (the same bug class D-009 fixed for senders)');
+ plAssertEq_(urlOf('https://track.customeriomail.com/deliveries/AB=='),'','other subdomains are not accepted');
+ plAssertEq_(urlOf('https://e.customeriomail.com.attacker.example/deliveries/AB=='),'','the real host used as a prefix is not accepted');
+ plAssertEq_(urlOf('http://e.customeriomail.com/deliveries/AB=='),'','plain http is not accepted');
+ plAssertEq_(urlOf('https://e.customeriomail.com/deliveries/AB-c_d=='),'https://e.customeriomail.com/deliveries/AB-c_d==','the exact host over https is accepted');
+
+ // ---- 4. 抓取:只打直达链接,不跟随跳转 ----
+ plTestWithFetch_(function(){return {code:200,text:plTestBrowserHtml_()};},function(fetched){
+  var parsed=parsePlentiReferral_(real);
+  plEnrichFromBrowserView_(real,parsed);
+  plAssertEq_(fetched.length,1,'exactly one request');
+  plAssertEq_(fetched[0].url,direct,'the request goes to the direct link');
+  plAssert_(fetched[0].url.indexOf('track.customer.io')<0,'and never to the tracking host');
+  plAssertEq_(fetched[0].options.followRedirects,false,'redirects are not followed — a 3xx must not smuggle the request onto a tracking host');
+ });
+
+ // ---- 5. 直达链接若开始 3xx → 当作抓取失败,Lead 照建(数据从邮件来)----
+ plTestWithFetch_(function(){return {code:302,text:''};},function(){
+  var parsed=parsePlentiReferral_(real);
+  plEnrichFromBrowserView_(real,parsed);
+  plAssertEq_(parsed.browserView.auditMissing,true,'a redirect counts as a failed fetch');
+  plAssert_(/redirect not followed/.test(parsed.browserView.error),'and says why');
+  plAssertEq_(parsed.kind,'referral','identity still comes from the token');
+  plAssertEq_(parsed.customer.lastName,'Fixture Example','and customer data still comes from the email body (D-029)');
+  plAssertEq_(parsed.browserView.degraded,false,'so the data is not degraded — only the audit copy is missing');
+ });
+
+ plTestBaseline_();
+ console.log('PASS: 16 link-host cases (direct link only; tracking host never fetched; redirects not followed)');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiLinkHost();
  testPlentiTwoSources();
  testPlentiScopeNarrowing();
  testPlentiCreatedDurability();

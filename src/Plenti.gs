@@ -335,7 +335,30 @@ function plUntrustedReason_(subject,plain){
  *   HTTP 200,0 次重定向,不依赖 cookie(纯靠 URL 里的 token 授权),
  *   0 个 <script>、0 个 <iframe> —— 纯静态,UrlFetchApp 直接可取。
  */
-var PLENTI_BROWSER_VIEW_RE=/https?:\/\/[A-Za-z0-9.-]*customeriomail\.com\/deliveries\/[A-Za-z0-9_\-+\/=]+/i;
+/**
+ * [D-031] 只认 **`https://e.customeriomail.com/deliveries/<token>`**,一个字符都不放宽。
+ *
+ * 2026-09-11 查了真实组投递的 referral 原文:同一封邮件里有两个形态的链接,
+ * token 相同、主机不同 ——
+ *
+ *   HTML 版    https://e.customeriomail.com/deliveries/<token>   ← 直达 browser view
+ *   纯文本版   https://track.customer.io/deliveries/<token>      ← **点击跟踪跳转域名**
+ *
+ * ⚠️ **绝不能去抓 track.customer.io。** 那是 Customer.io 的点击跟踪域名,抓它很可能
+ * 在 Plenti 的 Customer.io 后台记一次"客户点击了链接" —— 我们会在别人的营销数据
+ * 里伪造客户行为。以前的正则只是**碰巧**匹配不上它(主机名里没有 customeriomail),
+ * 而 plBrowserViewUrl_ 又先查纯文本、落空后转去 HTML,于是恰好拿到了直达链接。
+ * 这不能靠运气,现在由断言锁住。
+ *
+ * 旧写法 `[A-Za-z0-9.-]*customeriomail\.com` 另有两个口子,一并收紧:
+ *   - **没有域名边界**:`evilcustomeriomail.com` 也能匹配(D-009 修过的同一类 bug)
+ *   - 任意子域名都能匹配;`http://` 也能匹配
+ *
+ * 代价:如果 Plenti 哪天换 Customer.io 区域(例如欧洲区的主机名不同),这里会一个都
+ * 匹配不上 → 没有 token → 不建 Lead、落 review。这是**可见的**失败,会立刻被发现,
+ * 比静默地去抓一个跟踪域名好。
+ */
+var PLENTI_BROWSER_VIEW_RE=/https:\/\/e\.customeriomail\.com\/deliveries\/[A-Za-z0-9_\-+\/=]+/i;
 
 /**
  * 页面上的三个字段标签。**顺序无关**,配对靠文档顺序扫描,见 plParseBrowserView_。
@@ -403,8 +426,12 @@ function plFetchBrowserView_(url){
  var out={url:url||'',token:plDeliveryToken_(url),fetchedAt:new Date().toISOString(),ok:false,status:0,error:'',html:''};
  if(!out.url){out.error='No browser-view link found in the message';return out;}
  try{
-  var response=UrlFetchApp.fetch(out.url,{method:'get',muteHttpExceptions:true,followRedirects:true});
+  // [D-031] **不跟随跳转。** 实测直达链接是 0 次跳转;若哪天它开始 3xx,很可能是跳向
+  // 跟踪或别的域名 —— 那正是上面正则要堵的口子,不能在这一层又从后门放进来。
+  // 3xx 当作抓取失败处理:R17 之后数据已经能从邮件正文拿到,只丢审计留底,不丢 Lead。
+  var response=UrlFetchApp.fetch(out.url,{method:'get',muteHttpExceptions:true,followRedirects:false});
   out.status=response.getResponseCode();
+  if(out.status>=300&&out.status<400){out.error='Browser view returned HTTP '+out.status+' (redirect not followed — see D-031)';return out;}
   if(out.status!==200){out.error='Browser view returned HTTP '+out.status;return out;}
   out.html=String(response.getContentText()||'');
   if(!out.html){out.error='Browser view returned an empty body';return out;}
