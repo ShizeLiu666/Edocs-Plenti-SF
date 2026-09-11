@@ -334,10 +334,12 @@ Setup → Object Manager → **Lead** → Fields & Relationships → **Lead Sour
 的可选值里。**这一步最容易漏,漏了会在创建 Lead 时报错。**
 
 **改了什么**
-Lead 对象的 LeadSource picklist 多了一个值 `Plenti`。
+Lead 对象的 LeadSource picklist 多了一个值。
 
-代码里 `src/Plenti.gs` 的 `plLeadPayload_` 写的就是 `LeadSource:'Plenti'`
-(规格 §5.9)。**值必须精确匹配,大小写敏感。**
+⚠️ **2026-09-11 更新(D-029)**:代码**不再写死**这个值,改为读 Script Property
+`PLENTI_LEAD_SOURCE`。生产上 Lily 加的值是 **`Plenti Referrals`**,不是 `Plenti`。
+**沙箱加什么值都行,但 `PLENTI_LEAD_SOURCE` 必须与之完全一致,大小写敏感。**
+`plTestDescribeLead()` 会校验这一点,配错会报出所有活跃值。
 
 **怎么验证**
 两种都做:

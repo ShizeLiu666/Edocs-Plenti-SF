@@ -180,6 +180,7 @@ for (const file of ['Code.gs', 'Legacy.gs', 'Plenti.gs', 'Tests.gs', 'PlentiTest
   ];
 
   props.set('INTAKE_ADMIN_ID', '005000000000000AAA');
+  props.set('PLENTI_LEAD_SOURCE', 'Plenti Referrals');
   const used = context.plLeadFieldsUsed_();
   context.plLeadFieldMap_.cache = null;   // 探测缓存不能渗进后面的用例
   props.clear();
@@ -353,6 +354,7 @@ sheets.openById = (id) => {
 props.set('INTERNAL_DOMAIN', 'example.org');
 props.set('PLENTI_TRUSTED_SENDERS', '@plenti.example');
 props.set('INTAKE_MAILBOX', 'edocs-copy@example.org');
+props.set('PLENTI_LEAD_SOURCE', 'Plenti Referrals');
 props.set('INTAKE_LOG_SHEET_ID', 'fixture-sheet-id');
 context.runIntakeV2();
 

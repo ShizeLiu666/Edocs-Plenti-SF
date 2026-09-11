@@ -342,6 +342,9 @@ var PLENTI_BROWSER_VIEW_RE=/https?:\/\/[A-Za-z0-9.-]*customeriomail\.com\/delive
  */
 var PLENTI_BROWSER_LABELS=[
  {key:'name',label:'customer name'},
+ // [R17] 2026-09-10 的正式 lead 多出这一项。双区块陷阱同样适用 —— 配对算法对
+ // 每个标签独立扫描、撞到下一个标签就停,加一行标签即可,不需要改算法。
+ {key:'phone',label:'customer phone'},
  {key:'address',label:'customer address'},
  {key:'systems',label:'renewable systems'}
 ];
@@ -417,7 +420,7 @@ function plBrowserLabelKey_(text){
 }
 
 /**
- * plParseBrowserView_(html) → {name, address, systems, found:[], missing:[]}
+ * plParseBrowserView_(html) → {name, phone, address, systems, found:[], missing:[]}
  *
  * ⚠️ **页面里每个标签出现两次。** 模板为桌面/移动两套布局各渲染一份:
  *   第一组 标签 + 右对齐的真值
@@ -432,7 +435,7 @@ function plBrowserLabelKey_(text){
  * 取不到再退回该区间内第一个非空普通段落。
  */
 function plParseBrowserView_(html){
- var out={name:'',address:'',systems:'',found:[],missing:[]};
+ var out={name:'',phone:'',address:'',systems:'',found:[],missing:[]};
  // 去掉全部 HTML 注释,连同 Outlook 的 <!--[if ...]> 条件块一起 —— 真值不在注释里。
  var body=String(html||'').replace(/<!--[\s\S]*?-->/g,'');
  var tokens=[],re=/<p\b([^>]*)>([\s\S]*?)<\/p>/gi,m,i,j,key,value,fallback,token;
@@ -457,6 +460,84 @@ function plParseBrowserView_(html){
  for(i=0;i<PLENTI_BROWSER_LABELS.length;i++){
   key=PLENTI_BROWSER_LABELS[i].key;
   if(out[key])out.found.push(key);else out.missing.push(key);
+ }
+ return out;
+}
+
+/**
+ * 只留数字,并把 +61 国际格式折回本地格式 —— **仅用于比较,从不写入 Salesforce**。
+ * Salesforce 里存的是原样(D-029:Jack 倾向原样存,原始值另在 JSON 里留底)。
+ */
+function plNormalizeDigits_(value){
+ var digits=String(value||'').replace(/\D+/g,'');
+ if(/^61\d{9}$/.test(digits))digits='0'+digits.slice(2);
+ return digits;
+}
+
+/**
+ * 澳洲号码按编号规划分流:04 开头是手机 → MobilePhone,其余 → Phone。
+ * 编号规划是固定的,这不是猜。手机号放进 MobilePhone 语义才对 —— SMS 和
+ * 点击发短信这类集成都认这个字段;反过来把座机塞进 MobilePhone 就是错的。
+ */
+function plPhoneField_(phone){return /^04\d{8}$/.test(plNormalizeDigits_(phone))?'MobilePhone':'Phone';}
+
+/**
+ * 联系方式的指纹。用来记住"这个值是我们自己写进去的",让 plRefreshReview_
+ * 不把它误当成人补的(D-029)。
+ *
+ * **存的是哈希不是号码** —— 状态落在 Script Properties 里,不值得为了一次
+ * 比较多放一份客户电话的明文副本。
+ */
+function plContactHash_(value){
+ var digits=plNormalizeDigits_(value);
+ if(!digits)return '';
+ return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,digits)).slice(0,22);
+}
+
+/** 本次写入 Lead 的、由 Plenti 提供的联系方式 {字段名: 指纹}。 */
+function plSuppliedContacts_(parsed){
+ var out={},phone=parsed&&parsed.customer&&parsed.customer.phone;
+ if(phone)out[plPhoneField_(phone)]=plContactHash_(phone);
+ return out;
+}
+
+var PLENTI_MERGE_FIELDS=['name','phone','address','systems'];
+
+function plSameValue_(key,a,b){
+ if(key==='phone')return plNormalizeDigits_(a)===plNormalizeDigits_(b);
+ return String(a).replace(/\s+/g,' ').trim().toLowerCase()===String(b).replace(/\s+/g,' ').trim().toLowerCase();
+}
+
+/**
+ * plMergeSources_(fromEmail, fromPage) → {fields, source, conflicts}
+ *
+ * 两个数据源逐字段合并(D-029):
+ *
+ *   只有一边有值  → 取那一边
+ *   两边都有且一致 → 取值,来源记 both
+ *   两边都有且冲突 → **以邮件为准**,并记入 conflicts,要人看一眼
+ *
+ * 为什么冲突时邮件优先:
+ *   1. 邮件是**我们在 T0 实际收到的那一份**,落在 Plenti_Raw_Email__c,是审计原件
+ *   2. 邮件不受网络影响;页面是事后另外抓的,抓的时刻不同
+ *   3. 页面在这里的角色是**独立交叉核对** —— 它的价值在于发现两边不一致,
+ *      而不是在不一致时替邮件做决定
+ *
+ * 冲突**不阻断建 Lead**:SLA 时钟不等人。用邮件的值建,把冲突写进 reason 和
+ * Description,让跟进的人看到。
+ */
+function plMergeSources_(fromEmail,fromPage){
+ var out={fields:{},source:{},conflicts:[]},i,key,e,p;
+ for(i=0;i<PLENTI_MERGE_FIELDS.length;i++){
+  key=PLENTI_MERGE_FIELDS[i];
+  e=(fromEmail&&fromEmail[key])||'';
+  p=(fromPage&&fromPage[key])||'';
+  if(e&&p){
+   out.fields[key]=e;
+   if(plSameValue_(key,e,p))out.source[key]='both';
+   else{out.source[key]='email';out.conflicts.push(key);}
+  }else if(e){out.fields[key]=e;out.source[key]='email';}
+  else if(p){out.fields[key]=p;out.source[key]='page';}
  }
  return out;
 }
@@ -488,7 +569,8 @@ function plSplitAuAddress_(raw){
 function plEnrichFromBrowserView_(message,parsed){
  var url=plBrowserViewUrl_(message),fetched=plFetchBrowserView_(url);
  var meta={url:fetched.url,token:fetched.token,fetchedAt:fetched.fetchedAt,ok:fetched.ok,
-  status:fetched.status,error:fetched.error,found:[],missing:[],degraded:false};
+  status:fetched.status,error:fetched.error,found:[],missing:[],
+  emailFound:[],pageFound:[],sources:{},conflicts:[],degraded:false,auditMissing:false};
  parsed.browserView=meta;
  if(!fetched.token){
   meta.degraded=true;
@@ -498,35 +580,55 @@ function plEnrichFromBrowserView_(message,parsed){
  // 有 token 就有稳定身份 —— 这是 Plenti 转介,后面无论如何都要建 Lead。
  parsed.kind='referral';
  if(!parsed.referralId)parsed.referralId=fetched.token;
- if(!fetched.ok){
-  meta.degraded=true;
-  meta.missing=['name','address','systems'];
-  parsed.confidence='low';
-  parsed.reason='Browser view fetch failed: '+fetched.error+'. Lead created from the email alone; open the link manually for customer details.';
-  return {html:'',meta:meta};
+
+ // [R17] 两个数据源(D-029)。邮件 HTML 与 browser view 是**同一个 Customer.io
+ // 模板**的两份渲染,所以用同一个解析器,双区块陷阱的处理自动两边都适用。
+ // 刻意不解析 getPlainBody():那是 Gmail 转出来的文本,格式没见过,写规则是猜。
+ var fromEmail=plParseBrowserView_(message.getBody());
+ var fromPage=fetched.ok?plParseBrowserView_(fetched.html):null;
+ meta.emailFound=fromEmail.found;
+ meta.pageFound=fromPage?fromPage.found:[];
+ // 抓取照做,无论邮件解析得多完整:页面 HTML 是审计留底(D-014),不能省;
+ // 它也是发现"两边不一致"的唯一交叉核对。
+ meta.auditMissing=!fetched.ok;
+
+ var merged=plMergeSources_(fromEmail,fromPage),f=merged.fields,i,key;
+ meta.sources=merged.source;
+ meta.conflicts=merged.conflicts;
+ for(i=0;i<PLENTI_MERGE_FIELDS.length;i++){
+  key=PLENTI_MERGE_FIELDS[i];
+  if(f[key])meta.found.push(key);else meta.missing.push(key);
  }
- var fields=plParseBrowserView_(fetched.html);
- meta.found=fields.found;
- meta.missing=fields.missing;
- parsed.systems=fields.systems;
- if(fields.name)parsed.customer.lastName=fields.name;
- if(fields.address){
-  var address=plSplitAuAddress_(fields.address);
-  parsed.customer.addressRaw=fields.address;
+ if(f.systems)parsed.systems=f.systems;
+ if(f.name)parsed.customer.lastName=f.name;
+ // 原样存,不规范化(D-029)。规范化只在比较时做。
+ if(f.phone)parsed.customer.phone=String(f.phone).trim();
+ if(f.address){
+  var address=plSplitAuAddress_(f.address);
+  parsed.customer.addressRaw=f.address;
   parsed.customer.street=address.street;
   parsed.customer.city=address.city;
   parsed.customer.state=address.state;
   parsed.customer.postcode=address.postcode;
  }
- if(fields.name){
+
+ // [R17] "降级"拆成两根独立的轴,以前它们是捆在一起的(抓取失败 = 没数据):
+ //   degraded     —— **数据**缺失:两个来源都没给出客户姓名
+ //   auditMissing —— **审计留底**缺失:页面没抓到
+ // 邮件解析成功而页面抓取失败时,只丢审计留底、不丢数据 —— 比以前温和得多。
+ var notes=[];
+ if(f.name){
   parsed.confidence='high';
-  parsed.reason='Parsed '+fields.found.length+' field(s) from the Plenti browser view';
+  notes.push('Parsed '+meta.found.length+' field(s)');
  }else{
   meta.degraded=true;
   parsed.confidence='low';
-  parsed.reason='Browser view fetched but the customer name could not be parsed; template may have changed';
+  notes.push('Neither the email nor the browser view yielded a customer name; open the link manually for customer details');
  }
- return {html:fetched.html,meta:meta};
+ if(merged.conflicts.length)notes.push('⚠️ email and browser view DISAGREE on: '+merged.conflicts.join(', ')+' — the email value was used, please check');
+ if(meta.auditMissing)notes.push('browser view could not be fetched ('+fetched.error+'), so the audit copy is missing'+(f.name?' — customer data came from the email':''));
+ parsed.reason=notes.join('; ');
+ return {html:fetched.ok?fetched.html:'',meta:meta};
 }
 
 /**
@@ -833,7 +935,7 @@ function plLeadFieldMap_(){
    f=list[i];
    map[f.name]={createable:f.createable===true,unique:f.unique===true,
     caseSensitive:f.caseSensitive===true,externalId:f.externalId===true,
-    type:f.type||'',length:f.length||0};
+    type:f.type||'',length:f.length||0,picklist:plActivePicklist_(f)};
   }
  }catch(e){
   console.log('Lead describe failed; optional fields are skipped for this run: '+String(e.message||e).slice(0,200));
@@ -842,7 +944,45 @@ function plLeadFieldMap_(){
  return map;
 }
 
+/** 字段的**活跃** picklist 值;非 picklist 字段返回空数组。 */
+function plActivePicklist_(field){
+ var out=[],values=(field&&field.picklistValues)||[],i;
+ for(i=0;i<values.length;i++){if(values[i]&&values[i].active!==false)out.push(values[i].value);}
+ return out;
+}
+
+/**
+ * [R17] LeadSource 的值从 Script Property 读,不写死(D-029)。
+ *
+ * 触发:生产上 Lily 加的 picklist 值是 "Plenti Referrals",代码里写死的是
+ * "Plenti"。沙箱和生产不一定一样,写死迟早出事。
+ *
+ * 缺失即抛错(规格 §3 禁止 #2)。
+ */
+function plLeadSource_(){
+ var value=String(PropertiesService.getScriptProperties().getProperty('PLENTI_LEAD_SOURCE')||'').trim();
+ if(!value)throw new Error('Configure PLENTI_LEAD_SOURCE with the exact LeadSource picklist value for this org (production uses "Plenti Referrals")');
+ return value;
+}
+
 function plLeadFieldExists_(name){var f=plLeadFieldMap_()[name];return !!f&&f.createable===true;}
+
+/**
+ * 取 LeadSource 并对照 org 的 picklist 校验。
+ *
+ * ⚠️ 由 plCreateLead_ 在**写 IV2_CREATE_ 锁之前**调用。所以配错的 LeadSource
+ * 会在上锁之前就抛出来 —— 不会先 POST 失败、再把锁卡在 requested 触发 L-01
+ * (那要人工删属性才能恢复)。
+ *
+ * describe 失败时(字段表为空)跳过校验,不阻断 —— 与可选字段探测同一策略。
+ */
+function plValidatedLeadSource_(){
+ var value=plLeadSource_(),field=plLeadFieldMap_().LeadSource;
+ if(field&&field.picklist&&field.picklist.length&&field.picklist.indexOf(value)<0){
+  throw new Error('PLENTI_LEAD_SOURCE "'+value+'" is not an active LeadSource picklist value in this org. Active values: '+field.picklist.join(', '));
+ }
+ return value;
+}
 
 var PLENTI_LONG_TEXT_LIMIT=131072;
 var PLENTI_JSON_LIMIT=32768;
@@ -854,6 +994,21 @@ function plTruncateField_(value,limit){
  return text.length<=limit?text:text.slice(0,limit-marker.length)+marker;
 }
 
+/**
+ * Description 末尾的状态标记。三种情况是独立的,可以同时出现(D-029):
+ *   数据缺失   —— 两个来源都没给出客户姓名,人得自己去点链接
+ *   来源冲突   —— 邮件和页面对同一字段给了不同的值,用了邮件的,要人核对
+ *   审计缺失   —— 页面没抓到,数据来自邮件,但 Plenti_Browser_View_HTML__c 是空的
+ */
+function plDescriptionFlags_(meta){
+ var out='';
+ if(!meta)return out;
+ if(meta.degraded)out+=' [CUSTOMER DETAILS MISSING — open the browser-view link in the raw email]';
+ if(meta.conflicts&&meta.conflicts.length)out+=' [SOURCES DISAGREE: '+meta.conflicts.join(', ')+' — email value used, please check]';
+ if(meta.auditMissing&&!meta.degraded)out+=' [AUDIT COPY MISSING — browser view was not fetched]';
+ return out;
+}
+
 function plLeadPayload_(message,parsed,enrichment){
  var c=parsed.customer,marker='[Intake: '+message.getId()+']',meta=(enrichment&&enrichment.meta)||{};
  var fieldCount=(meta.found||[]).length;
@@ -861,7 +1016,7 @@ function plLeadPayload_(message,parsed,enrichment){
   LastName:plTruncateField_(c.lastName||('Plenti referral '+String(parsed.referralId||'').slice(0,24)),80),
   Status:'New',
   OwnerId:ivAdmin_(),
-  LeadSource:'Plenti',
+  LeadSource:plLeadSource_(),
   Company:'Individual / Residential',
   Contact_Attempt_Count__c:0,
   // D-014:审计留底存**原始 HTML**,不存 Gmail 转好的文本 —— 转换有损,
@@ -873,7 +1028,7 @@ function plLeadPayload_(message,parsed,enrichment){
   // [R13] 摘要里带上 systems —— 跟进的人一眼要看到客户想装什么。
   // 这不违反 D-012:那条禁的是 referralId 之外的**内部标识符**,而 systems 是
   // 客户需求本身,正是 D-012 允许的"销售必要信息"。
-  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(parsed.systems?'; systems: '+parsed.systems:'')+(meta.degraded?' [BROWSER VIEW UNAVAILABLE — open the link in the raw email for customer details]':''),PLENTI_DESCRIPTION_LIMIT)
+  Description:plTruncateField_(marker+' Plenti referral received '+message.getDate().toISOString()+'; '+fieldCount+' fields parsed'+(parsed.systems?'; systems: '+parsed.systems:'')+plDescriptionFlags_(meta),PLENTI_DESCRIPTION_LIMIT)
  };
  // [R13] 专用字段:Description 是自由文本,分组和筛选都做不了。Schedule 3 季度
  // 报告和 PLT002 的转化率分析都可能要按系统类型切分,所以另建一个可报表字段。
@@ -893,7 +1048,9 @@ function plLeadPayload_(message,parsed,enrichment){
  // §5.2:客户邮箱取不到就不写,**绝不拿 Plenti 的地址兜底**。
  if(c.email)payload.Email=c.email;
  if(c.firstName)payload.FirstName=plTruncateField_(c.firstName,40);
- if(c.phone)payload.Phone=c.phone;
+ // [R17] 手机进 MobilePhone、其余进 Phone(D-029)。原样写入,不规范化;
+ // Phone / MobilePhone 在 Salesforce 里上限都是 40 字符。
+ if(c.phone)payload[plPhoneField_(c.phone)]=plTruncateField_(String(c.phone).trim(),40);
  if(c.street)payload.Street=c.street;
  if(c.city)payload.City=c.city;
  if(c.state){payload.StateCode=String(c.state).toUpperCase();payload.CountryCode='AU';}
@@ -912,6 +1069,11 @@ function plLeadPayload_(message,parsed,enrichment){
 function plCreateLead_(message,parsed,enrichment){
  var id=message.getId(),p=PropertiesService.getScriptProperties();
  if(p.getProperty('IV2_CREATE_'+id))throw new Error('Earlier create outcome is uncertain; check Salesforce before retrying creation');
+ // [R17] 在上锁**之前**校验 LeadSource。配错的值在这里就抛出来,不会先 POST
+ // 失败、再把锁卡在 requested 触发 L-01。放在这里而不是 plLeadPayload_ 里,
+ // 是因为字段自检的探针也调 plLeadPayload_ —— 自检工具不能在配错时自己崩掉,
+ // 它的用处恰恰是把配错报出来。
+ plValidatedLeadSource_();
  var payload=plLeadPayload_(message,parsed,enrichment);
  p.setProperty('IV2_CREATE_'+id,JSON.stringify({state:'requested',at:new Date().toISOString()}));
  var result=ivReq_('sobjects/Lead','post',payload);
@@ -936,10 +1098,23 @@ function plCreateLead_(message,parsed,enrichment){
  * 另外两个条件沿用模板 ivRefreshReview_ 的意图:线索被转换、或被判定为
  * Unqualified,都说明有人处理过了,再挂着 review 只是噪音。
  */
-function plReviewClearedReason_(lead){
+function plReviewClearedReason_(lead,supplied){
+ supplied=supplied||{};
  if(lead.IsConverted===true)return 'Lead has been converted';
  if(lead.Status==='Unqualified')return 'Lead marked Unqualified';
- if(lead.Email||lead.Phone||lead.MobilePhone)return 'Contact details have been filled in (Plenti supplies none, so this can only have come from a person)';
+ // [R17] D-024 的前提"Plenti 一条联系方式都不给,所以非空只可能是人填的"
+ // 已经**不成立** —— 正式 lead 带了 Customer phone。如果照旧,我们自己写进去
+ // 的电话会在下一轮就让 review 解除,而且 reason 会谎称"是人填的"。
+ //
+ // 所以现在的判据是:**这个值不是我们写进去的**。supplied 里记着我们写入时的
+ // 指纹;同一个号码(换格式也算)不算人为动作,人改了号码或补了邮箱才算。
+ var fields=['Email','Phone','MobilePhone'],i,name,value;
+ for(i=0;i<fields.length;i++){
+  name=fields[i];value=lead[name];
+  if(!value)continue;
+  if(supplied[name]&&supplied[name]===plContactHash_(value))continue;
+  return 'Contact details were added or changed by a person ('+name+')';
+ }
  return '';
 }
 
@@ -982,7 +1157,7 @@ function plRefreshReview_(message){
   return false;
  }
  if(!lead)return false;
- var reason=plReviewClearedReason_(lead);
+ var reason=plReviewClearedReason_(lead,state.supplied);
  if(!reason)return false;
  state.state='done';
  state.reason=reason;
@@ -1077,6 +1252,20 @@ function plTestDescribeLead(){
  console.log('[R11] Plenti_Received_At__c: '+(Object.prototype.hasOwnProperty.call(have,'Plenti_Received_At__c')
   ? 'PRESENT — PLT001 timestamp is written from the message date (spec 5.3)'
   : 'ABSENT — skipped at runtime; PLT001 cannot be measured from a dedicated field until it is created (spec 5.3)'));
+
+ // [R17] PLENTI_LEAD_SOURCE 必须是 org 里的活跃 picklist 值。沙箱和生产的
+ // 值可能不同(生产是 "Plenti Referrals"),写错整个 POST 就会失败。
+ var configured=String(PropertiesService.getScriptProperties().getProperty('PLENTI_LEAD_SOURCE')||'').trim();
+ var ls=have.LeadSource,lsValues=(ls&&ls.picklist)||[];
+ if(!configured){
+  console.log('[R11] ❌ PLENTI_LEAD_SOURCE is not configured — every Lead creation will stop');
+ }else if(!lsValues.length){
+  console.log('[R11] ⓘ PLENTI_LEAD_SOURCE="'+configured+'" — LeadSource picklist values not available from describe, cannot verify');
+ }else if(lsValues.indexOf(configured)<0){
+  console.log('[R11] ❌ PLENTI_LEAD_SOURCE="'+configured+'" is NOT an active LeadSource value in this org. Active values: '+lsValues.join(', '));
+ }else{
+  console.log('[R11] ✅ PLENTI_LEAD_SOURCE="'+configured+'" is an active LeadSource value in this org');
+ }
 
  // [R14] Plenti_Lead_ID__c 的三个属性 —— 人肉核对不算数,让 describe 说话。
  // Unique 是规格 §5.4 第三层去重的**数据库层兜底**:查询与创建之间存在竞态
@@ -1423,6 +1612,9 @@ function plProcess_(message,force,detail){
   }
   state.record=lead.Id;
   state.created=resolved.created===true;
+  // [R17] 记下我们写进去的联系方式指纹。**按本次解析结果重算**而不是只在
+  // POST 时记 —— force 重跑会新建 state 对象,只在 POST 时记的话重跑后就丢了。
+  state.supplied=plSuppliedContacts_(parsed);
   state.attached=ivAttachSource_(message,{id:lead.Id});
   state.state='review';
   state.leadCandidate=true;

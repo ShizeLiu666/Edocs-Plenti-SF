@@ -1,0 +1,14 @@
+{
+  "_note": "虚构样本。2026-09-11 起真实 lead 邮件的 HTML 正文里就带客户数据(与 browser view 同一个Customer.io 模板)。这封的正文模板与 browser-view-sample.json 的值完全一致,用来测'两边一致 → 来源记 both'。所有值均为虚构。",
+  "id": "fixture-referral-with-template",
+  "subject": "Action required: New lead",
+  "from": "eDocs Group <edocs@example.org>",
+  "date": "2026-09-11T02:15:00.000Z",
+  "headers": {
+    "X-Original-Sender": "referrals@plenti.example",
+    "X-Original-Authentication-Results": "mx.example.org; dkim=pass; spf=pass; dmarc=pass header.from=plenti.example",
+    "To": "eDocs <edocs@example.org>"
+  },
+  "body": "Hi Sunterra,\n\nView in Browser: https://e.customeriomail.com/deliveries/FIXTUREtoken0001AAA==\n",
+  "html": "<html><head><meta charset=\"utf-8\"/></head><body><p><a href=\"https://e.customeriomail.com/deliveries/FIXTUREtoken0001AAA==\">View in Browser</a></p><!--[if true]><table role=\"none\"><tr><td><![endif]--><div><p style=\"font-size: 16px; margin: 0;\">Hi Sunterra,</p></div><div><p style=\"font-size: 16px; margin: 0;\"><strong>Customer name</strong></p></div><!--[if true]></td><td></td></tr></table><![endif]--><div><p style=\"font-size: 16px; text-align: right; margin: 0;\"><span style=\"font-size: 16px\">Fixture Example</span></p></div><div><p style=\"font-size: 16px; margin: 0;\"><strong>Customer phone</strong></p></div><div><p style=\"font-size: 16px; text-align: right; margin: 0;\"><span style=\"font-size: 16px\">0400 000 111</span></p></div><div><p style=\"font-size: 16px; margin: 0;\"><strong>Customer address</strong></p></div><div><p style=\"font-size: 16px; text-align: right; margin: 0;\"><span style=\"font-size: 16px\">12 Fictional Street,<br/>\n   Sampletown SA 5000</span></p></div><div><p style=\"font-size: 16px; margin: 0;\"><strong>Renewable systems</strong></p></div><div><p style=\"font-size: 16px; text-align: right; margin: 0;\"><span style=\"font-size: 16px\">Battery, Solar</span></p></div><div style=\"display: none;\"><p style=\"font-size: 16px; margin: 0;\"><strong>Customer name</strong></p><p style=\"font-size: 16px; margin: 0 0 8px;\"></p><p style=\"font-size: 16px; margin: 0;\"><strong>Customer phone</strong></p><p style=\"font-size: 16px; margin: 0 0 8px;\"></p><p style=\"font-size: 16px; margin: 0;\"><strong>Customer address</strong></p><p style=\"font-size: 16px; margin: 0 0 8px;\"></p><p style=\"font-size: 16px; margin: 0;\"><strong>Renewable systems</strong></p><p style=\"font-size: 16px; margin: 0;\">[]</p></div><!-- <![endif]--><div><p>If you have any questions, please contact us at <a href=\"mailto:renewables-referrals@plenti.example\">renewables-referrals@plenti.example</a></p></div></body></html>"
+}

@@ -69,6 +69,8 @@ function plTestBaseline_(){
   EDOCS_GROUP_ADDRESS:'edocs@example.org',
   INTAKE_MAILBOX:'edocs-copy@example.org',
   INTAKE_ADMIN_ID:'005000000000000AAA',
+  // [R17] 刻意用和代码旧写死值('Plenti')不同的值,证明是从属性读的
+  PLENTI_LEAD_SOURCE:'Plenti Referrals',
   ATTACH_RAW_EMAIL:null
  });
  plTestClearState_();
@@ -481,7 +483,7 @@ function testPlentiLeadPayload(){
 
  plAssertEq_(payload.Email,'dale.example@example.net','Lead.Email must be the customer address');
  plAssert_(payload.Email!=='referrals@plenti.example','Lead.Email must never be the Plenti sender address');
- plAssertEq_(payload.LeadSource,'Plenti','LeadSource per spec 5.9 (picklist value pending Q3)');
+ plAssertEq_(payload.LeadSource,'Plenti Referrals','LeadSource comes from PLENTI_LEAD_SOURCE, not a hardcoded value (D-029)');
  plAssertEq_(payload.Contact_Attempt_Count__c,0,'Contact_Attempt_Count__c starts at zero');
  plAssertEq_(payload.OwnerId,'005000000000000AAA','OwnerId comes from INTAKE_ADMIN_ID');
  plAssertEq_(payload.Status,'New','Status');
@@ -526,7 +528,7 @@ function testPlentiLeadPayload(){
 
  // 降级时 Description 要显眼地标出来
  var degraded=plLeadPayload_(message,parsed,{html:'',meta:{found:[],degraded:true}});
- plAssert_(/BROWSER VIEW UNAVAILABLE/.test(degraded.Description),'a degraded Lead says so in Description so a human knows to open the link');
+ plAssert_(/CUSTOMER DETAILS MISSING/.test(degraded.Description),'a degraded Lead says so in Description so a human knows to open the link');
  plAssertEq_(degraded.Plenti_Browser_View_HTML__c,'','no page means an empty field, not a fabricated one');
 
  // 客户姓名取不到时用 token 兜底,**绝不用发件人地址**
@@ -693,7 +695,7 @@ function testPlentiReviewRelease(){
    plAssertEq_(plRefreshReview_(message),true,c[0]+' clears the review');
    var after=ivGet_(id);
    plAssertEq_(after.state,'done',c[0]+': state becomes done');
-   plAssert_(/Contact details have been filled in/.test(after.reason),c[0]+': the reason says why');
+   plAssert_(/Contact details were added or changed by a person/.test(after.reason),c[0]+': the reason says why');
    plAssertEq_(after.created,true,c[0]+': the created flag survives, so SF-Lead-Created stays lit');
    plAssertEq_(after.record,'00Qreview0001AAA',c[0]+': the record id survives');
   });
@@ -850,7 +852,7 @@ function testPlentiForceCreate(){
  plAssert_(/@example\.invalid$/.test(posted.Email),'the synthetic customer email must use the unroutable .invalid TLD so no Salesforce Flow can mail a real address');
  plAssert_(posted.Email!=='referrals@plenti.example','the synthetic email must never fall back to the sender address');
  plAssert_(/Forced Test/.test(posted.LastName),'the synthetic name is obviously test data');
- plAssertEq_(posted.LeadSource,'Plenti','the real field mapping is still exercised — that is the point of the switch');
+ plAssertEq_(posted.LeadSource,'Plenti Referrals','the real field mapping is still exercised — that is the point of the switch');
  plAssertEq_(JSON.parse(posted.Plenti_Parsed_JSON__c).receivedAt,message.getDate().toISOString(),'the received timestamp is still the real message date, now carried in the parsed JSON');
 
  // 解析器保持诚实:强制模式不改 parsePlentiReferral_ 的返回
@@ -965,7 +967,8 @@ function testPlentiBrowserView(){
  var fields=plParseBrowserView_(plTestBrowserHtml_());
  plAssertEq_(fields.name,'Fixture Example','customer name comes from the populated block');
  plAssertEq_(fields.systems,'Battery, Solar','renewable systems parsed');
- plAssertEq_(fields.found.length,3,'all three labelled fields are found');
+ plAssertEq_(fields.found.length,4,'all four labelled fields are found');
+ plAssertEq_(fields.phone,'0400 000 111','customer phone comes from the populated block, verbatim — the empty duplicate block must not win');
  plAssertEq_(fields.missing.length,0,'nothing missing');
  // 地址:<br/> 与换行都要合并成一行
  plAssertEq_(fields.address,'12 Fictional Street, Sampletown SA 5000','the address is merged onto one line');
@@ -979,11 +982,13 @@ function testPlentiBrowserView(){
  // 只有空值区块时,三个字段都应为空而不是 []
  var emptyOnly=plParseBrowserView_(
   '<p><strong>Customer name</strong></p><p></p>'+
+  '<p><strong>Customer phone</strong></p><p></p>'+
   '<p><strong>Customer address</strong></p><p></p>'+
   '<p><strong>Renewable systems</strong></p><p>[]</p>');
  plAssertEq_(emptyOnly.name,'','an empty block yields no name');
  plAssertEq_(emptyOnly.systems,'','[] is not a value');
- plAssertEq_(emptyOnly.missing.length,3,'all three are reported missing');
+ plAssertEq_(emptyOnly.phone,'','an empty phone block yields no phone');
+ plAssertEq_(emptyOnly.missing.length,4,'all four are reported missing');
 
  // ---- 3. 地址拆分:匹配不上就整串塞 Street,不猜 ----
  var au=plSplitAuAddress_('12 Fictional Street, Sampletown SA 5000');
@@ -1073,7 +1078,7 @@ function testPlentiBrowserView(){
    var posts=plTestPosts_(calls);
    plAssertEq_(posts.length,1,'still exactly one Lead');
    plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'identity is preserved even when the page could not be read');
-   plAssert_(/BROWSER VIEW UNAVAILABLE/.test(posts[0].data.Description),'Description tells the reviewer to open the link');
+   plAssert_(/CUSTOMER DETAILS MISSING/.test(posts[0].data.Description),'Description tells the reviewer to open the link');
    plAssertEq_(posts[0].data.Plenti_Browser_View_HTML__c,'','no page stored');
   });
  });
@@ -1185,7 +1190,7 @@ function testPlentiTestEntryPoint(){
 
  // ---- 6. ⚠️ Jack 要确认的:链接提取失败时会怎样 ----
  plTestClearState_();
- // 6a. 有链接但抓取失败 → **降级建 Lead**,标记 BROWSER VIEW UNAVAILABLE
+ // 6a. 有链接但抓取失败(且邮件里也没有模板数据)→ **降级建 Lead**,标记 CUSTOMER DETAILS MISSING
  plTestWithGmail_(inbox,function(){
   plTestWithFetch_(function(){return {code:500,text:'boom'};},function(){
    plTestWithFakeApi_(function(calls){
@@ -1195,7 +1200,7 @@ function testPlentiTestEntryPoint(){
     var state=plTestFromMessageId(id,true);
     plAssertEq_(state.created,true,'a failed fetch must still create the Lead — the SLA clock is running');
     var posts=plTestPosts_(calls);
-    plAssert_(/BROWSER VIEW UNAVAILABLE/.test(posts[0].data.Description),'Description tells the reviewer to open the link');
+    plAssert_(/CUSTOMER DETAILS MISSING/.test(posts[0].data.Description),'Description tells the reviewer to open the link');
     plAssertEq_(posts[0].data.Plenti_Lead_ID__c,token,'identity survives the failed fetch');
    });
   });
@@ -1476,7 +1481,7 @@ function testPlentiReceivedAt(){
   try{return plLeadPayload_(message,parsed,enrichment);}finally{ivReq_=real;plLeadFieldMap_.cache=null;}
  })();
  plAssert_(!('Plenti_Received_At__c' in broken),'a describe failure skips the optional field');
- plAssertEq_(broken.LeadSource,'Plenti','but the rest of the payload is intact — the Lead is still created');
+ plAssertEq_(broken.LeadSource,'Plenti Referrals','but the rest of the payload is intact — the Lead is still created');
 
  // ---- 4. describe 每次执行只发一次 ----
  (function(){
@@ -1577,7 +1582,7 @@ function testPlentiSystemsVisible(){
   return plLeadPayload_(message,parsed,{html:'',meta:{found:[],degraded:true}});
  })();
  plAssert_(/; systems: Solar/.test(degraded.Description),'systems still shown when the browser view degraded');
- plAssert_(/BROWSER VIEW UNAVAILABLE/.test(degraded.Description),'and the degraded warning is still there');
+ plAssert_(/CUSTOMER DETAILS MISSING/.test(degraded.Description),'and the degraded warning is still there');
 
  // ---- 6. 超长 systems 截断,不能撑破字段 ----
  var huge=payloadWith(new Array(400).join('x'),['Plenti_Systems__c']);
@@ -1806,10 +1811,177 @@ function testPlentiScopeNarrowing(){
 }
 
 // ============================================================
+// 27. R17 两个数据源、Customer phone、LeadSource 读属性(D-029)
+// ============================================================
+
+function testPlentiTwoSources(){
+ plTestBaseline_();
+ var page=plTestBrowserHtml_(),token=plTestBrowserToken_();
+ var withTemplate=plTestMessage_('trusted-referral-with-template');
+ var linkOnly=plTestMessage_('trusted-referral-with-link');
+
+ function enrich(message,handler){
+  return plTestWithFetch_(handler,function(){
+   var parsed=parsePlentiReferral_(message),r=plEnrichFromBrowserView_(message,parsed);
+   return {parsed:parsed,meta:parsed.browserView,html:r.html};
+  });
+ }
+ var ok=function(){return {code:200,text:page};};
+ var fail=function(){return null;};
+
+ // ---- 1. 两边一致 → 来源记 both,不报冲突 ----
+ var both=enrich(withTemplate,ok);
+ plAssertEq_(both.parsed.customer.lastName,'Fixture Example','name parsed');
+ plAssertEq_(both.meta.sources.name,'both','identical in both sources → recorded as both');
+ plAssertEq_(both.meta.sources.phone,'both','phone agrees too');
+ plAssertEq_(both.meta.conflicts.length,0,'no conflict');
+ plAssertEq_(both.meta.emailFound.length,4,'the email HTML is parsed with the same template parser');
+ plAssertEq_(both.meta.pageFound.length,4,'and so is the page');
+ plAssertEq_(both.html,page,'the page is still fetched and kept for audit even though the email was complete');
+
+ // ---- 2. 邮件是空的(只有链接)、页面有数据 → 页面补齐 ----
+ //     这正是 Gabby TEST 那一类:邮件里没数据,页面上有。
+ var fill=enrich(linkOnly,ok);
+ plAssertEq_(fill.parsed.customer.lastName,'Fixture Example','the page fills a field the email lacks');
+ plAssertEq_(fill.meta.sources.name,'page','and the source says so');
+ plAssertEq_(fill.meta.emailFound.length,0,'the email contributed nothing');
+
+ // ---- 3. 页面抓不到、邮件有数据 → 数据完整,只丢审计留底 ----
+ //     以前抓取失败 = 没数据;现在两根轴分开了,这是温和得多的降级。
+ var auditOnly=enrich(withTemplate,fail);
+ plAssertEq_(auditOnly.parsed.customer.lastName,'Fixture Example','customer data survives a failed fetch when the email carries it');
+ plAssertEq_(auditOnly.parsed.confidence,'high','so confidence stays high');
+ plAssertEq_(auditOnly.meta.degraded,false,'the DATA is not degraded');
+ plAssertEq_(auditOnly.meta.auditMissing,true,'only the audit copy is missing');
+ plAssertEq_(auditOnly.html,'','no page to store');
+ plAssert_(/audit copy is missing/.test(auditOnly.parsed.reason),'the reason distinguishes this from missing data');
+ plAssert_(/customer data came from the email/.test(auditOnly.parsed.reason),'and says where the data came from');
+
+ // ---- 4. 两边都没有 → 数据降级 ----
+ var neither=enrich(linkOnly,fail);
+ plAssertEq_(neither.meta.degraded,true,'no name from either source is real data degradation');
+ plAssertEq_(neither.meta.auditMissing,true,'and the audit copy is missing too');
+ plAssertEq_(neither.parsed.kind,'referral','identity still comes from the token — the Lead is still created');
+ plAssertEq_(neither.parsed.referralId,token,'token preserved');
+
+ // ---- 5. 冲突 → 以邮件为准,记下来,不阻断 ----
+ var conflictPage=page.replace('0400 000 111','0400 000 999');
+ var conflict=enrich(withTemplate,function(){return {code:200,text:conflictPage};});
+ plAssertEq_(conflict.parsed.customer.phone,'0400 000 111','on conflict the EMAIL value wins — it is what we actually received');
+ plAssertEq_(conflict.meta.sources.phone,'email','and the source records it');
+ plAssertEq_(conflict.meta.conflicts.join(','),'phone','the conflict is recorded');
+ plAssert_(/DISAGREE on: phone/.test(conflict.parsed.reason),'and surfaced in the reason');
+ plAssertEq_(conflict.parsed.kind,'referral','a conflict does not block creation — the SLA clock is running');
+ // 同一个号码换个格式不算冲突
+ var formatPage=page.replace('0400 000 111','+61 400 000 111');
+ var sameNumber=enrich(withTemplate,function(){return {code:200,text:formatPage};});
+ plAssertEq_(sameNumber.meta.conflicts.length,0,'+61 400 000 111 and 0400 000 111 are the same number, not a conflict');
+
+ // ---- 6. Description 的三种标记相互独立 ----
+ var msg=plTestMessage_('trusted-referral');
+ function descOf(meta){var p=plTestParsed_();return plLeadPayload_(msg,p,{html:'',meta:meta}).Description;}
+ plAssert_(/CUSTOMER DETAILS MISSING/.test(descOf({found:[],degraded:true,auditMissing:true})),'data missing');
+ plAssert_(!/AUDIT COPY MISSING/.test(descOf({found:[],degraded:true,auditMissing:true})),'data-missing already implies it, so the audit flag is not repeated');
+ plAssert_(/AUDIT COPY MISSING/.test(descOf({found:['name'],degraded:false,auditMissing:true})),'audit-only missing gets its own milder flag');
+ plAssert_(!/CUSTOMER DETAILS MISSING/.test(descOf({found:['name'],degraded:false,auditMissing:true})),'and is not mislabelled as missing data');
+ plAssert_(/SOURCES DISAGREE: phone/.test(descOf({found:['name'],conflicts:['phone']})),'a conflict is flagged in Description for the follow-up person');
+ var clean=descOf({found:['name']});
+ plAssert_(!/CUSTOMER DETAILS MISSING|SOURCES DISAGREE|AUDIT COPY MISSING/.test(clean),'a clean Lead carries none of the three flags');
+ plAssert_(clean.indexOf('[Intake: ')===0,'but still starts with the load-bearing marker (D-013)');
+
+ // ---- 7. 电话:手机进 MobilePhone、座机进 Phone,原样写入 ----
+ function phonePayload(phone){var p=plTestParsed_();p.customer.phone=phone;return plLeadPayload_(msg,p,{html:'',meta:{found:[]}});}
+ var mobile=phonePayload('0400000111');
+ plAssertEq_(mobile.MobilePhone,'0400000111','an 04 number goes to MobilePhone');
+ plAssert_(!('Phone' in mobile),'and not to Phone');
+ var intl=phonePayload('+61 400 000 111');
+ plAssertEq_(intl.MobilePhone,'+61 400 000 111','a +61 4 number is a mobile too, and is stored verbatim — no normalisation');
+ var landline=phonePayload('08 8000 0000');
+ plAssertEq_(landline.Phone,'08 8000 0000','a landline goes to Phone, verbatim');
+ plAssert_(!('MobilePhone' in landline),'and not to MobilePhone');
+ var none=phonePayload('');
+ plAssert_(!('Phone' in none)&&!('MobilePhone' in none),'no phone means neither field is written');
+
+ // ---- 8. ⚠️ D-024 修正:我们自己写的电话不能让 review 解除 ----
+ var parsedWithPhone=plTestParsed_();parsedWithPhone.customer.phone='0400000111';
+ var supplied=plSuppliedContacts_(parsedWithPhone);
+ plAssert_(supplied.MobilePhone,'the supplied phone is recorded against the field it was written to');
+ plAssert_(supplied.MobilePhone.indexOf('0400')<0,'as a fingerprint, not the number itself — no plaintext phone in Script Properties');
+ var ours={Id:'00Q1',Email:null,Phone:null,MobilePhone:'0400000111',Status:'New',IsConverted:false};
+ plAssertEq_(plReviewClearedReason_(ours,supplied),'','our own phone is NOT evidence a person acted — the review stays open');
+ var reformatted={Id:'00Q1',Email:null,Phone:null,MobilePhone:'0400 000 111',Status:'New',IsConverted:false};
+ plAssertEq_(plReviewClearedReason_(reformatted,supplied),'','nor is the same number in a different format');
+ var changed={Id:'00Q1',Email:null,Phone:null,MobilePhone:'0400000999',Status:'New',IsConverted:false};
+ plAssert_(/changed by a person \(MobilePhone\)/.test(plReviewClearedReason_(changed,supplied)),'a person changing the phone DOES clear it');
+ var emailAdded={Id:'00Q1',Email:'c@example.net',Phone:null,MobilePhone:'0400000111',Status:'New',IsConverted:false};
+ plAssert_(/\(Email\)/.test(plReviewClearedReason_(emailAdded,supplied)),'a person adding the email clears it');
+ plAssert_(/Contact details were added/.test(plReviewClearedReason_({Id:'00Q1',MobilePhone:'0400000111'},{})),
+  'with nothing recorded as supplied, the old behaviour is preserved');
+
+ // ---- 9. LeadSource 从属性读,且在上锁之前校验 ----
+ plAssertEq_(plLeadSource_(),'Plenti Referrals','read from PLENTI_LEAD_SOURCE');
+ plTestSetProps_({PLENTI_LEAD_SOURCE:null});
+ plAssertThrows_(function(){plLeadSource_();},/PLENTI_LEAD_SOURCE/,'missing configuration stops processing');
+ plTestSetProps_({PLENTI_LEAD_SOURCE:'Plenti Referrals'});
+
+ // 值不在 picklist 里 → 在写 IV2_CREATE_ 锁**之前**就抛
+ plTestClearState_();
+ (function(){
+  var real=ivReq_,p=PropertiesService.getScriptProperties();
+  plLeadFieldMap_.cache=null;
+  ivReq_=function(path){
+   if(path==='sobjects/Lead/describe')return {fields:[{name:'LeadSource',createable:true,
+    picklistValues:[{value:'Web',active:true},{value:'Plenti',active:true},{value:'Old Value',active:false}]}]};
+   throw new Error('must not POST with an invalid LeadSource');
+  };
+  try{
+   plAssertThrows_(function(){plCreateLead_(msg,plTestParsed_(),{html:'',meta:{found:[]}});},
+    /not an active LeadSource picklist value/,'an invalid LeadSource is refused');
+   plAssertEq_(p.getProperty('IV2_CREATE_'+msg.getId()),null,
+    'and the IV2_CREATE_ lock was never written — a config error must not strand a message behind L-01');
+   plTestSetProps_({PLENTI_LEAD_SOURCE:'Old Value'});
+   plAssertThrows_(function(){plValidatedLeadSource_();},/not an active/,'an INACTIVE picklist value is refused too');
+  }finally{ivReq_=real;plLeadFieldMap_.cache=null;plTestSetProps_({PLENTI_LEAD_SOURCE:'Plenti Referrals'});}
+ })();
+ // describe 失败时不阻断(与可选字段探测同一策略)
+ plLeadFieldMap_.cache=null;
+ plAssertEq_(plValidatedLeadSource_(),'Plenti Referrals','with no picklist information the value is used as configured');
+
+ // ---- 10. 自检把 LeadSource 的有效性报出来,且不会因为配错而自己崩掉 ----
+ var names=[],used=plLeadFieldsUsed_(),i;
+ for(i=0;i<used.length;i++)names.push(used[i].name);
+ (function(){
+  var real=ivReq_,logged=[];
+  var realLog=console.log;
+  plLeadFieldMap_.cache=null;
+  ivReq_=function(){
+   var out=[],j;
+   for(j=0;j<names.length;j++){
+    if(names[j]==='LeadSource')out.push({name:'LeadSource',createable:true,picklistValues:[{value:'Web',active:true}]});
+    else out.push({name:names[j],createable:true});
+   }
+   return {fields:out};
+  };
+  console.log=function(m){logged.push(String(m));};
+  try{
+   var report=plTestDescribeLead();
+   plAssert_(report,'the self-check completes even when LeadSource is misconfigured — it must report the problem, not crash on it');
+   plAssert_(logged.some(function(l){return /PLENTI_LEAD_SOURCE="Plenti Referrals" is NOT an active LeadSource value/.test(l);}),
+    'and names the misconfiguration explicitly');
+  }finally{ivReq_=real;console.log=realLog;plLeadFieldMap_.cache=null;}
+ })();
+
+ plTestClearState_();
+ plTestBaseline_();
+ console.log('PASS: 52 two-source / phone / LeadSource cases');
+}
+
+// ============================================================
 // 入口
 // ============================================================
 
 function runPlentiRegressionTests(){
+ testPlentiTwoSources();
  testPlentiScopeNarrowing();
  testPlentiCreatedDurability();
  testPlentiSystemsVisible();
